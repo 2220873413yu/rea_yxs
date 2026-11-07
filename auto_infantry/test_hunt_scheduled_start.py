@@ -114,6 +114,7 @@ class ScheduledHuntUiTests(unittest.TestCase):
         """Use plain mocks for controls so no real checkboxes or game switches can change."""
         app=self.App.__new__(self.App)
         app.ready=True;app.closing=False;app.worker=Mock();app.hunt_enabled=Mock()
+        app.sessions=Mock(epoch=1,worker=app.worker)
         app.hunt_enabled.get.return_value=False
         app.monster_panel=Mock();app.monster_panel.options.return_value=HuntOptions(90)
         app.worker.hunt.start_on_refresh.return_value=True

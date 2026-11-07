@@ -25,12 +25,17 @@ ADB = r'E:\leidian\LDPlayer9\adb.exe'
 WORLD_READINESS_SOURCE = '''
 local mm=CSLTypes.ModelManager.sharedInstance()
 local main=mm:getModel(CSLTypes.SLGMainModel)
+local account=mm:getModel(CSLTypes.MainModel)
 local ok,stage=pcall(function()
  local cls=package.loaded.HeroPalaceItem
  return cls and cls.__instanceDict.getCurrentStageName({}) or 'unknown'
 end)
 stage=ok and tostring(stage):gsub('[^%w_]','') or 'unknown'
-local ready=main~=nil and main.mIsMapLoaded==true and type(main.mTSLGLoginMapRsp)=='table' and main.mTSLGLoginMapRsp[1]==0
+local rsp=main and main.mTSLGLoginMapRsp
+local uid=account and account.myUserId
+local worldUid=type(rsp)=='table' and type(rsp[5])=='table' and rsp[5][1]
+local same=uid and worldUid and uid[1]==worldUid[1] and uid[2]==worldUid[2] and uid[3]==worldUid[3] and uid[4]==worldUid[4]
+local ready=not not (same and main.mIsMapLoaded==true and rsp[1]==0 and stage~='LoginStage' and stage~='MainHallSceneStage')
 return string.format('{"ready":%s,"stage":"%s"}',tostring(ready),stage)
 '''
 
@@ -65,8 +70,8 @@ class Connection:
             raise RuntimeError('已有一个造兵助手连接，请先关闭原窗口')
         self.mutex_handle = handle
 
-    def open(self, on_status=None, cancel=None):
-        """Start ADB children without consoles and install checked APIs with every spending gate closed."""
+    def attach(self):
+        """Own a default-off bridge without requiring a world map, for native login or normal startup."""
         self.acquire_owner()
         package = subprocess.check_output([ADB, '-s', 'emulator-5554', 'shell', 'dumpsys', 'package', 'com.qqgame.mic'],
                                           text=True, timeout=8, encoding='utf-8', errors='replace',
@@ -82,7 +87,28 @@ class Connection:
         try:
             self.script = self.session.create_script((ROOT / 'bridge.js').read_text(encoding='utf-8'))
             self.script.load()
+        except Exception:
+            self.close()
+            raise
+
+    def login_call(self, operation='status'):
+        """Read masked role metadata or invoke one fixed native login action; credentials stay in the client."""
+        if operation not in {'status', 'logout', 'qr', 'bind'}:
+            raise ValueError('Unknown login operation')
+        source = 'local operation=' + json.dumps(operation) + '\n' + (ROOT / 'login_runtime.lua').read_text(encoding='utf-8')
+        with self.lock:
+            value = self.script.exports_sync.query(source)
+        return json.loads(value) if operation == 'status' else value
+
+    def open(self, on_status=None, cancel=None, on_account=None):
+        """Install fresh account APIs only after map readiness, with all spending gates closed."""
+        try:
+            self.attach()
+            if on_account is not None:
+                on_account(self.login_call())
             self.wait_world_ready(on_status, cancel)
+            self.login_call('bind')
+            self.script.exports_sync.bindsession(True)
             self.script.exports_sync.query('if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.beacon_close then REA_AUTO_INFANTRY.beacon_close() end;'
                                            'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.league_close then '
                                            'REA_AUTO_INFANTRY.league_close() end;'
@@ -735,13 +761,15 @@ class Connection:
                 self.set_hunt_enabled(False)
                 self.set_league_enabled(False)
                 self.set_beacon_enabled(False)
+                self.script.exports_sync.bindsession(False)
                 self.script.exports_sync.query('if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.beacon_close then REA_AUTO_INFANTRY.beacon_close() end;'
                                                'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.league_close then '
                                                'REA_AUTO_INFANTRY.league_close() end;'
                                                'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.hunt_close then '
                                                'REA_AUTO_INFANTRY.hunt_close() end;'
                                                'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.collect_close then '
-                                               'REA_AUTO_INFANTRY.collect_close() end;_G.REA_AUTO_INFANTRY=nil; return "closed"')
+                                               'REA_AUTO_INFANTRY.collect_close() end;_G.REA_AUTO_INFANTRY=nil;'
+                                               '_G.REA_HELPER_SESSION_VALID=nil; return "closed"')
                 self.script.exports_sync.close()
             except Exception:
                 pass

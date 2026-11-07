@@ -15,6 +15,7 @@ from monster_panel import MonsterPanel
 from league_panel import LeaguePanel
 from beacon_panel import BeaconPanel
 from collection_display import display_time
+from login_session import LoginSession, account_label
 
 
 class App:
@@ -26,6 +27,8 @@ class App:
         self.root.geometry('1050x1000')
         self.root.minsize(900, 940)
         self.events = queue.Queue()
+        self.sessions = LoginSession(self.events)
+        self.login_busy = False
         self.worker = None
         self.closing = False
         self.ready = False
@@ -44,9 +47,17 @@ class App:
         style.configure('Title.TLabel', font=('Microsoft YaHei UI', 15, 'bold'))
         style.configure('TLabel', font=('Microsoft YaHei UI', 10))
         style.configure('Switch.TCheckbutton', font=('Microsoft YaHei UI', 13))
-        panel = ttk.Frame(self.root, padding=18)
+        panel = ttk.Frame(self.root, padding=16)
         panel.pack(fill='both', expand=True)
-        ttk.Label(panel, text='世界模式助手', style='Title.TLabel').pack(anchor='w')
+        header = ttk.Frame(panel)
+        header.pack(fill='x')
+        ttk.Label(header, text='世界模式助手', style='Title.TLabel').pack(side='left')
+        self.login_button = ttk.Button(header, text='iOS 微信扫码登录', command=lambda: self.request_session('ios_wechat'))
+        self.login_button.pack(side='right')
+        self.reload_button = ttk.Button(header, text='重新读取当前账号', command=lambda: self.request_session('connect'))
+        self.reload_button.pack(side='right', padx=6)
+        self.account_status = tk.StringVar(value='当前账号：正在读取；自动功能关闭')
+        ttk.Label(header, textvariable=self.account_status, wraplength=360).pack(side='left', padx=(14, 0))
         top = ttk.Frame(panel)
         top.pack(fill='x', pady=(10, 0))
         troop_panel = ttk.LabelFrame(top, text='士兵训练', padding=10)
@@ -75,7 +86,7 @@ class App:
         self.feature_tabs = ttk.Notebook(panel)
         self.feature_tabs.pack(fill='both', expand=True, pady=(8, 0))
         self.hero_panel = HeroPanel(self.feature_tabs, self.hero_enabled, self.switch_hero, self.refresh_heroes, self.refresh_attributes)
-        self.hero_panel.tree.configure(height=5)
+        self.hero_panel.tree.configure(height=4)
         self.feature_tabs.add(self.hero_panel, text='英雄属性与恢复')
         self.monster_panel = MonsterPanel(self.feature_tabs, self.hunt_enabled, self.switch_hunt, self.check_hunt)
         self.feature_tabs.add(self.monster_panel, text='自动打野')
@@ -88,24 +99,66 @@ class App:
         ttk.Label(panel, textvariable=self.status, wraplength=960).pack(anchor='w')
         ttk.Label(panel, text='造兵只处理所选兵种，补满后自动关闭；恢复只用五分钟专用道具，不足五分钟也可用一个。\n采集恢复与自动恢复共用同一队列，不重复用道具；关闭后不发新请求，已接受的行动不会撤销。',
                   foreground='#666666', font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(10, 0))
-        ttk.Label(panel, text='恢复勾选会记住，自动功能启动时默认关闭；打野到地图刷新时刻会自动开启（请求结果不明除外）。',
+        ttk.Label(panel, text='选择会记住，换号后自动功能关闭；本次手动开启打野后，才恢复刷新时刻自动开启规则。',
                   foreground='#666666', font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(5, 0))
         self.root.protocol('WM_DELETE_WINDOW', self.close)
-        threading.Thread(target=self.connect, daemon=True).start()
+        self.connect()
         self.root.after(100, self.poll)
 
     def connect(self):
-        """Connect and queue read-only startup loads while all five spending switches stay off."""
-        try:
-            ensure_server()
-            worker = Worker(self.events)
-            self.worker = worker
-            if not self.closing:
-                worker.request_hero_refresh()
-                worker.request_collection_attributes()
-                worker.start()
-        except Exception as error:
-            self.events.put({'ready': False, 'status': '连接失败：' + str(error)})
+        """Start a fresh default-off session without blocking Tk on game readiness."""
+        self.request_session('connect')
+
+    def clear_account_views(self):
+        """Remove all old account snapshots and switches while retaining explicit saved selection settings."""
+        self.ready = False
+        for variable in (self.enabled, self.hero_enabled, self.collect_enabled, self.hunt_enabled,
+                         self.league_enabled, self.beacon_enabled, self.training_speed):
+            variable.set(False)
+        for count in self.counts.values():
+            count.set('正在读取…')
+        self.stock.set('五分钟训练加速：正在读取…')
+        hero = self.hero_panel
+        hero.roster.clear(); hero.speeds.clear(); hero.loads.clear(); hero.references.clear()
+        hero.tree.delete(*hero.tree.get_children())
+        hero.stock.set('五分钟英雄恢复加速：正在读取…')
+        hero.reference_text.set('采集速度：等待当前账号数据…')
+        hero.status.set('自动恢复关闭，等待当前账号名单…')
+        collection = self.collection_panel
+        collection.queue_snapshot = None
+        collection.queue_text.set('已出征 / 上限：待读取')
+        collection.recommendation.set('等待当前账号的采集属性…')
+        collection.balance_text.set('粮木铁按1:1:1补缺；等待当前账号存量。')
+        collection.status.set('自动采集关闭；等待当前账号数据。')
+        for view in (self.collection_teams_panel, self.league_panel, self.beacon_panel):
+            view.snapshot = None
+            view.tree.delete(*view.tree.get_children())
+        self.collection_teams_panel.awaiting = False
+        self.collection_teams_panel.note.set('等待当前账号数据；自动采集关闭。')
+        self.league_panel.mine.set('等待当前账号联盟矿…')
+        self.league_panel.confirmed.set('尚未确认当前账号服务器状态')
+        self.league_panel.status.set('自动联盟采集关闭。')
+        self.beacon_panel.scout_info = ''
+        self.beacon_panel.summary.set('烽火台额度：待读取')
+        self.beacon_panel.timing.set('刷新与下次检查：待读取')
+        self.beacon_panel.status.set('自动烽火台关闭。')
+        self.monster_panel.tree.delete(*self.monster_panel.tree.get_children())
+        self.monster_panel.team.set('队伍：未派出')
+        self.monster_panel.capacity.set('出征额度：待读取；本轮忽略：0个坐标')
+        self.monster_panel.status.set('自动打野关闭。')
+        self.monster_panel.auto_hint.set('本账号尚未手动开启打野，刷新时刻自动开启暂不启用。')
+
+    def request_session(self, mode):
+        """Stop old automation, clear its display, then request native login or current-account reconstruction."""
+        if self.closing:
+            return
+        self.clear_account_views()
+        self.login_busy = True
+        self.account_status.set('当前账号：正在重新读取，自动功能关闭')
+        self.status.set('正在停止旧连接并准备扫码登录…' if mode == 'ios_wechat' else '正在重新连接当前账号…')
+        self.sessions.request(mode)
+        self.worker = None
+        self.update_controls()
 
     def update_controls(self):
         """Enable each independent master while connected and freeze the settings owned by an active run."""
@@ -119,6 +172,7 @@ class App:
         for box in self.choice_widgets.values():
             box.state(['disabled'] if self.enabled.get() else ['!disabled'])
         self.speed_toggle.state(['disabled'] if self.enabled.get() else ['!disabled'])
+        self.login_button.state(['disabled'] if self.login_busy else ['!disabled'])
 
     def switch_hero(self):
         """Freeze the user's persisted hero choices without changing the troop master."""
@@ -274,6 +328,18 @@ class App:
         try:
             while True:
                 event = self.events.get_nowait()
+                if event.get('session_epoch', self.sessions.epoch) != self.sessions.epoch:
+                    continue
+                self.worker = self.sessions.worker
+                if event.get('account_changed'):
+                    self.request_session('connect')
+                    continue
+                if 'login_busy' in event:
+                    self.login_busy = event['login_busy']
+                if 'account' in event:
+                    self.account_status.set(account_label(event['account']))
+                if 'account_status' in event:
+                    self.account_status.set(event['account_status'])
                 if 'ready' in event:
                     self.ready = event['ready']
                 if 'beacon_enabled' in event:
@@ -358,6 +424,7 @@ class App:
     def close(self):
         """Disable every independent action gate before closing the visible control window."""
         self.closing = True
+        self.sessions.close()
         self.enabled.set(False)
         self.hero_enabled.set(False)
         self.collect_enabled.set(False)

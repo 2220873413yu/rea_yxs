@@ -27,6 +27,7 @@ let leagueEnabled = false;
 let leagueEpoch = 0;
 let beaconEnabled = false;
 let beaconEpoch = 0;
+let sessionBound = false;
 
 /** Copy one Lua result without retaining pointers into the game's Lua heap. */
 function readString(state, index) {
@@ -54,9 +55,10 @@ function execute(state, task) {
     }
     const oldTop = getTop(state);
     try {
-        const source = Memory.allocUtf8String(task.source);
+        const checkedSource = (sessionBound ? 'assert(REA_HELPER_SESSION_VALID and REA_HELPER_SESSION_VALID(), "Account session changed; reconnect the helper");\n' : '') + task.source;
+        const source = Memory.allocUtf8String(checkedSource);
         const chunk = Memory.allocUtf8String('@rea-auto-infantry');
-        const size = unescape(encodeURIComponent(task.source)).length;
+        const size = unescape(encodeURIComponent(checkedSource)).length;
         if (load(state, source, size, chunk) !== 0) throw new Error(readString(state, -1));
         if (pcall(state, 0, 1, 0) !== 0) throw new Error(readString(state, -1));
         task.resolve(readString(state, -1));
@@ -89,6 +91,8 @@ const hook = Interceptor.attach(lua.getExportByName('lua_pcall'), {
 });
 
 rpc.exports = {
+    /** Fence every subsequent queued operation against the live account, including read-only queries. */
+    bindsession(value) { sessionBound = value === true; },
     /** Expose hook activity for diagnosing scheduling without executing Lua. */
     status() { return {updateCount, queued: pending.length}; },
     /** Enqueue a bounded caller-owned Lua operation; no work survives a timed-out queue item. */

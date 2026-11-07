@@ -7,6 +7,7 @@ const vm = require('node:vm');
 function bridge() {
     let callbacks;
     let loads = 0;
+    const sources = [];
     const pointer = {isNull: () => false, readUtf8String: () => 'ok',
         writeU64() {}, readU64: () => 2};
     const context = {
@@ -17,7 +18,7 @@ function bridge() {
             if (name === 'luaL_loadbuffer') return () => { loads++; return 0; };
             return () => 0;
         },
-        Memory: {alloc: () => pointer, allocUtf8String: () => pointer},
+        Memory: {alloc: () => pointer, allocUtf8String: value => { sources.push(value); return pointer; }},
         File: {readAllText: () => 'UnityMain'},
         Interceptor: {attach: (name, hooks) => { callbacks = hooks; return {detach() {}}; }}
     };
@@ -30,13 +31,27 @@ function bridge() {
             callbacks.onEnter.call(invocation, [pointer]);
             callbacks.onLeave.call(invocation);
         },
-        loads: () => loads
+        loads: () => loads,
+        sources: () => sources
     };
 }
 
 /** Check gate isolation, immediate cancellation and protection against rapid off/on transitions. */
 async function main() {
     let b = bridge();
+    b.rpc.bindsession(true);
+    let guarded = b.rpc.query('return "first"');
+    b.drain();
+    await guarded;
+    assert.ok(b.sources().some(s => s.startsWith('assert(REA_HELPER_SESSION_VALID') && s.endsWith('return "first"')),
+        'A newly bound session must fence read-only operations too');
+    b.rpc.bindsession(false);
+    guarded = b.rpc.query('return "cleanup"');
+    b.drain();
+    await guarded;
+    assert.ok(b.sources().includes('return "cleanup"'), 'Detached-account cleanup must remain possible after revoking gates');
+    b.rpc.close();
+    b = bridge();
     let task = b.rpc.query('return "ok"', null, null);
     b.drain();
     assert.equal(await task, 'ok');

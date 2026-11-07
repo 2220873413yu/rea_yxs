@@ -111,6 +111,7 @@ class Worker(threading.Thread):
         self.epoch = 0
         self.step_delay = 0.3
         self.connection = None
+        self.allow_scheduled_hunt = True
         self.log_path = Path(__file__).with_name('actions.jsonl')
         self.collection = CollectionService(self)
         self.hunt = MonsterService(self)
@@ -207,8 +208,10 @@ class Worker(threading.Thread):
         self.collection.switch(enabled, options)
 
     def switch_hunt(self, enabled, options=None):
-        """Authorize hunting independently; it never adds a hero recovery demand."""
+        """Authorize hunting independently; a valid manual start also arms this account's refresh schedule."""
         self.hunt.switch(enabled, options)
+        if enabled:
+            self.allow_scheduled_hunt = True
 
     def request_collection_attributes(self):
         """Queue a read-only speed/load refresh on the same serial worker as all other game operations."""
@@ -276,7 +279,8 @@ class Worker(threading.Thread):
         run = None
         run_epoch = None
         try:
-            state = connection.open(on_status=lambda message: self.publish(ready=False, status=message), cancel=self.closing)
+            state = connection.open(on_status=lambda message: self.publish(ready=False, status=message), cancel=self.closing,
+                                    on_account=lambda account: self.publish(account=account))
             self.connection = connection
             for unit in UNIT_NAMES:
                 self.publish(state=connection.call('status', unit))
@@ -426,6 +430,7 @@ class Worker(threading.Thread):
             if not self.closing.is_set():
                 self.publish(enabled=False, hero_enabled=False, collect_enabled=False, hunt_enabled=False, league_enabled=False,
                              beacon_enabled=False, ready=False, error=str(error),
+                             account_changed='Account session changed' in str(error),
                              hero_status='连接已停止，自动恢复关闭',
                              status=('已停止：' if was_enabled else '连接已停止：') + str(error))
         finally:

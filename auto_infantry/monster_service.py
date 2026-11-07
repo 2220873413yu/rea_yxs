@@ -83,6 +83,8 @@ class MonsterService:
 
     def scheduled_start_tick(self, connection, now):
         """Check a monotonic one-shot deadline, confirming the local server clock only when that deadline arrives."""
+        if not getattr(self.owner, 'allow_scheduled_hunt', True):
+            return
         if self.automatic_start_blocked():
             if not self.auto_block_notified:
                 self.auto_block_notified = True
