@@ -1,0 +1,762 @@
+"""Own the temporary game bridge and its main-thread RPC lifecycle."""
+import json
+from contextlib import contextmanager
+import ctypes
+import contextlib
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import frida
+from collection_balance import resource_balance
+from units import UNIT_NAMES, checked_units
+from hero_preferences import checked_heroes
+from game_log import GameResponseLog, ResourceMissing, BeaconCapacityUnavailable
+
+ROOT = Path(__file__).resolve().parent
+
+
+class BarrackUnavailable(RuntimeError):
+    """Stop only troop automation when an upgrade or unknown building state prevents safe training."""
+
+
+ADB = r'E:\leidian\LDPlayer9\adb.exe'
+WORLD_READINESS_SOURCE = '''
+local mm=CSLTypes.ModelManager.sharedInstance()
+local main=mm:getModel(CSLTypes.SLGMainModel)
+local ok,stage=pcall(function()
+ local cls=package.loaded.HeroPalaceItem
+ return cls and cls.__instanceDict.getCurrentStageName({}) or 'unknown'
+end)
+stage=ok and tostring(stage):gsub('[^%w_]','') or 'unknown'
+local ready=main~=nil and main.mIsMapLoaded==true and type(main.mTSLGLoginMapRsp)=='table' and main.mTSLGLoginMapRsp[1]==0
+return string.format('{"ready":%s,"stage":"%s"}',tostring(ready),stage)
+'''
+
+
+class Connection:
+    """Attach to one running process and detach without leaving autonomous work behind."""
+
+    def __init__(self):
+        self.session = None
+        self.script = None
+        self.lock = threading.RLock()
+        self.mutex_handle = None
+        self.hero_generation = 0
+        self.collect_generation = 0
+        self.hunt_generation = 0
+        self.league_generation = 0
+        self.beacon_generation = 0
+        self.response_log = None
+
+    def acquire_owner(self):
+        """Allow only one helper connection to own the account's Lua bridge at a time."""
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel.CreateMutexW.restype = ctypes.c_void_p
+        ctypes.set_last_error(0)
+        handle = kernel.CreateMutexW(None, True, r'Local\REA_AUTO_INFANTRY_emulator_5554')
+        if not handle:
+            raise OSError(ctypes.get_last_error(), 'Cannot acquire helper ownership')
+        if ctypes.get_last_error() == 183:
+            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel.CloseHandle(handle)
+            raise RuntimeError('已有一个造兵助手连接，请先关闭原窗口')
+        self.mutex_handle = handle
+
+    def open(self, on_status=None, cancel=None):
+        """Start ADB children without consoles and install checked APIs with every spending gate closed."""
+        self.acquire_owner()
+        package = subprocess.check_output([ADB, '-s', 'emulator-5554', 'shell', 'dumpsys', 'package', 'com.qqgame.mic'],
+                                          text=True, timeout=8, encoding='utf-8', errors='replace',
+                                          creationflags=subprocess.CREATE_NO_WINDOW)
+        if 'versionCode=431000017 ' not in package:
+            raise RuntimeError('Game version changed; this bridge requires 4.31.0 / 431000017')
+        subprocess.run([ADB, '-s', 'emulator-5554', 'forward', 'tcp:27042', 'tcp:27042'],
+                       capture_output=True, check=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
+        pid = int(subprocess.check_output([ADB, '-s', 'emulator-5554', 'shell', 'pidof', 'com.qqgame.mic'],
+                                         text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW).strip().split()[0])
+        device = frida.get_device_manager().add_remote_device('127.0.0.1:27042')
+        self.session = device.attach(pid, realm='emulated')
+        try:
+            self.script = self.session.create_script((ROOT / 'bridge.js').read_text(encoding='utf-8'))
+            self.script.load()
+            self.wait_world_ready(on_status, cancel)
+            self.script.exports_sync.query('if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.beacon_close then REA_AUTO_INFANTRY.beacon_close() end;'
+                                           'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.league_close then '
+                                           'REA_AUTO_INFANTRY.league_close() end;'
+                                           'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.hunt_close then '
+                                           'REA_AUTO_INFANTRY.hunt_close() end;'
+                                           'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.collect_close then '
+                                           'REA_AUTO_INFANTRY.collect_close() end;return "old_collection_cleared"')
+            self.script.exports_sync.query((ROOT / 'runtime.lua').read_text(encoding='utf-8'))
+            initial = self.initialize_barracks()
+            self.script.exports_sync.query((ROOT / 'hero_runtime.lua').read_text(encoding='utf-8'))
+            self.script.exports_sync.query((ROOT / 'collection_runtime.lua').read_text(encoding='utf-8'))
+            self.script.exports_sync.query((ROOT / 'monster_runtime.lua').read_text(encoding='utf-8'))
+            self.script.exports_sync.query((ROOT / 'league_runtime.lua').read_text(encoding='utf-8'))
+            self.script.exports_sync.query((ROOT / 'beacon_runtime.lua').read_text(encoding='utf-8'))
+            self.script.exports_sync.query((ROOT / 'beacon_actions.lua').read_text(encoding='utf-8'))
+            return initial
+        except Exception:
+            self.close()
+            raise
+
+    def wait_world_ready(self, on_status=None, cancel=None):
+        """Wait on local map readiness before binding account data; no game-server requests or auto entry."""
+        previous = None
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError('已取消等待地图加载')
+            state = json.loads(self.script.exports_sync.query(WORLD_READINESS_SOURCE))
+            if state['ready']:
+                if on_status is not None:
+                    on_status('地图已加载，正在查询当前登录账号的数据…')
+                return
+            message = ('当前在游戏大厅，请进入西游幻境并等待地图加载；助手正在等待，自动功能关闭'
+                       if state['stage'] == 'MainHallSceneStage' else
+                       '正在等待西游幻境地图加载；自动功能关闭，不会操作游戏')
+            if on_status is not None and message != previous:
+                on_status(message)
+            previous = message
+            if cancel is not None:
+                cancel.wait(1)
+            else:
+                time.sleep(1)
+
+    def call(self, operation, unit=411):
+        """Invoke only a fixed local operation; never accept arbitrary commands from a UI."""
+        if operation not in {'status', 'refresh', 'train', 'speed', 'barrack_probe'}:
+            raise ValueError('Unknown infantry operation')
+        if type(unit) is not int or unit not in UNIT_NAMES:
+            raise ValueError('Unsupported troop identifier')
+        with self.lock:
+            result = self.script.exports_sync.query(f'return REA_AUTO_INFANTRY.{operation}({unit})',
+                                                    'train_speed' if operation == 'speed' else operation == 'train', unit)
+            return json.loads(result) if operation in {'status', 'barrack_probe'} else result
+
+    def initialize_barracks(self, timeout=6):
+        """Query once with gates closed, require a new successful response, then validate every troop type."""
+        previous = self.call('barrack_probe')['barrack_seq']
+        self.call('refresh')
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            probe = self.call('barrack_probe')
+            if probe['barrack_seq'] > previous and probe['received']:
+                if probe['ret'] != 0:
+                    raise RuntimeError(f"兵营初始化查询失败，服务器返回码：{probe['ret']}")
+                states = {unit: self.call('status', unit) for unit in UNIT_NAMES}
+                return states[411]
+            time.sleep(.15)
+        raise TimeoutError('兵营初始化查询超时，未收到新的成功响应；请确认已进入西游幻境并加载完成')
+
+    def set_enabled(self, enabled, units=(411,), use_training_speed=False):
+        """Authorize training and optional item use separately; master-off revokes both immediately."""
+        if self.script is not None:
+            selected = checked_units(units) if enabled else ()
+            self.script.exports_sync.setenabled(bool(enabled), list(selected), bool(use_training_speed))
+
+    def set_hero_enabled(self, enabled, heroes=()):
+        """Apply only explicitly selected hero IDs and revoke the preceding generation of requests."""
+        if self.script is not None:
+            selected = checked_heroes(heroes) if enabled else ()
+            self.hero_generation = self.script.exports_sync.setheroenabled(bool(enabled), list(selected))
+
+    def hero_call(self, operation, generation=None, hero_id=303):
+        """Dispatch fixed operations for one validated identifier, with no arbitrary UI-supplied Lua."""
+        if operation not in {'hero_status', 'hero_list', 'hero_refresh', 'hero_speed', 'hero_view'}:
+            raise ValueError('Unknown hero operation')
+        checked_heroes((hero_id,))
+        argument = str(hero_id) if operation in {'hero_status', 'hero_speed'} else ''
+        with self.lock:
+            result = self.script.exports_sync.query(f'return REA_AUTO_INFANTRY.{operation}({argument})',
+                                                    'hero' if operation == 'hero_speed' else False, hero_id,
+                                                    generation)
+            return json.loads(result) if operation in {'hero_status', 'hero_list', 'hero_view'} else result
+
+    def hero_view(self):
+        """Read existing response/push changes locally; this operation never sends a game request."""
+        return self.hero_call('hero_view')
+
+    def refresh_hero(self, timeout=6, hero_id=303):
+        """Require new hero and army responses for the requested individual before another item."""
+        return self._refresh_heroes('hero_status', hero_id, timeout)
+
+    def refresh_heroes(self, timeout=6):
+        """Read the complete authoritative roster without opening a building or spending resources."""
+        return self._refresh_heroes('hero_list', 303, timeout)
+
+    def _refresh_heroes(self, operation, hero_id, timeout):
+        """Wait for both response generations, sharing the same freshness rule for lists and individuals."""
+        before = self.hero_call(operation, hero_id=hero_id)
+        self.hero_call('hero_refresh')
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.hero_call(operation, hero_id=hero_id)
+            if state['hero_seq'] > before['hero_seq'] and state['army_seq'] > before['army_seq']:
+                if not state['fresh']:
+                    raise RuntimeError('英雄状态刷新耗时过长，暂不恢复')
+                return state
+            time.sleep(0.15)
+        raise TimeoutError('英雄或部队查询超时，自动恢复已停止')
+
+    def recover_hero(self, before, generation, timeout=6):
+        """Consume one recovery item and verify the response type/target before authoritative refresh."""
+        hero_id = before['hero_id']
+        checked_heroes((hero_id,))
+        self.hero_call('hero_speed', generation, hero_id=hero_id)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.hero_call('hero_status', hero_id=hero_id)
+            if state['speed_seq'] > before['speed_seq']:
+                if (state['speed_ret'] != 0 or state['speed_kind'] != 3 or
+                        state['speed_type'] != 500 or state['speed_target'] != hero_id):
+                    raise RuntimeError('英雄加速响应失败或不属于请求英雄，已停止；请勿同时手动加速')
+                return self.refresh_hero(hero_id=hero_id)
+            time.sleep(0.15)
+        raise TimeoutError('英雄恢复结果不明，已停止且不会自动重发')
+
+    def set_collection_enabled(self, enabled):
+        """Revoke queued departures immediately without touching the shared recovery or troop gates."""
+        if self.script is not None:
+            self.collect_generation = self.script.exports_sync.setcollectenabled(bool(enabled))
+
+    def collection_call(self, operation, arguments=(), generation=None, hero_id=1):
+        """Invoke numeric collection operations; scope loads and departures share the revocable collection gate."""
+        if operation not in {'collect_candidates', 'collect_query', 'collect_status', 'collect_metrics', 'collect_dispatch',
+                             'collect_push_status', 'collect_schedule', 'collect_region_plan', 'collect_region_query',
+                             'collect_region_read', 'collect_balance_state'}:
+            raise ValueError('Unknown collection operation')
+        if any(type(value) is not int or value < 0 or value > 100000000 for value in arguments):
+            raise ValueError('Invalid collection parameters')
+        source = 'return REA_AUTO_INFANTRY.' + operation + '(' + ','.join(map(str, arguments)) + ')'
+        with self.lock:
+            result = self.script.exports_sync.query(source, 'collect' if operation in {'collect_dispatch','collect_region_query'} else False,
+                                                    hero_id, generation)
+            return json.loads(result) if operation in {'collect_candidates', 'collect_status', 'collect_metrics',
+                'collect_push_status', 'collect_schedule', 'collect_region_plan', 'collect_region_read',
+                'collect_balance_state'} else result
+
+    def collection_balance(self, cancelled):
+        """Estimate existing ordinary trips once per decision, then reconcile stock and armies after the reads.
+
+        The existing resource query supplies each resident's server maximum or a marching hero's
+        target-specific load. All spending gates stay unchanged; this method owns no timer.
+        """
+        if cancelled():
+            raise InterruptedError('采集已关闭，停止收益查询')
+        roster = None
+        try:
+            snapshot = self.collection_call('collect_balance_state')
+        except Exception as error:
+            if 'Fresh army state is required for resource balancing' not in str(error) or cancelled():
+                raise
+            # Slow region/barrack reads can expire the pre-planning snapshot; refresh this read once only.
+            roster = self.refresh_heroes()
+            snapshot = self.collection_call('collect_balance_state')
+        metrics = {}
+        queried = False
+        for army in snapshot['armies']:
+            if army['aim'] != 1 or army['state'] in (7, 9) or army['target_id'] in metrics:
+                continue
+            if cancelled():
+                raise InterruptedError('采集已关闭，停止收益查询')
+            queried = True
+            try:
+                metrics[army['target_id']] = self.query_collection(army['target_id'])
+            except ResourceMissing:
+                # This is an existing trip, not a new candidate: never delete a saved coordinate here.
+                metrics[army['target_id']] = {}
+        if cancelled():
+            raise InterruptedError('采集已关闭，停止分配')
+        if queried:
+            roster = self.refresh_heroes()
+        snapshot = self.collection_call('collect_balance_state')
+        return {'balance': resource_balance(snapshot, metrics), 'roster': roster}
+
+    def collection_push_sequence(self):
+        """Read the passive own-army notification marker locally; this sends no game-server request."""
+        return self.collection_call('collect_push_status')['seq']
+
+    def set_hunt_enabled(self, enabled):
+        """Immediately revoke queued hunting departures and skips without touching other switches."""
+        if self.script is not None:
+            self.hunt_generation = self.script.exports_sync.sethuntenabled(bool(enabled))
+
+    def hunt_call(self, operation, arguments=(), generation=None, hero_id=1):
+        """Gate numeric hunting operations and refresh once only for explicit pre-send stale guards."""
+        readable = {'hunt_candidates', 'hunt_schedule', 'hunt_watch', 'hunt_status', 'hunt_metrics',
+                    'hunt_scan_plan', 'hunt_region_state', 'hunt_region_read', 'hunt_refresh_clock'}
+        operations = readable | {'hunt_query', 'hunt_cancel_query', 'hunt_dispatch', 'hunt_ack', 'hunt_release',
+                                 'hunt_skip', 'hunt_region_query'}
+        if operation not in operations or any(type(v) is not int or not 0 <= v <= 100000000 for v in arguments):
+            raise ValueError('Invalid hunting operation or arguments')
+        source = 'return REA_AUTO_INFANTRY.' + operation + '(' + ','.join(map(str, arguments)) + ')'
+        for attempt in range(2):
+            try:
+                with self.lock:
+                    gated = operation in {'hunt_dispatch', 'hunt_skip'} or (operation == 'hunt_region_query' and generation is not None)
+                    value = self.script.exports_sync.query(source, 'hunt' if gated else False,
+                                                           hero_id, generation)
+                return json.loads(value) if operation in readable else value
+            except Exception as error:
+                # These exact Lua guards precede all native callbacks and submission markers.
+                # Never retry a dispatch, transport timeout, server refusal or ambiguous skip.
+                guard = {'hunt_schedule': 'Fresh own-army response required',
+                         'hunt_skip': 'Fresh busy hero required'}.get(operation)
+                if attempt or guard is None or guard not in str(error):
+                    raise
+                self.refresh_heroes()
+
+    def _load_hunt_region(self, x, y, timeout=6, generation=None, collection_generation=None):
+        """Read one exact24/18 area under the caller's gate; cleanup loads remain independently read-only."""
+        before = self.hunt_call('hunt_region_state')
+        if collection_generation is not None:
+            self.collection_call('collect_region_query', (x, y), collection_generation)
+        elif generation is None:
+            self.hunt_call('hunt_region_query', (x, y))
+        else:
+            self.hunt_call('hunt_region_query', (x, y), generation)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.hunt_call('hunt_region_state')
+            if state['seq'] > before['seq']:
+                if (state['last_x'], state['last_y'], state['view_x'], state['view_y']) != (x, y, x, y):
+                    raise RuntimeError('其他地图查询替换了本次区域响应，未出征')
+                return state
+            time.sleep(.1)
+        raise TimeoutError('地图区域查询超时，未继续扫描或出征')
+
+    @contextmanager
+    def _hunt_region_scope(self, x, y, generation=None, collection_generation=None):
+        """Scope hunting or resource lookup to a temporary cache, preserving the user's current camera area."""
+        original = self.hunt_call('hunt_region_state')
+        origin = (original['view_x'], original['view_y'])
+        if any(type(v) is not int or v < 0 for v in origin):
+            raise RuntimeError('原地图区域未知，未开始区域查询')
+        try:
+            state = self._load_hunt_region(x, y, generation=generation, collection_generation=collection_generation)
+            yield state
+        finally:
+            latest = self.hunt_call('hunt_region_state')
+            camera = (latest.get('camera_x'), latest.get('camera_y'))
+            camera_moved = (all(type(v) is int and v >= 0 for v in camera) and
+                            camera != (original.get('camera_x'), original.get('camera_y')))
+            # Respect a user camera move made during the read instead of restoring an obsolete area.
+            if origin != (x, y) or camera_moved:
+                self._load_hunt_region(*(camera if camera_moved else origin))
+
+    def query_hunt_region(self, region, radius, generation=None):
+        """Return independent sightings from one confirmed response, restoring the previous region before return."""
+        x, y = region['x'], region['y']
+        with self._hunt_region_scope(x, y, generation) as state:
+            return self.hunt_call('hunt_region_read', (radius, state['seq'], x, y))
+
+    @contextmanager
+    def hunt_target_region(self, target, radius, generation=None):
+        """Reload an uncached catalog target through final dispatch checks; discovery records alone never authorize it."""
+        rows = self.hunt_call('hunt_candidates', (radius,))
+        if any(all(row[k] == target[k] for k in ('target_id', 'config_id', 'x', 'y')) for row in rows):
+            yield
+        else:
+            with self._hunt_region_scope(target['logic_x'], target['logic_y'], generation):
+                yield
+
+    def query_monster(self, target_id, timeout=6):
+        """Refresh expired eligibility once during this target check, never treating stale reads as busy heroes."""
+        for attempt in range(2):
+            metrics = self._query_monster_once(target_id, timeout)
+            own_fresh = metrics['own_state_fresh']
+            if own_fresh and metrics['target']['fresh']:
+                return metrics
+            if attempt:
+                raise RuntimeError('打野查询数据持续过期，未出征；请检查游戏响应是否缓慢')
+            if not own_fresh:
+                self.refresh_heroes()
+            # The hero refresh can outlive target freshness: require another exact-target reply too.
+
+    def _query_monster_once(self, target_id, timeout):
+        """Await one exact target's new detail/candidate replies and always release popup suppression."""
+        before = self.hunt_call('hunt_status')
+        try:
+            self.hunt_call('hunt_query', (target_id,))
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                state = self.hunt_call('hunt_status')
+                if (state['target_id'] == target_id and state['ready'] and
+                        state['detail_seq'] > before['detail_seq'] and state['available_seq'] > before['available_seq']):
+                    if state['detail_ret'] != 0 or state['available_ret'] != 0:
+                        raise RuntimeError(f"野怪查询失败：{state['detail_ret']} / {state['available_ret']}")
+                    return self.hunt_call('hunt_metrics')
+                time.sleep(.1)
+            raise TimeoutError('野怪详情或可用英雄查询超时，未派出')
+        finally:
+            self.hunt_call('hunt_cancel_query')
+
+    def dispatch_hunt(self, target, formation, radius, generation):
+        """Send one guarded formation, match its server receipt, and bind the confirmed army for later skip."""
+        if self.response_log is None:
+            self.response_log = GameResponseLog(ADB)
+        self.response_log.drain()
+        hero_id, target_id = formation['hero_id'], target['target_id']
+        self.hunt_call('hunt_dispatch', (target_id, hero_id, formation['soldier_id'], formation['followers'],
+                                        target['detail_seq'], target['available_seq'], radius, target['x'], target['y']),
+                       generation, hero_id)
+        receipt = self.response_log.wait_hunt(hero_id, target_id)
+        roster = self.refresh_heroes()
+        self.hunt_call('hunt_ack', (target_id, hero_id, receipt['army_id']))
+        return receipt, roster
+
+    def skip_hunt(self, active, generation):
+        """Submit the native skip once and attribute the quick-combat response to the tracked army."""
+        if self.response_log is None:
+            self.response_log = GameResponseLog(ADB)
+        self.response_log.drain()
+        self.hunt_call('hunt_skip', (active['target_id'], active['hero_id'], active['army_id']), generation, active['hero_id'])
+        return self.response_log.wait_hunt_skip(active['army_id'], active['target_id'])
+
+    def set_league_enabled(self, enabled):
+        """Revoke alliance mining independently of ordinary mining, hunting and recovery."""
+        if self.script is not None:
+            self.league_generation = self.script.exports_sync.setleagueenabled(bool(enabled))
+
+    def set_beacon_enabled(self, enabled):
+        """Revoke beacon actions and preparation reads without changing any other feature switch."""
+        if self.script is not None:
+            self.beacon_generation = self.script.exports_sync.setbeaconenabled(bool(enabled))
+
+    def configure_beacon(self, kinds):
+        """Close the old epoch before applying the explicitly selected native event types."""
+        from beacon_preferences import checked_types
+        kinds=checked_types(kinds)
+        self.set_beacon_enabled(False)
+        self.beacon_call('beacon_configure',(sum(2**(k-1) for k in kinds),))
+
+    def query_beacon_scout(self,event_id,generation,cancelled=None):
+        """Send one stock GET, then wait only on the local matching response."""
+        if cancelled and cancelled():raise InterruptedError('烽火台侦察检查已取消')
+        self.beacon_call('beacon_scout_query',(event_id,),generation)
+        deadline=time.monotonic()+6
+        while time.monotonic()<deadline:
+            if cancelled and cancelled():raise InterruptedError('烽火台侦察检查已取消')
+            result=self.beacon_call('beacon_scout_result',(event_id,))
+            if result['ready']:return result
+            time.sleep(.1)
+        raise TimeoutError('斥候库存查询超时，未重复发送')
+
+    def beacon_call(self, operation, arguments=(), generation=None, hero_id=1):
+        """Expose only fixed beacon operations and gate all actions plus target-candidate queries by run epoch."""
+        readable = {'beacon_watch', 'beacon_snapshot', 'beacon_candidates_result', 'beacon_scout_result','beacon_target_result'}
+        gated = {'beacon_dispatch', 'beacon_recall', 'beacon_claim', 'beacon_candidates_query', 'beacon_scout', 'beacon_skip', 'beacon_scout_query','beacon_target_query'}
+        if operation not in readable | gated | {'beacon_info_query', 'beacon_cancel_query', 'beacon_ack', 'beacon_configure','beacon_rejected'}:
+            raise ValueError('Invalid beacon operation')
+        if any(type(v) is not int or not (0 if operation=='beacon_configure' else 1) <= v <= 100000000 for v in arguments):
+            raise ValueError('Invalid beacon arguments')
+        source = 'return REA_AUTO_INFANTRY.' + operation + '(' + ','.join(map(str, arguments)) + ')'
+        with self.lock:
+            value = self.script.exports_sync.query(source, 'beacon' if operation in gated else False,
+                                                   hero_id, generation)
+        return json.loads(value) if operation in readable | {'beacon_dispatch', 'beacon_scout'} else value
+
+    def _wait_beacon_read(self, operation, cancelled=None, timeout=6):
+        """Wait only on local caches after one GET; cancellation prevents all dependent operations."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if cancelled and cancelled():
+                raise InterruptedError('烽火台检查已取消')
+            value = self.beacon_call(operation)
+            if value['ready']:
+                return value
+            time.sleep(.1)
+        raise TimeoutError('烽火台查询超时，未重复发送')
+
+    def query_beacon(self, cancelled=None):
+        """Fetch one fresh event list; create the response log before taking any time-sensitive snapshots."""
+        if cancelled and cancelled():
+            raise InterruptedError('烽火台检查已取消')
+        if self.response_log is None:
+            self.response_log = GameResponseLog(ADB)
+        self.beacon_call('beacon_info_query')
+        return self._wait_beacon_read('beacon_snapshot', cancelled)
+
+    def query_beacon_candidates(self, event_id, generation, cancelled=None):
+        """Fetch the exact event's detail then native availability without a popup or recovery request."""
+        if cancelled and cancelled():
+            raise InterruptedError('烽火台选将已取消')
+        try:
+            self.beacon_call('beacon_target_query',(event_id,),generation)
+            self._wait_beacon_read('beacon_target_result',cancelled)
+            if cancelled and cancelled():raise InterruptedError('烽火台选将已取消')
+            self.beacon_call('beacon_candidates_query', (event_id,), generation)
+            return self._wait_beacon_read('beacon_candidates_result', cancelled)
+        except Exception:
+            self.beacon_call('beacon_cancel_query')
+            raise
+
+    def beacon_action(self, operation, event_id, generation, hero_id=1, army_id=None):
+        """Submit one selected event action, require its exact receipt and confirm resulting server state."""
+        if operation not in {'dispatch', 'recall', 'claim', 'scout', 'skip'}:
+            raise ValueError('Invalid beacon action')
+        if self.response_log is None:
+            raise RuntimeError('烽火台响应日志未准备')
+        arguments = (event_id, hero_id) if operation == 'dispatch' else (
+            (event_id, hero_id, army_id) if operation in {'recall','skip'} else (event_id,))
+        self.response_log.drain()
+        result = self.beacon_call('beacon_' + operation, arguments, generation, hero_id)
+        if operation=='dispatch' and isinstance(result,dict) and result.get('not_sent') is True:
+            if result.get('reason')=='capacity_full' and result.get('event_id')==event_id:
+                raise BeaconCapacityUnavailable('发令前确认烽火台额度已满，本次未发送')
+            raise RuntimeError('烽火台本地出征结果无法确认，不重发')
+        if operation=='skip':
+            receipt=self.response_log.wait_hunt_skip(army_id,event_id,expected_aim=45)
+            if not receipt['won']:
+                raise RuntimeError('烽火台战斗未获胜，已停止')
+        elif operation=='scout':
+            receipt=self.response_log.wait_beacon_scout(result['logic_x'],result['logic_y'])
+        else:
+            receipt = self.response_log.wait_beacon(operation, event_id, hero_id, army_id)
+        roster = self.refresh_heroes()
+        if operation == 'dispatch':
+            self.beacon_call('beacon_ack', (event_id, hero_id, receipt['army_id']))
+        snapshot = self.query_beacon()
+        event = next((e for e in snapshot['events'] if e['event_id'] == event_id), None)
+        if operation == 'recall' and (event is None or event['state'] != 3):
+            raise RuntimeError('撤回成功但救援完成未确认，不重复撤回')
+        if operation == 'claim' and event is not None:
+            raise RuntimeError('领奖成功但事件释放未确认，不重复领奖')
+        return receipt, snapshot, roster
+
+    def league_call(self, operation, arguments=(), generation=None, hero_id=1):
+        """Gate alliance operations and refresh once only when the read-only own-army snapshot is rejected."""
+        readable = {'league_watch', 'league_build_result', 'league_mine_result', 'league_metrics', 'league_schedule',
+                    'league_heroes_result'}
+        if operation not in readable | {'league_build_query', 'league_mine_query', 'league_cancel_query',
+                                       'league_dispatch', 'league_ack', 'league_heroes_query'}:
+            raise ValueError('Invalid alliance operation')
+        if any(type(v) is not int or not 0 < v <= 100000000 for v in arguments):
+            raise ValueError('Invalid alliance arguments')
+        source = 'return REA_AUTO_INFANTRY.' + operation + '(' + ','.join(map(str, arguments)) + ')'
+        for attempt in range(2):
+            try:
+                with self.lock:
+                    value = self.script.exports_sync.query(source, 'league' if operation == 'league_dispatch' else False,
+                                                           hero_id, generation)
+                return json.loads(value) if operation in readable or operation == 'league_dispatch' else value
+            except Exception as error:
+                # This exact guard is in league_schedule, which reads but never submits an army.
+                if attempt or operation != 'league_schedule' or 'Fresh own armies required' not in str(error):
+                    raise
+                self.refresh_heroes()
+
+    def query_league(self, timeout=6):
+        """Discover the current mine from a new own-building response, then read exact target metrics once."""
+        def wait_result(operation):
+            """Wait for arrival in local model caches without resending the server request."""
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                result = self.league_call(operation)
+                if result['ready']:
+                    return result
+                time.sleep(.1)
+            raise TimeoutError('联盟采集查询超时，未派出')
+        try:
+            self.league_call('league_build_query')
+            building = wait_result('league_build_result')
+            if not building['found']:
+                return {'mine': None, 'heroes': []}
+            self.league_call('league_mine_query', (building['target_id'],))
+            wait_result('league_mine_result')
+            metrics = self.league_call('league_metrics')
+            mine = metrics['mine']
+            if (mine['stock'] > 0 and mine['occupied'] < mine['capacity'] and
+                    not mine['own_present'] and mine['visible']):
+                self.league_call('league_heroes_query')
+                wait_result('league_heroes_result')
+            return self.league_call('league_metrics')
+        finally:
+            self.league_call('league_cancel_query')
+
+    def dispatch_league(self, target_id, hero_id, generation):
+        """Submit once, match the exact server receipt and confirm the accepted army before any later send."""
+        if self.response_log is None:
+            raise RuntimeError('联盟采集响应日志尚未准备')
+        self.response_log.drain()
+        plan = self.league_call('league_dispatch', (target_id, hero_id), generation, hero_id)
+        receipt = self.response_log.wait_league(hero_id, target_id, plan['secondary_target'])
+        roster = self.refresh_heroes()
+        self.league_call('league_ack', (target_id, hero_id, receipt['army_id']))
+        return receipt, roster
+
+    def collection_candidates(self, kind, level, radius):
+        """Read only loaded resource points; never expand the map silently or select an enemy army."""
+        return self.collection_call('collect_candidates', (kind, level, radius))
+
+    def collection_list_candidates(self, coordinates, generation, cancelled=None):
+        """Locate saved points across missing regions once per triggered check, keeping results outside the game cache."""
+        saved = set(map(tuple, coordinates))
+        found = {}
+        def merge(rows):
+            """Merge only requested coordinates so overlapping area replies cannot add unintended targets."""
+            for row in rows:
+                point = (row['x'], row['y'])
+                if point in saved:
+                    found[point] = row
+        merge(self.collection_candidates(0, 0, 0))
+        missing = sorted(saved - found.keys())
+        loaded = 0
+        if missing and not (cancelled and cancelled()):
+            plan = self.collection_call('collect_region_plan', tuple(value for p in missing for value in p))
+            for region in plan['regions']:
+                if cancelled and cancelled():
+                    break
+                if all(tuple(p) in found for p in region['coordinates']):
+                    continue
+                x, y = region['x'], region['y']
+                with self._hunt_region_scope(x, y, collection_generation=generation) as state:
+                    if cancelled and cancelled():
+                        break
+                    merge(self.collection_call('collect_region_read', (state['seq'], x, y)))
+                    loaded += 1
+        return {'rows': list(found.values()), 'regions_loaded': loaded}
+
+    def query_collection(self, target_id, timeout=6):
+        """Match a resource wire reply, then await fresh native data; only an attributed6001 means missing."""
+        if self.response_log is None:
+            self.response_log = GameResponseLog(ADB)
+        self.response_log.drain()
+        before = self.collection_call('collect_status')
+        self.collection_call('collect_query', (target_id,))
+        try:
+            self.response_log.wait_resource_detail(target_id, timeout)
+        except ResourceMissing:
+            # A late reply from a previous world/account cannot delete a coordinate in the current session.
+            self.collection_call('collect_status')
+            raise
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.collection_call('collect_status')
+            if state.get('observer_error'):
+                raise RuntimeError('采集响应结构异常，未派出')
+            if (state['ready'] and state['target_id'] == target_id and
+                    state['detail_seq'] > before['detail_seq'] and state['available_seq'] > before['available_seq']):
+                if state['fresh']:
+                    metrics = self.collection_call('collect_metrics')
+                    if metrics['target'].get('fresh'):
+                        return metrics
+            time.sleep(.1)
+        raise TimeoutError('采集目标或选将数据查询超时，未派出')
+
+    def dispatch_collection(self, metrics, hero_id, generation):
+        """Send once, then bind the exact accepted army/hero/aim/target in fresh own actions before another team."""
+        checked_heroes((hero_id,))
+        target = metrics['target']
+        if self.response_log is None:
+            raise RuntimeError('采集响应日志尚未准备，未派出')
+        self.response_log.drain()
+        arguments = (target['target_id'], hero_id, target['kind'], target['level'],
+                     target['detail_seq'], target['available_seq'], target['scope_radius'], target['x'], target['y'])
+        if target.get('balance_guard'):
+            arguments += (1,)
+        self.collection_call('collect_dispatch', arguments, generation, hero_id)
+        receipt = self.response_log.wait_collection(hero_id, target['target_id'])
+        roster = self.refresh_heroes()
+        hero = next((row for row in roster['heroes'] if row['hero_id'] == hero_id), None)
+        if hero is None or not hero['fresh'] or not hero['army_known'] or (not hero['busy'] and hero['hero_state'] == 0):
+            raise RuntimeError('服务器已接受，但英雄出征状态未确认，已停止且不重复派出')
+        schedule = self.collection_call('collect_schedule')
+        if not any(row.get('army_id') == receipt['army_id'] and row.get('hero_id') == hero_id and
+                   row.get('aim') == 1 and row.get('target_id') == target['target_id'] and
+                   row.get('state') in (2, 3, 6) for row in schedule['stages']):
+            raise RuntimeError('服务器已接受，但采集队伍及目标未确认，已停止且不重复派出')
+        return receipt, roster
+
+    def prepare_collection(self):
+        """Prepare log ownership and refresh all barrack species before hero/target queries begin."""
+        if self.response_log is None:
+            self.response_log = GameResponseLog(ADB)
+        # The barrack response includes all species; 411 only selects the response-generation probe.
+        self.refresh(411)
+
+    def refresh(self, unit=411, timeout=6):
+        """Wait for a new server barrack response; a timeout never repeats spending commands."""
+        previous = self.call('status', unit)['barrack_seq']
+        self.call('refresh', unit)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.call('status', unit)
+            if state['barrack_seq'] > previous:
+                return state
+            time.sleep(0.15)
+        raise TimeoutError('No new barrack response; stopped')
+
+    def action(self, operation, unit=411, timeout=6):
+        """Check building availability before spending, then require an attributed successful response."""
+        if operation not in {'train', 'speed'}:
+            raise ValueError('Only training and acceleration are spending actions')
+        sequence = 'train_seq' if operation == 'train' else 'speed_seq'
+        result = 'train_ret' if operation == 'train' else 'speed_ret'
+        response_unit = 'train_unit' if operation == 'train' else 'speed_unit'
+        before = self.call('status', unit)
+        if before.get('upgrade_known') is not True or before.get('upgrading') is not False:
+            raise BarrackUnavailable('兵营正在升级或升级状态未确认，自动造兵已关闭；请升级完成后重新开启')
+        previous = before[sequence]
+        if operation == 'train':
+            if self.response_log is None:
+                self.response_log = GameResponseLog(ADB)
+            self.response_log.drain()
+        try:
+            self.call(operation, unit)
+        except Exception as error:
+            if 'REA_BARRACK_TRAINING_UNAVAILABLE' in str(error):
+                raise BarrackUnavailable('发送前发现兵营升级中或状态未确认，自动造兵已关闭') from error
+            raise
+        if operation == 'train':
+            self.response_log.wait_training(unit, timeout)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.call('status', unit)
+            if state[sequence] > previous:
+                if state[result] != 0:
+                    raise RuntimeError(f'{operation} rejected by server: {state[result]}')
+                if state[response_unit] != unit:
+                    raise RuntimeError('响应兵种与请求不一致，已停止；请勿同时手动训练或加速')
+                return self.refresh(unit)
+            time.sleep(0.15)
+        raise TimeoutError(f'{operation} result uncertain; do not repeat automatically')
+
+    def close(self):
+        """Remove the caller API, detach hooks, and release the process even after an RPC failure."""
+        if self.script is not None:
+            try:
+                self.set_enabled(False)
+                self.set_hero_enabled(False)
+                self.set_collection_enabled(False)
+                self.set_hunt_enabled(False)
+                self.set_league_enabled(False)
+                self.set_beacon_enabled(False)
+                self.script.exports_sync.query('if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.beacon_close then REA_AUTO_INFANTRY.beacon_close() end;'
+                                               'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.league_close then '
+                                               'REA_AUTO_INFANTRY.league_close() end;'
+                                               'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.hunt_close then '
+                                               'REA_AUTO_INFANTRY.hunt_close() end;'
+                                               'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.collect_close then '
+                                               'REA_AUTO_INFANTRY.collect_close() end;_G.REA_AUTO_INFANTRY=nil; return "closed"')
+                self.script.exports_sync.close()
+            except Exception:
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    self.script.unload()
+                self.script = None
+        if self.session is not None:
+            with contextlib.suppress(Exception):
+                self.session.detach()
+            self.session = None
+        if self.mutex_handle is not None:
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel.ReleaseMutex.argtypes = [ctypes.c_void_p]
+            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel.ReleaseMutex(self.mutex_handle)
+            kernel.CloseHandle(self.mutex_handle)
+            self.mutex_handle = None

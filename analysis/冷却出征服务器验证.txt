@@ -1,0 +1,26 @@
+冷却出征服务器验证（2026-11-05）
+
+结果：服务器实际拒绝了冷却中的西施对用户所选4级巡山妖怪的出征请求。并非仅观察客户端按钮禁用。
+
+接口：游戏自身的SLGMainController.sendTSLGStartArmyTripReq，协议11010。
+英雄：西施303；目标位置标识148532；野怪配置100401。
+没有修改本地恢复结束时间，没有改变英雄状态，没有使用恢复加速。
+
+测试过程
+1. 第一笔请求于17:03:41发送，西施剩余冷却1581121毫秒，未带随行兵。服务器返回6012。错误配置原文为“军队组建失败”。该结果存在编队差异，不能单独用于定位冷却校验。
+2. 对照于17:05:20发送，西施剩余冷却1482635毫秒，带两个单兵步兵随行项（位置5和1），与用户16:34:51成功请求的请求体逐字节完全一致；当时服务器返回0，本次返回6012。没有反复重试，两个测试各有独立的发送前防重复标记。
+3. 再次查询：西施状态0，仍有恢复倒计时，活动部队中无匹配，没有成功出征。五分钟英雄恢复加速库存前后均为1563。
+
+结论边界
+可以确认这次直接调用原出征接口也被服务器拒绝，跳过客户端禁用选择并不足以让本次冷却中的西施出征。
+6012是泛化的“军队组建失败”，不是明确标注冷却的错误码。结合请求体与历史成功请求完全一致、英雄当时仍在冷却，结果支持服务端仍检查英雄可组队状态；但没有服务端源码，不能把冷却断言为该错误的唯一可能原因。
+未修改现有助手的业务功能，也未安装自动出征循环。
+
+证据
+analysis/evidence/cooldown-trip-send.json
+analysis/evidence/cooldown-trip-server.json
+analysis/evidence/cooldown-trip-control-send.json
+analysis/evidence/cooldown-trip-control-server.json
+analysis/evidence/trip-prior-reference.json
+analysis/evidence/trip-error-6012.txt
+analysis/evidence/hero-runtime-validation.json（最后一次只读查询）

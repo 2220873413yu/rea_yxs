@@ -1,0 +1,42 @@
+# Local tools, virtual environments and original application packages.
+/.analysis-tools/
+/.venv/
+/venv/
+*.apk
+*.aab
+*.exe
+*.dll
+*.so
+*.zip
+*.7z
+
+# Python caches and test/build output.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Per-installation selections, account-related runtime data and diagnostics.
+/auto_infantry/*.json
+/auto_infantry/*.jsonl
+/auto_infantry/startup-error.txt
+*.log
+.env
+.env.*
+!.env.example
+
+# Keep research source and notes; raw evidence and extracted client assets stay local.
+/analysis/*
+!/analysis/*.py
+!/analysis/*.lua
+!/analysis/*.md
+!/analysis/*.txt
+
+# Editor/OS metadata.
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

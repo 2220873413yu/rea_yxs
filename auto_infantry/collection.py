@@ -1,0 +1,116 @@
+"""Collection choices and pending recovery demand, independent of game transport and UI."""
+from dataclasses import dataclass
+from resource_preferences import checked_coordinates
+
+RESOURCE_NAMES = {1: '粮', 2: '木', 3: '铁'}
+
+
+@dataclass(frozen=True)
+class CollectionOptions:
+    """Freeze one run's resource scope; fixed coordinates use the game's display coordinate system."""
+    kind: int = 3
+    level: int = 2
+    radius: int = 20
+    mode: str = 'coordinate'
+    x: int = 101
+    y: int = 191
+    coordinates: tuple = ()
+
+    def __post_init__(self):
+        """Reject malformed options before any query, recovery authorization or departure."""
+        if (type(self.kind) is not int or self.kind not in RESOURCE_NAMES or
+                type(self.level) is not int or not 1 <= self.level <= 10 or
+                type(self.radius) is not int or not 1 <= self.radius <= 100 or
+                self.mode not in {'coordinate', 'nearby', 'list'} or type(self.x) is not int or
+                type(self.y) is not int or not 0 <= self.x <= 10000 or not 0 <= self.y <= 10000):
+            raise ValueError('采集类型、等级、范围或坐标无效')
+        object.__setattr__(self, 'coordinates', checked_coordinates(self.coordinates))
+        if self.mode == 'list' and not self.coordinates:
+            raise ValueError('请先录入并保存资源清单')
+
+
+def quantity_allowed(level, quantity):
+    """Require40000 for levels4+, and any positive remaining quantity for lower levels."""
+    return (type(level) is int and 1 <= level <= 10 and
+            type(quantity) in (int, float) and quantity > 0 and (level < 4 or quantity >= 40000))
+
+
+def collection_slot_available(target):
+    """Require native relationship permission, a configured free slot and no own army at the point."""
+    capacity, occupied = target.get('capacity'), target.get('occupants')
+    return (target.get('rules_known') is True and target.get('can_collect') is True and
+            target.get('own_present') is False and type(capacity) is int and capacity > 0 and
+            type(occupied) is int and 0 <= occupied < capacity)
+
+
+def active_resource_targets(schedule):
+    """Read own marching/collecting destinations from an already-refreshed schedule, excluding returned armies."""
+    targets = set()
+    for row in schedule['stages']:
+        if row.get('aim') == 1 and row['state'] not in (7, 9):
+            target = row.get('target_id')
+            if type(target) is not int or target <= 0:
+                raise RuntimeError('采集队伍目标不明，未继续派出')
+            targets.add(target)
+    return targets
+
+
+def candidate_targets(rows, options, blocked, now, active_targets=()):
+    """Order scoped points while excluding own inbound/collecting destinations before any resource query."""
+    return sorted((row for row in rows if row['kind'] in RESOURCE_NAMES and
+                   (options.mode == 'list' or row['kind'] == options.kind) and
+                   (options.mode == 'list' or row['level'] == options.level) and
+                   (options.mode == 'list' or row['distance'] <= options.radius) and
+                   (options.mode == 'list' or row['quantity'] > 0) and
+                   row['target_id'] not in active_targets and blocked.get(row['target_id'], 0) <= now and (options.mode == 'nearby' or
+                   (options.mode == 'list' and (row['x'], row['y']) in options.coordinates) or
+                   (options.mode == 'coordinate' and row['x'] == options.x and row['y'] == options.y))),
+                  key=lambda row: (row['distance'], row['x'], row['y'], row['target_id']))
+
+
+def best_collector(metrics, roster):
+    """Rank target-specific speeds, allowing idle-but-cooling heroes while excluding busy/unknown heroes."""
+    states = {state['hero_id']: state for state in roster['heroes']}
+    eligible = []
+    for row in metrics['heroes']:
+        state = states.get(row['hero_id'])
+        if (state and state.get('found') and state.get('fresh') and state.get('army_known') and
+                not state.get('busy') and state.get('hero_state') == 0 and row.get('fresh') and
+                row.get('army_known') and not row.get('busy') and row.get('hero_state') == 0 and
+                row.get('action_state') in (0, 5) and row.get('speed', 0) > 0):
+            eligible.append(row)
+    if not eligible:
+        return None
+    return min(eligible, key=lambda row: (-row['speed'], -row['load'], row['travel_seconds'], row['hero_id']))
+
+
+class CollectionRun:
+    """Keep a single resource/hero plan whose recovery demand merges with normal automatic recovery."""
+
+    def __init__(self, options):
+        self.options = options
+        self.plan = None
+        self.needs_recovery = False
+        self.blocked = {}
+
+    @property
+    def recovery_hero(self):
+        """Expose at most one hero demand; no separate recovery queue or sender exists here."""
+        return self.plan['hero_id'] if self.plan and self.needs_recovery else None
+
+    def observe(self, roster):
+        """Drop a plan that became busy/unknown, or release its recovery demand when cooldown reaches zero."""
+        if not self.plan:
+            return
+        state = next((row for row in roster['heroes'] if row['hero_id'] == self.plan['hero_id']), None)
+        if (state is None or not state.get('found') or not state.get('fresh') or not state.get('army_known') or
+                state.get('busy') or state.get('hero_state') != 0):
+            self.plan = None
+            self.needs_recovery = False
+        else:
+            self.needs_recovery = state['remaining_ms'] > 0
+
+    def reserve(self, target, hero, state):
+        """Reserve the fastest non-busy hero for this target, including a shared recovery demand if needed."""
+        self.plan = {'target_id': target['target_id'], 'hero_id': hero['hero_id'], 'name': hero['name']}
+        self.needs_recovery = state['remaining_ms'] > 0

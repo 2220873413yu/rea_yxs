@@ -1,0 +1,176 @@
+英雄杀：西游幻境兵营后台训练与加速——分析记录
+日期：2026-11-05（Asia/Shanghai）
+
+1. 当前判断
+
+训练和加速已定位到真实业务函数，并在不进入兵营的情况下完成了后台单兵完整实测。
+电脑控制窗口第一版已经实现，默认关闭；整轮补满到上限的实际运行尚未进行，满额停止逻辑通过离线测试。
+现已根据用户手动完成的训练和加速操作，确认训练协议 11029、加速协议 186，以及五分钟训练加速道具 70251；详细验证见第 8 节。
+
+2. 样本和工具
+
+APK：D:/reaWorko/rea_yxs/英雄杀.apk
+APK SHA-256：7a7e6955453e89a72efc196b1a39ed2405d1f8b11e9d5dcccffeb0201e7da7ff
+包名：com.qqgame.mic
+版本：4.31.0，versionCode 431000017
+Unity：2018.4.30f1，IL2CPP，包含 Lua/tolua。
+模拟器：雷电 LDPlayer9，ADB emulator-5554，现有 root 可用。
+模拟器安装版本与提供的 APK 相同；运行时元数据文件与 APK 中的文件 SHA-256 相同。
+
+使用项目内独立安装的 REA 6.8.0 CLI、JADX headless 0.7.1，以及 UnityPy、补充的元数据读取和 ARM64 反汇编工具。
+未修改全局 Node、Codex MCP 配置或原始 APK。
+
+REA 原生 inspect-android-package 成功，读取到 5,137 个 Java 类。
+REA 原生 inspect-il2cpp-metadata 无法直接读取受处理的元数据头。
+推断的 v24.1 布局还包含 REA 当前读取器不接受的 272 字节扩展头。
+补充脚本按观察到的区块 XOR 规律读取名称和方法记录，并检查方法 token、参数范围和所有者索引。
+得到 10,767 条类型记录、97,245 条方法记录；末尾一条类型的声明范围存在异常，已单独记录，未据此建立业务调用关系。
+首段保护数据没有完整恢复，因此补充结果不是原始文件已完整解密的证明。
+
+3. 已确认的训练协议
+
+依据：游戏自身已有日志（本次分析没有发起这些训练）。
+
+2026-11-05 14:50:51：发送协议 11029，包体 01 01 9b。
+按 Tars/JCE 解码：tag 0，短整数，值 411。
+2026-11-05 14:50:52：收到 11029 响应。
+紧随其后的业务日志：SLGBuildingsController::parseTSLGTrainSoldierRsp(), rsp.iRet = 0。
+响应解码：tag 0=0，tag 1=411，tag 2=675，tag 3=1，tag 4=675。
+
+14:51:02 又出现同样的训练请求包体，响应为 0、411、664、2、675。
+日志还出现兵种 411 的训练槽状态以及 675 秒初始时长，675 秒与截图的 11:15 一致。
+字段 0 的兵种含义有日志交叉支持；响应 tag 3 的精确业务定义还需协议结构确认，不能仅按值 1/2 当作已知字段名。
+
+兵营查询协议：11028。
+请求样本包体：0c，即 tag 0 的零值。
+响应后调用 parseTSLGGetBarrackRsp，并更新 SLGBuildingsModel 的训练剩余时间缓存。
+
+这些训练请求的业务包体没有窗口 ID 或坐标字段。
+这支持业务命令与 UI 点击解耦的推断，但不能排除会话、外层封包、地图状态或服务器规则的约束。
+
+4. 通信方式
+
+已读取到的加载后 ARM64 代码中：
+TKCommon.ClientGameSystem.sendData 调用 TKFrame.TKNetwork.SendData。
+TKNetwork.SendData 获取 SocketConnection 的 SenderThread 并调用 send。
+ProtoCryption.EncrypedMsg / DecrypedMsg 中存在对 TKFrame.TxTEA.encrypt / decrypt 的调用。
+另有 SetPublicRsaKey、GetRsaEncryptKey、SetEncryptKey、MsgEncoder、MsgDecoder 等方法声明。
+libtolua 的 REA 导出表中也存在 Tars/JCE 的读写相关导出。
+
+现有证据指向游戏自己的二进制消息、Socket 发送队列和消息加密。
+不能把 APK 内 okhttp、WebSocket 或 HTTP 库的存在当成兵营接口使用它们的证据。
+尚未完成外层消息封包、序号、连接鉴权和加密时序的完整还原。
+没有读取或导出运行时会话密钥，也没有向服务器重放请求。
+
+5. 加速和资源版本
+
+Lua 资源中有 BarracksDialog、SoldierTrainingNewDialog、UpgradeAccelerationNewDialog、AccelerateItem、ProtoController 等模块。
+APK Lua 资源包含 5,191 个 TextAsset；脚本不是可直接阅读的明文。
+已安装游戏另有热更新 Lua 包，SHA-256：2e858d97bc088fffa6551a56456ca5ef3895a33e87f01983897b2aa37f6d28a6。
+它与 APK Lua 包不同，UpgradeAccelerationNewDialog 的字节数也发生变化。
+后续必须以实际运行资源为准。
+
+14:51:04 的日志显示加速界面查询道具列表，协议号 252。
+注意：252 是道具列表查询样本，不是已确认的使用加速协议。
+初次日志显示训练加速道具 70251 的数量为 1519。后续用户手动使用一个紫色五分钟训练加速，已由请求、成功响应、扣量和倒计时变化交叉确认该道具对应关系。
+
+6. 实现形态
+
+优先验证游戏进程内复用现有的业务发送、会话、加密及响应处理逻辑。
+外部 App 可以承担配置和开关，但普通独立 App 不能直接调用另一个 App 进程内的 Unity/Lua 函数。
+需要额外的进程内模块和通信桥，或者完整实现游戏协议及其会话机制。
+是否采用加载模块、重打包或其他接入方式，应在后台调用验证通过后决定。
+当前没有必要先修改和重新签名 APK。
+
+后台调用的验收必须包括：停留在目标战斗界面，发送训练命令，收到成功响应，查询队列确认实际新增；随后使用一个已确定的加速道具，查询确认倒计时减少且道具数量减少；还要确认正常战斗操作与消息处理不冲突。
+训练满槽、资源不足、道具耗尽、超时和重连时都需要停止或核对状态，不能盲目重试消耗型请求。
+
+7. 证据索引
+
+evidence/android-package.json：REA/JADX 原始 APK 分析结果。
+evidence/android-classes.json：REA Java 类名清单。
+evidence/il2cpp-metadata.json：REA 原始元数据读取失败记录。
+evidence/il2cpp-candidate-summary.json：推断版本文件仍不受 REA 布局支持的记录。
+inspect_metadata.py：补充元数据读取脚本（只读原始输入，输出衍生文件）。
+evidence/metadata-custom-methods.json：方法声明，后补的 rva 是静态候选地址，只有读取到运行时指令的选定方法得到进一步核对。
+evidence/metadata-custom-owner-mismatches.json：类型声明范围异常。
+evidence/tolua-exports.json：REA 本地 native 导出表结果。
+evidence/network-runtime-disassembly.txt：发送入口与消息加解密的加载后指令。
+evidence/tcp-send-runtime-disassembly.txt：Socket 发送队列相关的加载后指令。
+evidence/training-jce-decoded.json：仅选定训练、兵营消息的离线解码。
+evidence/training-debug-excerpts.json：与训练及加速道具直接相关的日志摘录。
+analyze_training_log.py：游戏日志及 JCE 离线读取脚本，不连接服务器。
+
+注意：native-xor77-candidate.txt 是未验证的静态解码尝试，不能用作方法语义证据；同名方法的运行时读取结果才用于本记录。
+
+参考：
+REA：https://github.com/morluto/rea
+REA Android 分析：https://github.com/morluto/rea/blob/main/docs/android-analysis.md
+Tars/JCE 编码：https://tarscloud.org/document/documentation?path=base%2Ftars-protocol.md
+
+8. 新增操作样本验证：2026-11-05 15:16:57 至 15:17:04
+
+用户手动训练一个步兵，使用一个紫色五分钟训练加速。本次分析仅读取日志，没有代为训练或使用道具。
+
+15:16:57 发送 11029，JCE tag 0=411；响应 tag 0=0。
+业务处理日志 parseTSLGTrainSoldierRsp 的 iRet=0，剩余训练时间为 675 秒。
+该兵种 ID 与早先同种兵训练样本一致。
+
+15:17:04 发送 186：
+tag 0：公共上下文结构，摘要中省略身份字段，尚未确定其全部字段语义及有效期。
+tag 1：数值 3，精确枚举语义待协议定义核实。
+tag 2：数值 400，精确业务语义待协议定义核实。
+tag 3：数值 411，与本次训练的兵种 ID 一致。
+tag 4：一个元素的列表；元素 tag 0=70251，tag 1=1，与所用道具和数量一致。
+
+186 响应 tag 0=0；业务日志 parseTSLGBuildSpeedupRsp 的 iRet=0。
+道具 70251 数量从 1518 变为 1517。
+查询兵营后剩余时间为 368 秒。
+675 秒减去两次日志之间约 7 秒的自然流逝，再减去 300 秒加速，恰好是 368 秒。
+因此本次训练、使用一个指定道具、服务器成功响应及实际状态变化已形成完整证据链。
+
+此次验证发生在用户正常打开兵营和加速窗口时，尚未验证战斗界面下主动调用。
+训练包体只有兵种字段，不代表加速包体也如此；加速还包含公共上下文及额外枚举字段，不能只发道具 ID。
+下一阶段需要确认这些字段来源、生命周期，以及通过现有游戏发送链路在目标界面调用时的行为。
+没有向服务器重放或伪造请求，没有注入进程模块，也没有修改游戏文件。
+
+新增证据：evidence/acceleration-verification.json（只保留本次训练及加速相关字段，省略请求中的身份上下文）。
+
+9. 第一版实现与后台实测
+
+入口：D:/reaWorko/rea_yxs/Start-AutoInfantry.vbs。
+实现目录：auto_infantry。
+现有 root 下使用与客户端版本匹配的官方 Frida 17.25.2，连接模拟器 ARM64 emulated realm。
+tolua_update 没有实际触发，已改为在 UnityMain 线程的 lua_pcall 返回后处理有界任务；每次恢复 Lua 栈，不注册自主训练定时器。
+运行中读取 ModelManager 中的 SLGBuildingsModel、ItemsModel；调用原有 SLGBuildingsController 的训练、查询和加速函数。
+加速公共身份上下文由游戏现有函数实时生成，没有复制日志里的旧身份包。
+加速道具列表使用游戏本身的 T_TItemInfo 和 CSLList 构造，固定使用一个 70251。
+
+第一次有界验证：队列 0→1，675000ms→375000ms，道具1517→1516。
+完整单兵验证：兵力29→30，使用三个五分钟道具，道具1516→1513，队列回到0，未打开兵营。
+开发实测共发起两次训练、四次指定加速；期间观察到其他兵力损失，不将其归因于助手。
+关闭状态实测：训练调用被开关门禁拒绝，查询前后兵力、队列和道具库存不变。
+使用 Windows 互斥锁阻止多个连接同时拥有同一会话，避免重复窗口重复消费。
+切换地图、游戏版本变化、响应超时或失败、道具不足、异常扣量、次数用尽等会停止；消耗请求不自动重发。
+六项离线测试全部通过，包含两兵训练/六次加速达到上限后停止的完整状态机模拟。
+新版窗口已实际打开并观察到“步兵30/54、训练中0、道具1513、已连接，开关关闭”。
+
+证据：evidence/background-single-test.json、evidence/background-completion-test.json、evidence/switch-off-live-test.json。
+使用限制和启动方式：auto_infantry/使用说明.txt。
+
+10. 三兵种总开关扩展
+
+根据用户确认，将界面改为一个“自动造兵”总开关，下面勾选步兵、弓兵、骑兵。
+分别使用兵种411、412、413读取自己的状态、发送自己的训练和加速命令；兵种上限及本轮预算各自独立。
+多个所选兵种公平轮询，满额类型跳过。完成前重新查询全体所选兵种，防止已补满类型在战斗中损兵后仍误报全部满额。
+进程桥只允许总开关开启且已选中的目标接收消耗命令。关闭时清除允许集合并取消排队消耗任务。
+响应必须同时符合新的响应序号、成功返回值及所请求的兵种ID，不匹配时停止。
+
+弓兵实测：兵种412，队列0→1，训练剩余674000ms→374000ms，道具1478→1477。
+骑兵实测：兵种413，队列0→1，训练剩余674000ms→374000ms，道具1477→1476。
+两者训练及加速响应的兵种均与目标一致。未进入兵营。
+未勾选步兵及总开关关闭的弓兵调用均被门禁拒绝，无须发送游戏请求。
+证据：evidence/multi-troop-live-test.json。
+13项离线测试通过，覆盖公平轮询、未选择类型跳过、不同上限、满额跳过、总开关停止、超时不重试以及损兵后的最终核对。
+新版窗口已观察到步兵44/54、弓兵32/54（训练中1）、骑兵37/54（训练中1）、道具1476；总开关关闭，默认只勾选步兵。
+本次没有执行三兵种整轮补满的账号实测。
