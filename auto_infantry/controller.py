@@ -15,6 +15,8 @@ from game_log import TrainingRejected
 from monster_service import MonsterService
 from league_service import LeagueService
 from beacon_service import BeaconService
+from trial_service import TrialService
+from report_service import ReportService
 
 
 def owned_soldiers(state):
@@ -117,6 +119,8 @@ class Worker(threading.Thread):
         self.hunt = MonsterService(self)
         self.league = LeagueService(self)
         self.beacon = BeaconService(self)
+        self.trial = TrialService(self)
+        self.report = ReportService(self)
         self.recovery_authorized = ()
         self.hero_view_due = 0
         self.collection_queue_signature = None
@@ -164,12 +168,35 @@ class Worker(threading.Thread):
     def stop(self):
         """Revoke all feature action gates before detaching the owned connection."""
         self.closing.set()
+        self.report.switch(False)
+        self.trial.switch(False)
         self.hunt.switch(False)
         self.league.switch(False)
         self.beacon.switch(False)
         self.collection.switch(False)
         self.switch_hero(False)
         self.switch(False)
+
+    def switch_trial(self, enabled):
+        """Give trial scene transitions exclusive ownership; other masters and scheduled hunting remain off afterwards."""
+        with self.guard:
+            if enabled:
+                if self.connection is None:
+                    raise RuntimeError('请先连接西游幻境地图')
+                if self.trial.uncertain or self.trial.holding:
+                    raise RuntimeError('请先核对当前试炼并返回地图，等待重新读取后再开启')
+                self.report.switch(False)
+                self.hunt.switch(False)
+                self.league.switch(False)
+                self.beacon.switch(False)
+                self.collection.switch(False)
+                self.switch_hero(False)
+                self.switch(False)
+                self.allow_scheduled_hunt = False
+                self.publish(enabled=False,hero_enabled=False,collect_enabled=False,hunt_enabled=False,
+                             league_enabled=False,beacon_enabled=False,
+                             hunt_auto_status='试炼期间已取消打野定时开启；其他自动功能不会自行恢复')
+            self.trial.switch(enabled)
 
     def wait_for_training(self, run, unit, state):
         """Schedule one server-duration confirmation without polling while this species is waiting."""
@@ -288,6 +315,12 @@ class Worker(threading.Thread):
             self.beacon.tick(connection)
             self.publish(ready=True, status='已连接，自动造兵关闭')
             while not self.closing.is_set():
+                if self.trial.tick(connection):
+                    run = None
+                    run_epoch = None
+                    self.closing.wait(.1)
+                    continue
+                self.report.tick(connection)
                 self.poll_hero_view(connection)
                 if self.collection.attributes_requested.is_set():
                     try:
@@ -419,6 +452,8 @@ class Worker(threading.Thread):
         except Exception as error:
             was_enabled = self.enabled
             try:
+                self.report.switch(False)
+                self.trial.switch(False)
                 self.hunt.switch(False)
                 self.league.switch(False)
                 self.beacon.switch(False)
@@ -429,7 +464,7 @@ class Worker(threading.Thread):
                 self.enabled = False
             if not self.closing.is_set():
                 self.publish(enabled=False, hero_enabled=False, collect_enabled=False, hunt_enabled=False, league_enabled=False,
-                             beacon_enabled=False, ready=False, error=str(error),
+                             beacon_enabled=False, trial_enabled=False, report_enabled=False, report_next_ms=None, ready=False, error=str(error),
                              account_changed='Account session changed' in str(error),
                              hero_status='连接已停止，自动恢复关闭',
                              status=('已停止：' if was_enabled else '连接已停止：') + str(error))

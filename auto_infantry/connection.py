@@ -13,6 +13,7 @@ from collection_balance import resource_balance
 from units import UNIT_NAMES, checked_units
 from hero_preferences import checked_heroes
 from game_log import GameResponseLog, ResourceMissing, BeaconCapacityUnavailable
+from account_lock import ensure_account_available
 
 ROOT = Path(__file__).resolve().parent
 
@@ -53,10 +54,13 @@ class Connection:
         self.hunt_generation = 0
         self.league_generation = 0
         self.beacon_generation = 0
+        self.trial_generation = 0
+        self.report_generation = 0
         self.response_log = None
 
     def acquire_owner(self):
         """Allow only one helper connection to own the account's Lua bridge at a time."""
+        ensure_account_available()
         kernel = ctypes.WinDLL('kernel32', use_last_error=True)
         kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
         kernel.CreateMutexW.restype = ctypes.c_void_p
@@ -124,6 +128,8 @@ class Connection:
             self.script.exports_sync.query((ROOT / 'league_runtime.lua').read_text(encoding='utf-8'))
             self.script.exports_sync.query((ROOT / 'beacon_runtime.lua').read_text(encoding='utf-8'))
             self.script.exports_sync.query((ROOT / 'beacon_actions.lua').read_text(encoding='utf-8'))
+            self.script.exports_sync.query((ROOT / 'trial_runtime.lua').read_text(encoding='utf-8'))
+            self.script.exports_sync.query((ROOT / 'report_runtime.lua').read_text(encoding='utf-8'))
             return initial
         except Exception:
             self.close()
@@ -751,6 +757,78 @@ class Connection:
             time.sleep(0.15)
         raise TimeoutError(f'{operation} result uncertain; do not repeat automatically')
 
+    def set_trial_enabled(self, enabled):
+        """Revoke queued trial reads and mutations immediately; no other feature can authorize this gate."""
+        if self.script is not None:
+            self.trial_generation = self.script.exports_sync.settrialenabled(bool(enabled))
+
+    def trial_call(self, operation, arguments=(), generation=None):
+        """Submit a fixed native trial operation with bounded numeric parameters, never UI-provided Lua."""
+        operations = {'begin','query_profile','query_available','select','challenge','skip','ack','return_after_win','status'}
+        if operation not in operations or any(type(v) is not int or not 0 <= v <= 100000000 for v in arguments):
+            raise ValueError('Invalid trial operation or parameters')
+        source = 'return REA_TRIAL.' + operation + '(' + ','.join(map(str, arguments)) + ')'
+        spending = False if operation in {'ack','status'} else 'trial'
+        with self.lock:
+            value = self.script.exports_sync.query(source, spending, 1, generation)
+        return value if operation == 'ack' else json.loads(value)
+
+    def trial_action(self, operation, generation, cancelled):
+        """Attribute one native trial acknowledgement; successful skip requests still require a separate win/lose push."""
+        from trial_receipts import wait_trial_receipt, TrialRejected
+        if cancelled():
+            raise InterruptedError('试炼已关闭，尚未发送请求')
+        if operation == 'return_after_win':
+            return self.trial_call(operation, generation=generation)
+        if self.response_log is None:
+            self.response_log = GameResponseLog(ADB)
+        self.response_log.drain()
+        receipt = self.trial_call(operation, generation=generation)
+        kind = {'query_profile':'profile','query_available':'available'}.get(operation, operation)
+        ret = wait_trial_receipt(self.response_log, kind, receipt, cancelled)
+        self.trial_call('ack', (receipt['code'], ret))
+        if ret != 0:
+            raise TrialRejected(kind, ret)
+        return {**receipt, 'ret':ret}
+
+    def set_report_enabled(self, enabled):
+        """Immediately revoke queued timer-owned military report requests without changing other gates."""
+        if self.script is not None:
+            self.report_generation = self.script.exports_sync.setreportenabled(bool(enabled))
+
+    def report_call(self, operation, generation=None):
+        """Invoke only fixed report operations; both list refresh and receive require this timer's gate."""
+        if operation not in {'refresh','confirm','claim'}:
+            raise ValueError('Invalid military report operation')
+        with self.lock:
+            value=self.script.exports_sync.query('return REA_REPORT.'+operation+'()',
+                False if operation=='confirm'else'report',1,generation)
+        return json.loads(value)
+
+    def report_request(self, operation, generation, cancelled):
+        """Submit a single native operation and wait for its exact request/response, never resending."""
+        from report_receipts import wait_report_receipt, ReportResponseLog
+        if cancelled():raise InterruptedError('自动领取军报已关闭，未发送')
+        report_log=ReportResponseLog(ADB)
+        report_log.drain()
+        self.report_call(operation,generation)
+        return wait_report_receipt(report_log,operation,cancelled)
+
+    def refresh_reports(self, generation, cancelled):
+        """Confirm one full list response and its new native cache; local waiting creates no extra requests."""
+        self.report_request('refresh',generation,cancelled)
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            if cancelled():raise InterruptedError('自动领取军报已关闭')
+            snapshot=self.report_call('confirm')
+            if snapshot['ready']:return snapshot
+            time.sleep(.1)
+        raise TimeoutError('军报响应成功但列表未更新；停止，不重发')
+
+    def claim_reports(self, generation, cancelled):
+        """Receive all eligible ground-world report rewards only after a fresh list and explicit timer permission."""
+        return self.report_request('claim',generation,cancelled)
+
     def close(self):
         """Remove the caller API, detach hooks, and release the process even after an RPC failure."""
         if self.script is not None:
@@ -761,8 +839,11 @@ class Connection:
                 self.set_hunt_enabled(False)
                 self.set_league_enabled(False)
                 self.set_beacon_enabled(False)
+                self.set_trial_enabled(False)
+                self.set_report_enabled(False)
                 self.script.exports_sync.bindsession(False)
-                self.script.exports_sync.query('if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.beacon_close then REA_AUTO_INFANTRY.beacon_close() end;'
+                self.script.exports_sync.query('REA_REPORT=nil;if REA_TRIAL then REA_TRIAL.close();REA_TRIAL=nil end;'
+                                               'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.beacon_close then REA_AUTO_INFANTRY.beacon_close() end;'
                                                'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.league_close then '
                                                'REA_AUTO_INFANTRY.league_close() end;'
                                                'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.hunt_close then '

@@ -23,6 +23,8 @@ class LoginLifecycleTests(unittest.TestCase):
         """Keep all transport and worker seams isolated; use real cancellation and event queues."""
         self.events = queue.Queue()
         self.session = LoginSession(self.events)
+        self.session.store = Mock()
+        self.session.store.list.return_value = []
         self.cancel = threading.Event()
         self.bridge = Mock()
         self.worker = Mock()

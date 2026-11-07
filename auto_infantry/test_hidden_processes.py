@@ -23,7 +23,7 @@ class HiddenProcessTests(unittest.TestCase):
         connection = Connection()
         connection.acquire_owner = Mock()
         script = Mock()
-        script.exports_sync.query.side_effect = ['{"ready":true,"stage":"World"}', 'session_bound', 'cleared', 'troop_api_installed', 'hero', 'collection', 'hunt', 'league', 'beacon','beacon_actions']
+        script.exports_sync.query.side_effect = ['{"ready":true,"stage":"World"}', 'session_bound', 'cleared', 'troop_api_installed', 'hero', 'collection', 'hunt', 'league', 'beacon','beacon_actions','trial_api_installed','report_api_installed']
         connection.initialize_barracks = Mock(return_value={})
         device = Mock()
         device.attach.return_value.create_script.return_value = script

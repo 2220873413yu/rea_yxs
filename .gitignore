@@ -24,6 +24,8 @@ dist/
 /auto_infantry/*.jsonl
 /auto_infantry/startup-error.txt
 *.log
+*.dpapi
+/auto_infantry/accounts/
 .env
 .env.*
 !.env.example

@@ -5,6 +5,9 @@ import time
 from bootstrap import ensure_server
 from connection import Connection
 from controller import Worker
+from pathlib import Path
+from account_store import AccountStore
+from account_service import AccountService
 
 
 def account_label(state):
@@ -43,10 +46,12 @@ class LoginSession:
         self.guard = threading.RLock()
         self.job = None
         self.closed = False
+        self.store = AccountStore()
+        self.accounts = AccountService(self.store)
 
-    def request(self, mode='connect'):
+    def request(self, mode='connect', selection=None):
         """Cancel earlier work before asynchronously detaching and opening a fresh default-off session."""
-        if mode not in {'connect', 'ios_wechat'}:
+        if mode not in {'connect', 'ios_wechat', 'account_save', 'account_switch', 'account_qr'}:
             raise ValueError('Unsupported session mode')
         with self.guard:
             if self.closed:
@@ -57,10 +62,10 @@ class LoginSession:
             self.epoch += 1
             epoch = self.epoch
             self.worker = None
-            self.job = threading.Thread(target=self._replace, args=(mode, epoch, cancel, previous, old_job), daemon=True)
+            self.job = threading.Thread(target=self._replace, args=(mode, epoch, cancel, previous, old_job, selection), daemon=True)
             self.job.start()
 
-    def _replace(self, mode, epoch, cancel, previous, old_job):
+    def _replace(self, mode, epoch, cancel, previous, old_job, selection=None):
         """Join old owners before acquiring a bridge; no account caches or services survive replacement."""
         sink = SessionEvents(self.events, epoch)
         connection = None
@@ -77,6 +82,18 @@ class LoginSession:
             if cancel.is_set():
                 return
             ensure_server()
+            legacy = Path(__file__).resolve().parents[1] / 'analysis/evidence'
+            self.store.import_legacy([legacy / 'ios-wechat-ticket-test.dpapi', legacy / 'android-qq-ticket-test.dpapi'])
+            sink.put({'profiles': self.store.list()})
+            if mode == 'account_save':
+                record = self.accounts.save_current(cancel)
+                sink.put({'status': '已加密保存当前账号：' + record['name'], 'profiles': self.store.list()})
+            elif mode in {'account_switch', 'account_qr'}:
+                state, record = self.accounts.login(cancel, lambda **event: sink.put(event),
+                    profile_id=selection if mode == 'account_switch' else None,
+                    qr_context=selection if mode == 'account_qr' else None)
+                sink.put({'account': state, 'profiles': self.store.list(),
+                          'status': '已登录并更新票据：' + record['name'] + '；自动功能全部关闭，请进入西游幻境'})
             if mode == 'ios_wechat':
                 connection = Connection()
                 connection.attach()
@@ -117,6 +134,7 @@ class LoginSession:
             if connection is not None:
                 connection.close()
             sink.put({'login_busy': False})
+            sink.put({'profiles': self.store.list()})
 
     @staticmethod
     def _wait(connection, cancel, predicate, seconds):
@@ -139,3 +157,8 @@ class LoginSession:
             worker = self.worker
         if worker is not None:
             worker.stop()
+
+    def pending_shutdown(self):
+        """Keep Tk alive until a cancelled SDK file transaction and its worker have safely released ownership."""
+        return ((self.job is not None and self.job.is_alive() is True) or
+                (self.worker is not None and self.worker.is_alive() is True))

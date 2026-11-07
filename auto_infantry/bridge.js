@@ -27,6 +27,10 @@ let leagueEnabled = false;
 let leagueEpoch = 0;
 let beaconEnabled = false;
 let beaconEpoch = 0;
+let trialEnabled = false;
+let trialEpoch = 0;
+let reportEnabled = false;
+let reportEpoch = 0;
 let sessionBound = false;
 
 /** Copy one Lua result without retaining pointers into the game's Lua heap. */
@@ -42,7 +46,9 @@ function readString(state, index) {
 
 /** Execute one queued operation on the existing Lua update thread and restore its stack. */
 function execute(state, task) {
-    if ((task.spending === 'beacon' && (!beaconEnabled || task.beaconEpoch !== beaconEpoch)) ||
+    if ((task.spending === 'report' && (!reportEnabled || task.reportEpoch !== reportEpoch)) ||
+        (task.spending === 'trial' && (!trialEnabled || task.trialEpoch !== trialEpoch)) ||
+        (task.spending === 'beacon' && (!beaconEnabled || task.beaconEpoch !== beaconEpoch)) ||
         (task.spending === 'league' && (!leagueEnabled || task.leagueEpoch !== leagueEpoch)) ||
         (task.spending === 'hunt' && (!huntEnabled || task.huntEpoch !== huntEpoch)) ||
         (task.spending === 'hero' && (!heroEnabled || task.heroEpoch !== heroEpoch || !allowedHeroes.has(task.unit))) ||
@@ -101,7 +107,7 @@ rpc.exports = {
         spending = spending == null ? false : spending;
         unit = unit == null ? 411 : unit;
         if (typeof source !== 'string' || source.length > 32000) throw new Error('Invalid Lua source');
-        if (![false, true, 'train_speed', 'hero', 'collect', 'hunt', 'league', 'beacon'].includes(spending)) throw new Error('Invalid spending category');
+        if (![false, true, 'train_speed', 'hero', 'collect', 'hunt', 'league', 'beacon', 'trial', 'report'].includes(spending)) throw new Error('Invalid spending category');
         if ((spending === true || spending === 'train_speed') && ![411, 412, 413, 803].includes(unit)) throw new Error('Unsupported troop identifier');
         if ((spending === 'hero' || spending === 'collect' || spending === 'hunt' || spending === 'league' || spending === 'beacon') && (!Number.isInteger(unit) || unit <= 0 || unit > 10000000)) throw new Error('Unsupported hero');
         if (pending.length >= 8) throw new Error('Lua queue is full');
@@ -112,6 +118,8 @@ rpc.exports = {
                 huntEpoch: expectedHeroEpoch === null ? huntEpoch : expectedHeroEpoch,
                 leagueEpoch: expectedHeroEpoch === null ? leagueEpoch : expectedHeroEpoch,
                 beaconEpoch: expectedHeroEpoch === null ? beaconEpoch : expectedHeroEpoch,
+                trialEpoch: expectedHeroEpoch === null ? trialEpoch : expectedHeroEpoch,
+                reportEpoch: expectedHeroEpoch === null ? reportEpoch : expectedHeroEpoch,
                 resolve, reject, timer: null};
             task.timer = setTimeout(() => {
                 const index = pending.indexOf(task);
@@ -211,6 +219,32 @@ rpc.exports = {
         }
         return beaconEpoch;
     },
+    /** Revoke trial queries/actions immediately, including stale starts across rapid off/on changes. */
+    settrialenabled(value) {
+        trialEnabled = value === true;
+        trialEpoch++;
+        for (let i = pending.length - 1; i >= 0; i--) {
+            if (pending[i].spending === 'trial') {
+                const task = pending.splice(i, 1)[0];
+                clearTimeout(task.timer);
+                task.reject(new Error('Trial switch changed'));
+            }
+        }
+        return trialEpoch;
+    },
+    /** Cancel timer-owned report queries and claims, including stale actions across off/on changes. */
+    setreportenabled(value) {
+        reportEnabled = value === true;
+        reportEpoch++;
+        for (let i = pending.length - 1; i >= 0; i--) {
+            if (pending[i].spending === 'report') {
+                const task = pending.splice(i, 1)[0];
+                clearTimeout(task.timer);
+                task.reject(new Error('Report switch changed'));
+            }
+        }
+        return reportEpoch;
+    },
     /** Disable the hook and reject queued commands before caller detach. */
     close() {
         enabled = false;
@@ -221,6 +255,10 @@ rpc.exports = {
         huntEnabled = false;
         leagueEnabled = false;
         beaconEnabled = false;
+        trialEnabled = false;
+        reportEnabled = false;
+        reportEpoch++;
+        trialEpoch++;
         beaconEpoch++;
         leagueEpoch++;
         huntEpoch++;

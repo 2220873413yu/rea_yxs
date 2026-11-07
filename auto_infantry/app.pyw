@@ -16,6 +16,9 @@ from league_panel import LeaguePanel
 from beacon_panel import BeaconPanel
 from collection_display import display_time
 from login_session import LoginSession, account_label
+from account_dialog import AccountDialog
+from trial_panel import TrialPanel
+from report_panel import ReportPanel
 
 
 class App:
@@ -29,9 +32,11 @@ class App:
         self.events = queue.Queue()
         self.sessions = LoginSession(self.events)
         self.login_busy = False
+        self.accounts_dialog = None
         self.worker = None
         self.closing = False
         self.ready = False
+        self.trial_exclusive = False
         self.enabled = tk.BooleanVar(value=False)
         self.training_speed = tk.BooleanVar(value=False)
         self.hero_enabled = tk.BooleanVar(value=False)
@@ -39,6 +44,8 @@ class App:
         self.hunt_enabled = tk.BooleanVar(value=False)
         self.league_enabled = tk.BooleanVar(value=False)
         self.beacon_enabled = tk.BooleanVar(value=False)
+        self.trial_enabled = tk.BooleanVar(value=False)
+        self.report_enabled = tk.BooleanVar(value=False)
         self.selections = {unit: tk.BooleanVar(value=unit == 411) for unit in UNIT_NAMES}
         self.counts = {unit: tk.StringVar(value='正在读取…') for unit in UNIT_NAMES}
         self.stock = tk.StringVar(value='五分钟训练加速：正在读取…')
@@ -52,10 +59,11 @@ class App:
         header = ttk.Frame(panel)
         header.pack(fill='x')
         ttk.Label(header, text='世界模式助手', style='Title.TLabel').pack(side='left')
-        self.login_button = ttk.Button(header, text='iOS 微信扫码登录', command=lambda: self.request_session('ios_wechat'))
+        self.login_button = ttk.Button(header, text='iOS 微信扫码登录', command=lambda: self.request_session('account_qr', (1, 0)))
         self.login_button.pack(side='right')
         self.reload_button = ttk.Button(header, text='重新读取当前账号', command=lambda: self.request_session('connect'))
         self.reload_button.pack(side='right', padx=6)
+        ttk.Button(header, text='账号管理', command=self.open_accounts).pack(side='right')
         self.account_status = tk.StringVar(value='当前账号：正在读取；自动功能关闭')
         ttk.Label(header, textvariable=self.account_status, wraplength=360).pack(side='left', padx=(14, 0))
         top = ttk.Frame(panel)
@@ -94,6 +102,10 @@ class App:
         self.feature_tabs.add(self.league_panel, text='联盟采集')
         self.beacon_panel = BeaconPanel(self.feature_tabs, self.beacon_enabled, self.switch_beacon, self.check_beacon)
         self.feature_tabs.add(self.beacon_panel, text='烽火台')
+        self.trial_panel = TrialPanel(self.feature_tabs, self.trial_enabled, self.switch_trial)
+        self.feature_tabs.add(self.trial_panel, text='灵台试炼')
+        self.report_panel = ReportPanel(self.feature_tabs,self.report_enabled,self.switch_report)
+        self.feature_tabs.add(self.report_panel,text='军报')
         self.hero_status = self.hero_panel.status
         ttk.Separator(panel).pack(fill='x', pady=9)
         ttk.Label(panel, textvariable=self.status, wraplength=960).pack(anchor='w')
@@ -112,8 +124,9 @@ class App:
     def clear_account_views(self):
         """Remove all old account snapshots and switches while retaining explicit saved selection settings."""
         self.ready = False
+        self.trial_exclusive = False
         for variable in (self.enabled, self.hero_enabled, self.collect_enabled, self.hunt_enabled,
-                         self.league_enabled, self.beacon_enabled, self.training_speed):
+                         self.league_enabled, self.beacon_enabled, self.training_speed, self.trial_enabled,self.report_enabled):
             variable.set(False)
         for count in self.counts.values():
             count.set('正在读取…')
@@ -147,32 +160,47 @@ class App:
         self.monster_panel.capacity.set('出征额度：待读取；本轮忽略：0个坐标')
         self.monster_panel.status.set('自动打野关闭。')
         self.monster_panel.auto_hint.set('本账号尚未手动开启打野，刷新时刻自动开启暂不启用。')
+        self.trial_panel.clear()
+        self.report_panel.clear()
 
-    def request_session(self, mode):
+    def open_accounts(self):
+        """Display public saved-role metadata in a separate window without interrupting active game work."""
+        if self.accounts_dialog is None or not self.accounts_dialog.winfo_exists():
+            self.accounts_dialog = AccountDialog(self)
+        else:
+            self.accounts_dialog.refresh(self.sessions.store.list())
+            self.accounts_dialog.lift()
+
+    def request_session(self, mode, selection=None):
         """Stop old automation, clear its display, then request native login or current-account reconstruction."""
         if self.closing:
             return
         self.clear_account_views()
         self.login_busy = True
         self.account_status.set('当前账号：正在重新读取，自动功能关闭')
-        self.status.set('正在停止旧连接并准备扫码登录…' if mode == 'ios_wechat' else '正在重新连接当前账号…')
-        self.sessions.request(mode)
+        self.status.set('正在停止旧连接并处理账号操作…' if mode != 'connect' else '正在重新连接当前账号…')
+        self.sessions.request(mode, selection)
         self.worker = None
         self.update_controls()
 
     def update_controls(self):
         """Enable each independent master while connected and freeze the settings owned by an active run."""
-        self.toggle.state(['!disabled'] if self.ready else ['disabled'])
-        self.hero_panel.update_controls(self.ready, self.collect_enabled.get())
-        self.collection_panel.update_controls(self.ready)
-        self.monster_panel.update_controls(self.ready)
-        self.league_panel.update_controls(self.ready)
-        self.beacon_panel.update_controls(self.ready)
-        self.collection_teams_panel.set_active(self.collect_enabled.get(), self.ready)
+        world_ready = self.ready and not self.trial_exclusive
+        self.toggle.state(['!disabled'] if world_ready else ['disabled'])
+        self.hero_panel.update_controls(world_ready, self.collect_enabled.get())
+        self.collection_panel.update_controls(world_ready)
+        self.monster_panel.update_controls(world_ready)
+        self.league_panel.update_controls(world_ready)
+        self.beacon_panel.update_controls(world_ready)
+        self.trial_panel.update_controls(self.ready)
+        self.report_panel.update_controls(world_ready)
+        self.collection_teams_panel.set_active(self.collect_enabled.get(), world_ready)
         for box in self.choice_widgets.values():
-            box.state(['disabled'] if self.enabled.get() else ['!disabled'])
-        self.speed_toggle.state(['disabled'] if self.enabled.get() else ['!disabled'])
+            box.state(['disabled'] if self.enabled.get() or self.trial_exclusive else ['!disabled'])
+        self.speed_toggle.state(['disabled'] if self.enabled.get() or self.trial_exclusive else ['!disabled'])
         self.login_button.state(['disabled'] if self.login_busy else ['!disabled'])
+        if self.accounts_dialog is not None and self.accounts_dialog.winfo_exists():
+            self.accounts_dialog.update_controls()
 
     def switch_hero(self):
         """Freeze the user's persisted hero choices without changing the troop master."""
@@ -251,7 +279,7 @@ class App:
 
     def start_hunt_on_refresh(self, epoch):
         """Validate the current visible radius on the UI thread before accepting a scheduled gate opening."""
-        if not self.ready or self.closing or self.worker is None or self.hunt_enabled.get():
+        if not self.ready or self.closing or self.trial_exclusive or self.worker is None or self.hunt_enabled.get():
             return
         try:
             if self.worker.hunt.start_on_refresh(epoch, self.monster_panel.options()):
@@ -323,6 +351,35 @@ class App:
             self.worker.beacon.request_check()
             self.beacon_panel.status.set('已请求核对服务器事件和队伍…')
 
+    def switch_report(self):
+        """Authorize only the current account's two-hour timer; enabling never immediately claims anything."""
+        if self.worker is None:
+            self.report_enabled.set(False)
+            return
+        try:
+            self.worker.report.switch(self.report_enabled.get())
+        except Exception as error:
+            self.report_enabled.set(False)
+            self.report_panel.status.set('自动领取未开启：'+str(error).splitlines()[0])
+        self.update_controls()
+
+    def switch_trial(self):
+        """Start the exclusive default-off trial run or immediately revoke its queued requests for manual handoff."""
+        if self.worker is None:
+            self.trial_enabled.set(False)
+            return
+        try:
+            self.worker.switch_trial(self.trial_enabled.get())
+            self.trial_exclusive = self.worker.trial.holding
+            if self.trial_enabled.get():
+                for v in (self.enabled,self.hero_enabled,self.collect_enabled,self.hunt_enabled,self.league_enabled,self.beacon_enabled,self.training_speed,self.report_enabled):
+                    v.set(False)
+                self.trial_panel.status.set('正在读取本轮试炼；已有名单沿用，无名单时选择最强可用三人')
+        except Exception as error:
+            self.trial_enabled.set(False)
+            self.trial_panel.status.set('自动爬塔未开启：'+str(error).splitlines()[0])
+        self.update_controls()
+
     def poll(self):
         """Render confirmed switches and accept only the authorized, scoped scheduled-hunting start requests."""
         try:
@@ -331,6 +388,14 @@ class App:
                 if event.get('session_epoch', self.sessions.epoch) != self.sessions.epoch:
                     continue
                 self.worker = self.sessions.worker
+                if event.get('trial_reconnect'):
+                    snapshot=self.trial_panel.snapshot
+                    message=self.trial_panel.status.get()
+                    self.request_session('connect')
+                    if snapshot is not None:
+                        self.trial_panel.apply_snapshot({**snapshot,'enabled':False,'phase':'off'})
+                    self.trial_panel.status.set(message+'；已返回地图，重新读取账号，所有开关保持关闭')
+                    continue
                 if event.get('account_changed'):
                     self.request_session('connect')
                     continue
@@ -340,8 +405,26 @@ class App:
                     self.account_status.set(account_label(event['account']))
                 if 'account_status' in event:
                     self.account_status.set(event['account_status'])
+                if 'profiles' in event and self.accounts_dialog is not None and self.accounts_dialog.winfo_exists():
+                    self.accounts_dialog.refresh(event['profiles'])
                 if 'ready' in event:
                     self.ready = event['ready']
+                if 'trial_enabled' in event:
+                    self.trial_enabled.set(bool(event['trial_enabled']))
+                if 'report_enabled' in event:
+                    self.report_enabled.set(bool(event['report_enabled']))
+                if 'report_next_ms' in event:
+                    self.report_panel.apply_next(event['report_next_ms'])
+                if 'report_snapshot' in event:
+                    self.report_panel.apply_snapshot(event['report_snapshot'])
+                if 'report_status' in event:
+                    self.report_panel.status.set(event['report_status'].splitlines()[0][:240])
+                if 'trial_exclusive' in event:
+                    self.trial_exclusive = bool(event['trial_exclusive'])
+                if 'trial_status' in event:
+                    self.trial_panel.status.set(event['trial_status'].splitlines()[0][:240])
+                if 'trial_snapshot' in event:
+                    self.trial_panel.apply_snapshot(event['trial_snapshot'])
                 if 'beacon_enabled' in event:
                     self.beacon_enabled.set(event['beacon_enabled'])
                 if 'beacon_status' in event:
@@ -423,6 +506,8 @@ class App:
 
     def close(self):
         """Disable every independent action gate before closing the visible control window."""
+        if self.closing:
+            return
         self.closing = True
         self.sessions.close()
         self.enabled.set(False)
@@ -431,12 +516,22 @@ class App:
         self.hunt_enabled.set(False)
         self.league_enabled.set(False)
         self.beacon_enabled.set(False)
+        self.trial_enabled.set(False)
+        self.report_enabled.set(False)
         if self.worker is not None:
             try:
                 self.worker.stop()
             except Exception:
                 pass
-        self.root.destroy()
+        self.finish_close()
+
+    def finish_close(self):
+        """Wait without blocking Tk so daemon shutdown cannot interrupt a two-file SDK restore transaction."""
+        if self.sessions.pending_shutdown():
+            self.status.set('正在安全退出账号操作，请稍候；自动功能全部关闭…')
+            self.root.after(100, self.finish_close)
+        else:
+            self.root.destroy()
 
     def run(self):
         """Keep the control window responsive until the user closes it."""
