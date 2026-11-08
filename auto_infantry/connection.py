@@ -14,6 +14,7 @@ from units import UNIT_NAMES, checked_units
 from hero_preferences import checked_heroes
 from game_log import GameResponseLog, ResourceMissing, BeaconCapacityUnavailable
 from account_lock import ensure_account_available
+from player_profile_cache import PlayerProfileCache
 
 ROOT = Path(__file__).resolve().parent
 
@@ -57,6 +58,20 @@ class Connection:
         self.trial_generation = 0
         self.report_generation = 0
         self.response_log = None
+        self.league_query_installed = False
+        self.map_index_installed = False
+        self.profile_cache = PlayerProfileCache()
+
+    def clear_player_profile_cache(self):
+        """Clear only current-map public profiles; resolving the scope never queries the server."""
+        self.profile_cache.clear(self.map_index_call('context'))
+
+    def _save_player_profile(self,scope,snapshot,identity=None):
+        """Cache only confirmed profiles; a local save failure must not discard a successful query."""
+        try:self.profile_cache.put(scope,snapshot,identity)
+        except Exception as error:
+            snapshot=dict(snapshot,cache_warning='资料已取得，但缓存未保存：'+str(error).splitlines()[0][:140])
+        return snapshot
 
     def acquire_owner(self):
         """Allow only one helper connection to own the account's Lua bridge at a time."""
@@ -796,6 +811,149 @@ class Connection:
         if self.script is not None:
             self.report_generation = self.script.exports_sync.setreportenabled(bool(enabled))
 
+    def player_call(self, operation, target):
+        """Invoke one fixed public-profile adapter operation, with no arbitrary Lua or spending permission."""
+        from player_query import validate_player_id
+        if operation not in {'resolve', 'lookup', 'profile', 'snapshot', 'identity'}:
+            raise ValueError('Invalid player query operation')
+        target = validate_player_id(target)
+        with self.lock:
+            value = self.script.exports_sync.query(f'return REA_PLAYER_QUERY.{operation}({target})')
+        return json.loads(value)
+
+    def _install_player_adapter(self):
+        """Install idempotent navigation attribution before exposing the public-profile adapter."""
+        self.script.exports_sync.query((ROOT/'player_query_ui.lua').read_text(encoding='utf-8'))
+        self.script.exports_sync.query((ROOT/'player_query_runtime.lua').read_text(encoding='utf-8'))
+
+    @contextmanager
+    def _player_query_scope(self, cancelled):
+        """Cancel helper work on native manual queries and always release local operation ownership."""
+        def check():
+            """Reuse existing receipt waits; this local check never sends a server request."""
+            if cancelled():return True
+            with self.lock:
+                self.script.exports_sync.query('if REA_PLAYER_QUERY_UI then REA_PLAYER_QUERY_UI.check()end;return "checked"')
+            return False
+        try:
+            yield check
+        except RuntimeError as exc:
+            # A decoded server rejection completes the outstanding request; a timeout does not.
+            if '服务器拒绝' in str(exc) and self.script is not None:
+                with contextlib.suppress(Exception),self.lock:
+                    self.script.exports_sync.query('if REA_PLAYER_QUERY_UI then REA_PLAYER_QUERY_UI.finish(true)end;return "rejected"')
+            raise
+        finally:
+            if self.script is not None:
+                with contextlib.suppress(Exception),self.lock:
+                    self.script.exports_sync.query('if REA_PLAYER_QUERY_UI then REA_PLAYER_QUERY_UI.finish()end;return "finished"')
+
+    def league_query_call(self, operation, value=0):
+        """Allow only bounded manual league browsing operations and session-local member handles."""
+        operations={'leagues','league_snapshot','roster','roster_snapshot','member','member_snapshot','member_identity'}
+        if operation not in operations or type(value) is not int or not 0<=value<=9007199254740991:
+            raise ValueError('Invalid league browsing operation')
+        with self.lock:
+            result=self.script.exports_sync.query(f'return REA_LEAGUE_QUERY.{operation}({value})')
+        return json.loads(result)
+
+    def query_league_members(self, operation, value, cancelled):
+        """Install passive adapters lazily, then execute exactly one manually requested browsing exchange."""
+        from league_query import query_league
+        if operation not in {'leagues','roster','member'} or type(value)is not int or not 0<=value<=9007199254740991:
+            raise ValueError('Invalid league browsing operation')
+        if cancelled():raise InterruptedError('联盟查询已取消')
+        if not self.league_query_installed:
+            with self.lock:
+                self._install_player_adapter()
+                self.script.exports_sync.query((ROOT/'league_query_runtime.lua').read_text(encoding='utf-8'))
+            self.league_query_installed=True
+        scope=identity=None
+        if operation=='member':
+            scope=self.map_index_call('context');identity=self.league_query_call('member_identity',value)
+            cached=self.profile_cache.get(scope,identity=identity)
+            if cached is not None:return cached
+        with self._player_query_scope(cancelled) as check:
+            snapshot=query_league(self,GameResponseLog(ADB),operation,value,check)
+        return self._save_player_profile(scope,snapshot,identity)if operation=='member'else snapshot
+
+    def ensure_map_index(self):
+        """Install passive map/index adapters once; installation never sends a region or player request."""
+        if not self.map_index_installed:
+            with self.lock:
+                self._install_player_adapter()
+                self.script.exports_sync.query((ROOT/'map_index_runtime.lua').read_text(encoding='utf-8'))
+            self.map_index_installed=True
+
+    def map_index_call(self, operation, arguments=()):
+        """Read only fixed local map-index operations, with numeric exact-region attribution parameters."""
+        if operation not in {'context','plan','cached','region_read','profile_snapshot'} or any(
+                type(v)is not int or not 0<=v<=100000000 for v in arguments):
+            raise ValueError('Invalid map index operation')
+        self.ensure_map_index()
+        with self.lock:
+            result=self.script.exports_sync.query('return REA_MAP_INDEX.'+operation+'('+','.join(map(str,arguments))+')')
+        return json.loads(result)
+
+    def query_map_index_region(self, region, cancelled):
+        """Reuse the existing bounded regional read/restore scope without changing camera or spending gates."""
+        if cancelled():raise InterruptedError('搜索已停止')
+        x,y=region['x'],region['y']
+        with self._hunt_region_scope(x,y)as state:
+            return self.map_index_call('region_read',(state['seq'],x,y))
+
+    def query_map_index_player(self, scope, row, cancelled):
+        """Use the exact-identity local cache first; keep misses silent and cancel concurrent native browsing."""
+        from map_index_store import checked_player,scope_key
+        checked_player(row)
+        if cancelled():raise InterruptedError('玩家查询已取消')
+        self.ensure_map_index()
+        if scope_key(self.map_index_call('context'))!=scope_key(scope):raise RuntimeError('地图已改变，请重新加载本地记录')
+        cached=self.profile_cache.get(scope,identity=row['identity'])
+        if cached is not None:return cached
+        with self._player_query_scope(cancelled) as check:
+            snapshot=self._query_map_index_player(scope,row,check)
+        return self._save_player_profile(scope,snapshot,row['identity'])
+
+    def _query_map_index_player(self, scope, row, cancelled):
+        """Fetch one saved player's fresh profile only after a click and exact current-map validation."""
+        from map_index_store import checked_player,scope_key
+        from player_query import wait_player_receipt
+        checked_player(row)
+        if cancelled():raise InterruptedError('玩家查询已取消')
+        if scope_key(self.map_index_call('context'))!=scope_key(scope):raise RuntimeError('地图已改变，请重新加载本地记录')
+        uin,openid,platform,mobile=row['identity']
+        # Decimal byte escapes are Lua-safe even for quotes, backslashes and non-ASCII identity text.
+        quoted='"'+''.join('\\%03d'%b for b in openid.encode('utf-8'))+'"'
+        source=f'return REA_MAP_INDEX.profile({{{uin},{quoted},{platform},{mobile}}})'
+        log=GameResponseLog(ADB);log.drain()
+        if cancelled():raise InterruptedError('玩家查询已取消')
+        with self.lock:meta=json.loads(self.script.exports_sync.query(source))
+        wait_player_receipt(log,meta['code'],0,cancelled,owner=True)
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            if cancelled():raise InterruptedError('玩家查询已取消')
+            result=self.map_index_call('profile_snapshot')
+            if result['ready']:return result
+            time.sleep(.1)
+        raise TimeoutError('玩家资料未能确认，未显示旧数据')
+
+    def query_player(self, target, cancelled):
+        """Reuse a scoped public-ID cache or query once and bind its resolved identity for later member exports."""
+        from player_query import query_player, validate_player_id
+        target = validate_player_id(target)
+        if cancelled():
+            raise InterruptedError('玩家查询已取消')
+        scope=self.map_index_call('context')
+        cached=self.profile_cache.get(scope,user_id=target)
+        if cached is not None:return cached
+        with self.lock:
+            self._install_player_adapter()
+        with self._player_query_scope(cancelled) as check:
+            snapshot=query_player(self, GameResponseLog(ADB), target, check)
+            identity=self.player_call('identity',target)
+        return self._save_player_profile(scope,snapshot,identity)
+
     def report_call(self, operation, generation=None):
         """Invoke only fixed report operations; both list refresh and receive require this timer's gate."""
         if operation not in {'refresh','confirm','claim'}:
@@ -832,6 +990,9 @@ class Connection:
     def close(self):
         """Remove the caller API, detach hooks, and release the process even after an RPC failure."""
         if self.script is not None:
+            # Restore native browsing before other feature teardown can fail independently.
+            with contextlib.suppress(Exception):
+                self.script.exports_sync.query('if REA_PLAYER_QUERY_UI then REA_PLAYER_QUERY_UI.close()end;return "profile_ui_restored"')
             try:
                 self.set_enabled(False)
                 self.set_hero_enabled(False)
@@ -842,7 +1003,7 @@ class Connection:
                 self.set_trial_enabled(False)
                 self.set_report_enabled(False)
                 self.script.exports_sync.bindsession(False)
-                self.script.exports_sync.query('REA_REPORT=nil;if REA_TRIAL then REA_TRIAL.close();REA_TRIAL=nil end;'
+                self.script.exports_sync.query('if REA_PLAYER_QUERY_UI then REA_PLAYER_QUERY_UI.close()end;REA_MAP_INDEX=nil;REA_LEAGUE_QUERY=nil;REA_PLAYER_QUERY=nil;REA_REPORT=nil;if REA_TRIAL then REA_TRIAL.close();REA_TRIAL=nil end;'
                                                'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.beacon_close then REA_AUTO_INFANTRY.beacon_close() end;'
                                                'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.league_close then '
                                                'REA_AUTO_INFANTRY.league_close() end;'

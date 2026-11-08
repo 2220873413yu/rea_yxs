@@ -17,6 +17,8 @@ from league_service import LeagueService
 from beacon_service import BeaconService
 from trial_service import TrialService
 from report_service import ReportService
+from map_index_service import MapIndexService
+from league_export import LeagueExportService
 
 
 def owned_soldiers(state):
@@ -124,6 +126,90 @@ class Worker(threading.Thread):
         self.recovery_authorized = ()
         self.hero_view_due = 0
         self.collection_queue_signature = None
+        self.player_target = None
+        self.player_busy = False
+        self.map_index = MapIndexService(self)
+        self.league_export = LeagueExportService(self)
+
+    def request_league_export(self, league_id, path):
+        """Queue one explicit alliance export, mutually exclusive with searches and manual profile queries."""
+        if type(league_id)is not int or league_id<0 or Path(path).suffix.lower()!='.xlsx':
+            raise ValueError('联盟或Excel路径无效')
+        with self.guard:
+            if self.closing.is_set()or self.connection is None or self.trial.holding:
+                raise RuntimeError('请先连接西游幻境地图，试炼期间不能导出')
+            if self.player_busy:raise RuntimeError('已有玩家查询、搜索或导出正在进行')
+            if not any(r['league_id']==league_id for r in self.map_index.players.values()):
+                raise ValueError('该联盟没有已记录成员，请先搜索本图用户')
+            self.league_export.cancel.clear()
+            self.player_target=('league_export',(league_id,str(path)));self.player_busy=True
+
+    def request_player(self, value):
+        """Queue exactly one validated manual query; idle worker cycles never create player requests."""
+        from player_query import validate_player_id
+        target = validate_player_id(value)
+        with self.guard:
+            if self.closing.is_set() or self.connection is None or self.trial.holding:
+                raise RuntimeError('请先连接西游幻境地图，试炼期间不能查询')
+            if self.player_busy:
+                raise RuntimeError('已有玩家查询正在进行')
+            self.player_target = target
+            self.player_busy = True
+
+    def player_tick(self, connection):
+        """Serialize clicked queries/searches/exports; their errors never stop automatic features."""
+        with self.guard:
+            target = self.player_target
+            self.player_target = None
+        if target is None:
+            return
+        browsing=isinstance(target,tuple)
+        status_key='league_query_status'if browsing else'player_status'
+        self.publish(player_busy=True,**{status_key:'正在查询联盟成员资料…'if browsing else'正在查询用户ID和玩家武将资料…'})
+        try:
+            if browsing and target[0]=='clear_profile_cache':
+                connection.clear_player_profile_cache()
+                self.publish(player_cache_cleared=True,league_query_status='已清空当前区服/地图玩家资料缓存；成员和坐标记录保留，下次查询将重新请求服务器。')
+                return
+            if browsing and target[0]=='league_export':
+                self.league_export.begin(*target[1])
+                return
+            if browsing and target[0]=='map_scan':
+                self.map_index.begin(connection)
+                return
+            snapshot = (self.map_index.query_player(connection,target[1])if browsing and target[0]=='saved_member'else
+                        connection.query_league_members(*target,self.closing.is_set)if browsing else
+                        connection.query_player(target,self.closing.is_set))
+            if not self.closing.is_set():
+                save_warning=None
+                if browsing and target[0]=='leagues':
+                    try:self.map_index.record_leagues(connection,snapshot)
+                    except Exception as error:save_warning='联盟已查询，但人数统计未保存：'+str(error).splitlines()[0][:160]
+                key={'leagues':'league_query_list','roster':'league_query_roster','member':'league_query_member','saved_member':'league_query_member'}[target[0]]if browsing else'player_snapshot'
+                self.publish(**{key:snapshot})
+                if save_warning:self.publish(league_query_status=save_warning)
+        except Exception as error:
+            if not self.closing.is_set():
+                self.publish(**{status_key:'查询失败：' + str(error).splitlines()[0][:220]})
+            if browsing and target[0]=='league_export' and not self.league_export.active:
+                self.publish(league_export_progress=dict(active=False,done=0,total=0,path=None))
+        finally:
+            if not self.map_index.active and not self.league_export.active:
+                with self.guard:
+                    self.player_busy = False
+                self.publish(player_busy=False)
+
+    def request_league_query(self, operation, value=0):
+        """Queue one explicit list/roster/member click on the same serial gate as individual-player queries."""
+        saved=operation=='saved_member'and isinstance(value,str)and value in self.map_index.players
+        numeric=operation in {'leagues','roster','member','map_scan','clear_profile_cache'}and type(value)is int and 0<=value<=9007199254740991
+        if not(saved or numeric):
+            raise ValueError('联盟查询参数无效')
+        with self.guard:
+            if self.closing.is_set()or self.connection is None or self.trial.holding:
+                raise RuntimeError('请先连接西游幻境地图，试炼期间不能查询')
+            if self.player_busy:raise RuntimeError('已有玩家或联盟查询正在进行')
+            self.player_target=(operation,value);self.player_busy=True
 
     def poll_hero_view(self, connection):
         """Forward changed cached responses and passive pushes to the UI without querying the server."""
@@ -309,6 +395,10 @@ class Worker(threading.Thread):
             state = connection.open(on_status=lambda message: self.publish(ready=False, status=message), cancel=self.closing,
                                     on_account=lambda account: self.publish(account=account))
             self.connection = connection
+            try:
+                self.map_index.load(connection)
+            except Exception as error:
+                self.publish(league_query_status='本地地图记录未加载：'+str(error).splitlines()[0][:180])
             for unit in UNIT_NAMES:
                 self.publish(state=connection.call('status', unit))
             self.league.tick(connection)
@@ -320,6 +410,9 @@ class Worker(threading.Thread):
                     run_epoch = None
                     self.closing.wait(.1)
                     continue
+                self.player_tick(connection)
+                self.map_index.tick(connection)
+                self.league_export.tick(connection)
                 self.report.tick(connection)
                 self.poll_hero_view(connection)
                 if self.collection.attributes_requested.is_set():
@@ -469,6 +562,10 @@ class Worker(threading.Thread):
                              hero_status='连接已停止，自动恢复关闭',
                              status=('已停止：' if was_enabled else '连接已停止：') + str(error))
         finally:
+            if self.map_index.active:
+                self.map_index.finish('连接已关闭，已保存的地图玩家记录保留')
+            if self.league_export.active:
+                self.league_export.finish('连接已关闭，导出停止')
             self.connection = None
             connection.close()
             self.publish(closed=True)

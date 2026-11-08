@@ -57,6 +57,7 @@ class GameResponseLog:
     """Bind one current log stream and match a single ordinary collection request and its response."""
 
     def __init__(self, adb, device='emulator-5554'):
+        """Skip historical traffic using a bounded tail, retaining any incomplete frame for later drains."""
         self.adb = adb
         self.device = device
         folder = '/storage/emulated/0/Android/data/com.qqgame.mic/files/YXS/net'
@@ -65,8 +66,26 @@ class GameResponseLog:
         names = self.read('shell', 'ls', '-t', folder + '/' + date).decode('ascii').split()
         name = next(value for value in names if re.fullmatch(r'\d{2}_\d{2}_\d{2}', value))
         self.path = folder + '/' + date + '/' + name
-        records = read_records(self.read('exec-out', 'cat', self.path))
-        self.cursor = record_end(records[-1]) if records else 4
+        size = int(self.read('shell', 'stat', '-c', '%s', self.path).strip())
+        if size == 4:
+            self.cursor = 4
+            return
+        offset = max(0, (size - 524288) // 4096) * 4096
+        blob = self.read('exec-out', 'dd', 'if=' + self.path, 'bs=4096',
+                         'skip=' + str(offset // 4096), 'count=129')
+        for match in re.finditer(rb'[sr]_\d+_\w+', blob):
+            at = match.start()
+            if at == 0 or blob[at - 1] != len(match.group()):
+                continue
+            start = at - 1
+            try:
+                records = read_records(bytes.fromhex('0100ffff') + blob[start:])
+            except (ValueError, UnicodeError, AssertionError):
+                continue
+            if records:
+                self.cursor = offset + start + record_end(records[-1]) - 4
+                return
+        raise RuntimeError('无法定位游戏日志的完整记录，未发送请求')
 
     def read(self, *arguments):
         """Read binary emulator logs through hidden ADB children, avoiding console flashes under pythonw."""

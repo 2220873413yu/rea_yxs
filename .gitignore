@@ -18,6 +18,7 @@ __pycache__/
 htmlcov/
 build/
 dist/
+/outputs/
 
 # Per-installation selections, account-related runtime data and diagnostics.
 /auto_infantry/*.json
@@ -26,6 +27,8 @@ dist/
 *.log
 *.dpapi
 /auto_infantry/accounts/
+/auto_infantry/map_player_indexes/
+/auto_infantry/player_profile_caches/
 .env
 .env.*
 !.env.example

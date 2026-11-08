@@ -3,7 +3,7 @@ import queue
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import ttk, filedialog
 
 from bootstrap import ensure_server
 from controller import Worker, owned_soldiers
@@ -19,6 +19,8 @@ from login_session import LoginSession, account_label
 from account_dialog import AccountDialog
 from trial_panel import TrialPanel
 from report_panel import ReportPanel
+from player_panel import PlayerPanel
+from league_members_panel import LeagueMembersPanel
 
 
 class App:
@@ -106,6 +108,10 @@ class App:
         self.feature_tabs.add(self.trial_panel, text='灵台试炼')
         self.report_panel = ReportPanel(self.feature_tabs,self.report_enabled,self.switch_report)
         self.feature_tabs.add(self.report_panel,text='军报')
+        self.player_panel = PlayerPanel(self.feature_tabs, self.query_player)
+        self.feature_tabs.add(self.player_panel, text='玩家武将查询')
+        self.league_members_panel = LeagueMembersPanel(self.feature_tabs,self.query_league,self.stop_map_search,self.stop_league_export)
+        self.feature_tabs.add(self.league_members_panel,text='联盟成员')
         self.hero_status = self.hero_panel.status
         ttk.Separator(panel).pack(fill='x', pady=9)
         ttk.Label(panel, textvariable=self.status, wraplength=960).pack(anchor='w')
@@ -125,6 +131,8 @@ class App:
         """Remove all old account snapshots and switches while retaining explicit saved selection settings."""
         self.ready = False
         self.trial_exclusive = False
+        self.player_panel.clear()
+        self.league_members_panel.clear()
         for variable in (self.enabled, self.hero_enabled, self.collect_enabled, self.hunt_enabled,
                          self.league_enabled, self.beacon_enabled, self.training_speed, self.trial_enabled,self.report_enabled):
             variable.set(False)
@@ -191,6 +199,8 @@ class App:
         self.collection_panel.update_controls(world_ready)
         self.monster_panel.update_controls(world_ready)
         self.league_panel.update_controls(world_ready)
+        self.player_panel.update_controls(world_ready)
+        self.league_members_panel.update_controls(world_ready)
         self.beacon_panel.update_controls(world_ready)
         self.trial_panel.update_controls(self.ready)
         self.report_panel.update_controls(world_ready)
@@ -351,6 +361,53 @@ class App:
             self.worker.beacon.request_check()
             self.beacon_panel.status.set('已请求核对服务器事件和队伍…')
 
+    def query_player(self):
+        """Queue one clicked public-ID lookup and clear old results before any fresh data arrives."""
+        if self.worker is None:
+            self.player_panel.status.set('请先连接西游幻境地图')
+            return
+        try:
+            self.worker.request_player(self.player_panel.player_id.get())
+            self.player_panel.replace_details('')
+            self.player_panel.set_busy(True)
+            self.league_members_panel.set_busy(True)
+            self.player_panel.status.set('已提交玩家查询，等待处理…')
+        except Exception as error:
+            self.player_panel.status.set(str(error).splitlines()[0])
+
+    def query_league(self, operation, value):
+        """Choose an export destination before querying, then serialize the clicked league action."""
+        if self.worker is None:return
+        try:
+            if operation=='export':
+                import re
+                from datetime import datetime
+                league=next((r for r in self.league_members_panel.comparison_rows if r['league_id']==value),{})
+                name=re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',league.get('name','联盟')).strip(' .')or'联盟'
+                path=filedialog.asksaveasfilename(parent=self.root,title='导出联盟已记录成员',defaultextension='.xlsx',
+                    initialfile=f"{name}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",filetypes=[('Excel 工作簿','*.xlsx')])
+                if not path:return
+                self.worker.request_league_export(value,path)
+                self.league_members_panel.export_running=True
+            else:self.worker.request_league_query(operation,value)
+            if operation in {'leagues','roster'}:self.league_members_panel.clear_roster()
+            else:self.league_members_panel.replace_details('')
+            self.league_members_panel.set_busy(True);self.player_panel.set_busy(True)
+            self.league_members_panel.status.set('已提交导出，正在逐人查询资料…'if operation=='export'else'已提交查询，等待服务器响应…')
+        except Exception as error:self.league_members_panel.status.set(str(error).splitlines()[0])
+
+    def stop_map_search(self):
+        """Cancel remaining planned areas locally, allowing the current scoped read to restore the original view."""
+        if self.worker is not None:
+            self.worker.map_index.stop()
+            self.league_members_panel.status.set('正在停止搜索，等待当前区域返回并保存已发现记录…')
+
+    def stop_league_export(self):
+        """Stop unsent export requests and save a workbook marking the remaining members unqueried."""
+        if self.worker is not None:
+            self.worker.league_export.stop()
+            self.league_members_panel.status.set('正在停止导出，将保留已取得资料并标注未查询成员…')
+
     def switch_report(self):
         """Authorize only the current account's two-hour timer; enabling never immediately claims anything."""
         if self.worker is None:
@@ -409,6 +466,30 @@ class App:
                     self.accounts_dialog.refresh(event['profiles'])
                 if 'ready' in event:
                     self.ready = event['ready']
+                if 'player_busy' in event:
+                    self.player_panel.set_busy(event['player_busy'])
+                    self.league_members_panel.set_busy(event['player_busy'])
+                if 'league_query_status' in event:
+                    self.league_members_panel.status.set(event['league_query_status'])
+                if event.get('player_cache_cleared'):
+                    self.league_members_panel.replace_details('');self.player_panel.replace_details('')
+                    self.player_panel.status.set('当前图玩家资料缓存已清空，下次查询将重新请求服务器。')
+                if 'map_index_snapshot' in event:
+                    self.league_members_panel.apply_index(event['map_index_snapshot'])
+                if 'map_index_progress' in event:
+                    self.league_members_panel.apply_search_progress(event['map_index_progress'])
+                if 'league_export_progress' in event:
+                    self.league_members_panel.apply_export_progress(event['league_export_progress'])
+                if 'league_query_list' in event:
+                    self.league_members_panel.apply_leagues(event['league_query_list'])
+                if 'league_query_roster' in event:
+                    self.league_members_panel.apply_roster(event['league_query_roster'])
+                if 'league_query_member' in event:
+                    self.league_members_panel.apply_member(event['league_query_member'])
+                if 'player_status' in event:
+                    self.player_panel.status.set(event['player_status'])
+                if 'player_snapshot' in event:
+                    self.player_panel.apply_snapshot(event['player_snapshot'])
                 if 'trial_enabled' in event:
                     self.trial_enabled.set(bool(event['trial_enabled']))
                 if 'report_enabled' in event:
