@@ -18,14 +18,16 @@ def hero_details(snapshot):
 class PlayerPanel(ttk.Frame):
     """Keep query state separate from automation switches and clear results across account changes."""
 
-    def __init__(self,parent,on_query):
+    def __init__(self,parent,on_query,on_clear=None):
+        """Build clicked public-ID query/cache controls without requiring world-map availability."""
         super().__init__(parent,padding=10)
         self.busy=False;self.ready=False;self.player_id=tk.StringVar()
         bar=ttk.Frame(self);bar.pack(fill='x')
         ttk.Label(bar,text='用户ID').pack(side='left')
         self.entry=ttk.Entry(bar,textvariable=self.player_id,width=24);self.entry.pack(side='left',padx=8)
         self.button=ttk.Button(bar,text='查询武将',command=on_query,state='disabled');self.button.pack(side='left')
-        self.status=tk.StringVar(value='输入用户ID后点击查询；不会自动刷新。')
+        self.clear_button=ttk.Button(bar,text='清空资料缓存',command=on_clear,state='disabled');self.clear_button.pack(side='left',padx=8)
+        self.status=tk.StringVar(value='登录游戏后即可输入用户ID查询，无需进入世界模式；不会自动刷新。')
         ttk.Label(self,textvariable=self.status,wraplength=930).pack(anchor='w',pady=8)
         area=ttk.Frame(self);area.pack(fill='both',expand=True)
         self.details=tk.Text(area,wrap='word',height=10,font=('Microsoft YaHei UI',10),state='disabled')
@@ -35,9 +37,10 @@ class PlayerPanel(ttk.Frame):
         ttk.Label(self,text='仅显示服务器返回的最强武将和展示武将，不代表完整武将名单。',foreground='#666666').pack(anchor='w',pady=(6,0))
 
     def update_controls(self,ready):
-        """Permit one manual query only when the world is connected and no query is in flight."""
+        """Allow a logged-in hall connection independently of the world worker; block duplicate clicks."""
         self.ready=ready
         self.button.state(['!disabled']if ready and not self.busy else['disabled'])
+        self.clear_button.state(['!disabled']if ready and not self.busy else['disabled'])
         self.entry.state(['disabled']if self.busy else['!disabled'])
 
     def set_busy(self,busy):
@@ -51,7 +54,8 @@ class PlayerPanel(ttk.Frame):
 
     def clear(self):
         """Discard results when reconnecting or switching the logged-in account."""
-        self.set_busy(False);self.replace_details('');self.status.set('输入用户ID后点击查询；不会自动刷新。')
+        self.busy=False;self.update_controls(False);self.replace_details('')
+        self.status.set('登录游戏后即可输入用户ID查询，无需进入世界模式；不会自动刷新。')
 
     def apply_snapshot(self,snapshot):
         """Show cache provenance and retain the original confirmation time instead of claiming a fresh reply."""

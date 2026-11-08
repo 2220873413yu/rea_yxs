@@ -21,6 +21,9 @@ from trial_panel import TrialPanel
 from report_panel import ReportPanel
 from player_panel import PlayerPanel
 from league_members_panel import LeagueMembersPanel
+from battle_chat import BattleChatSession
+from battle_chat_panel import BattleChatPanel
+from hall_profile import HallProfileSession
 
 
 class App:
@@ -32,6 +35,8 @@ class App:
         self.root.geometry('1050x1000')
         self.root.minsize(900, 940)
         self.events = queue.Queue()
+        self.battle_chat = BattleChatSession(self.events)
+        self.hall_profile = HallProfileSession(self.events)
         self.sessions = LoginSession(self.events)
         self.login_busy = False
         self.accounts_dialog = None
@@ -108,10 +113,12 @@ class App:
         self.feature_tabs.add(self.trial_panel, text='灵台试炼')
         self.report_panel = ReportPanel(self.feature_tabs,self.report_enabled,self.switch_report)
         self.feature_tabs.add(self.report_panel,text='军报')
-        self.player_panel = PlayerPanel(self.feature_tabs, self.query_player)
+        self.player_panel = PlayerPanel(self.feature_tabs, self.query_player,self.clear_player_cache)
         self.feature_tabs.add(self.player_panel, text='玩家武将查询')
         self.league_members_panel = LeagueMembersPanel(self.feature_tabs,self.query_league,self.stop_map_search,self.stop_league_export)
         self.feature_tabs.add(self.league_members_panel,text='联盟成员')
+        self.battle_chat_panel = BattleChatPanel(self.feature_tabs,self.send_battle_chat)
+        self.feature_tabs.add(self.battle_chat_panel,text='战斗聊天')
         self.hero_status = self.hero_panel.status
         ttk.Separator(panel).pack(fill='x', pady=9)
         ttk.Label(panel, textvariable=self.status, wraplength=960).pack(anchor='w')
@@ -133,6 +140,8 @@ class App:
         self.trial_exclusive = False
         self.player_panel.clear()
         self.league_members_panel.clear()
+        self.battle_chat.cancel_pending();self.battle_chat_panel.clear()
+        self.hall_profile.cancel_pending()
         for variable in (self.enabled, self.hero_enabled, self.collect_enabled, self.hunt_enabled,
                          self.league_enabled, self.beacon_enabled, self.training_speed, self.trial_enabled,self.report_enabled):
             variable.set(False)
@@ -199,8 +208,9 @@ class App:
         self.collection_panel.update_controls(world_ready)
         self.monster_panel.update_controls(world_ready)
         self.league_panel.update_controls(world_ready)
-        self.player_panel.update_controls(world_ready)
+        self.player_panel.update_controls(not self.login_busy and not self.closing)
         self.league_members_panel.update_controls(world_ready)
+        self.battle_chat_panel.update_controls(not self.login_busy and not self.closing)
         self.beacon_panel.update_controls(world_ready)
         self.trial_panel.update_controls(self.ready)
         self.report_panel.update_controls(world_ready)
@@ -211,6 +221,11 @@ class App:
         self.login_button.state(['disabled'] if self.login_busy else ['!disabled'])
         if self.accounts_dialog is not None and self.accounts_dialog.winfo_exists():
             self.accounts_dialog.update_controls()
+
+    def send_battle_chat(self,message):
+        """Delegate only an explicit composer click; battle chat does not depend on a loaded world map."""
+        if self.login_busy or self.closing:raise RuntimeError('账号操作或关闭进行中，未发送')
+        self.battle_chat.submit(message)
 
     def switch_hero(self):
         """Freeze the user's persisted hero choices without changing the troop master."""
@@ -362,18 +377,25 @@ class App:
             self.beacon_panel.status.set('已请求核对服务器事件和队伍…')
 
     def query_player(self):
-        """Queue one clicked public-ID lookup and clear old results before any fresh data arrives."""
-        if self.worker is None:
-            self.player_panel.status.set('请先连接西游幻境地图')
-            return
+        """Query public profiles through a login-bound temporary hall connection, independently of map readiness."""
+        if self.login_busy or self.closing:return
         try:
-            self.worker.request_player(self.player_panel.player_id.get())
+            self.hall_profile.submit(self.player_panel.player_id.get(),self.worker)
             self.player_panel.replace_details('')
             self.player_panel.set_busy(True)
             self.league_members_panel.set_busy(True)
             self.player_panel.status.set('已提交玩家查询，等待处理…')
         except Exception as error:
             self.player_panel.status.set(str(error).splitlines()[0])
+
+    def clear_player_cache(self):
+        """Clear the current login's local profile cache without requiring world entry or sending a request."""
+        if self.login_busy or self.closing:return
+        try:
+            self.hall_profile.submit(None,self.worker,clear_cache=True)
+            self.player_panel.set_busy(True);self.league_members_panel.set_busy(True)
+            self.player_panel.status.set('正在清空当前资料缓存…')
+        except Exception as error:self.player_panel.status.set(str(error).splitlines()[0])
 
     def query_league(self, operation, value):
         """Choose an export destination before querying, then serialize the clicked league action."""
@@ -444,6 +466,21 @@ class App:
                 event = self.events.get_nowait()
                 if event.get('session_epoch', self.sessions.epoch) != self.sessions.epoch:
                     continue
+                if event.get('chat_generation',self.battle_chat.generation)!=self.battle_chat.generation:
+                    continue
+                if event.get('hall_profile_generation',self.hall_profile.generation)!=self.hall_profile.generation:
+                    continue
+                if 'battle_chat_result'in event:
+                    self.battle_chat_panel.apply_result(event['battle_chat_result'])
+                if 'hall_profile_snapshot'in event or 'hall_profile_error'in event:
+                    self.player_panel.set_busy(False);self.league_members_panel.set_busy(False)
+                    if 'hall_profile_error'in event:self.player_panel.status.set(event['hall_profile_error'])
+                    else:
+                        snapshot=event['hall_profile_snapshot']
+                        if snapshot.get('cleared'):
+                            self.player_panel.replace_details('');self.league_members_panel.replace_details('')
+                            self.player_panel.status.set(snapshot['status'])
+                        else:self.player_panel.apply_snapshot(snapshot)
                 self.worker = self.sessions.worker
                 if event.get('trial_reconnect'):
                     snapshot=self.trial_panel.snapshot
@@ -590,6 +627,8 @@ class App:
         if self.closing:
             return
         self.closing = True
+        self.battle_chat.close()
+        self.hall_profile.close()
         self.sessions.close()
         self.enabled.set(False)
         self.hero_enabled.set(False)
@@ -608,7 +647,7 @@ class App:
 
     def finish_close(self):
         """Wait without blocking Tk so daemon shutdown cannot interrupt a two-file SDK restore transaction."""
-        if self.sessions.pending_shutdown():
+        if self.sessions.pending_shutdown()or self.battle_chat.pending_shutdown()or self.hall_profile.pending_shutdown():
             self.status.set('正在安全退出账号操作，请稍候；自动功能全部关闭…')
             self.root.after(100, self.finish_close)
         else:

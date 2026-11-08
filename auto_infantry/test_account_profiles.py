@@ -523,6 +523,8 @@ class AccountDialogTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec);loader.exec_module(module)
         app = module.App.__new__(module.App)
         app.root = Mock();app.status = Mock();app.sessions = Mock()
+        app.battle_chat = Mock();app.battle_chat.pending_shutdown.return_value=False
+        app.hall_profile = Mock();app.hall_profile.pending_shutdown.return_value=False
         app.sessions.pending_shutdown.side_effect = [True, False]
         app.finish_close()
         app.root.destroy.assert_not_called()

@@ -818,12 +818,13 @@ class Connection:
             raise ValueError('Invalid player query operation')
         target = validate_player_id(target)
         with self.lock:
-            value = self.script.exports_sync.query(f'return REA_PLAYER_QUERY.{operation}({target})')
+            value = self.script.exports_sync.query(f'return {getattr(self,"player_api","REA_PLAYER_QUERY")}.{operation}({target})')
         return json.loads(value)
 
     def _install_player_adapter(self):
         """Install idempotent navigation attribution before exposing the public-profile adapter."""
         self.script.exports_sync.query((ROOT/'player_query_ui.lua').read_text(encoding='utf-8'))
+        self.script.exports_sync.query('REA_PLAYER_QUERY_UI.claim();return "profile_ui_owned"')
         self.script.exports_sync.query((ROOT/'player_query_runtime.lua').read_text(encoding='utf-8'))
 
     @contextmanager

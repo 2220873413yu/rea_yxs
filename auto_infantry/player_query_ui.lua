@@ -4,6 +4,7 @@ local api={};local active,interrupted,owned,pending,foreground=false,false,false
 local patches={}
 local unpack=unpack or table.unpack
 local suppressed,lastProfileNotification=0,0
+local externalLeases,owner=0,false
 local hall=assert(package.loaded.HallMsgMgr.__instanceDict)
 local friend=assert(package.loaded.FriendController.__instanceDict)
 local notifier=assert(package.loaded.SceneNotifier.__instanceDict)
@@ -66,6 +67,22 @@ function api.status()
  return active,interrupted,pending~=nil,suppressed,lastProfileNotification
 end
 
+-- A world helper owns these shared hooks until its connection closes.
+function api.claim()
+ owner=true
+end
+
+-- A temporary hall query keeps the common hook alive across unrelated world-helper teardown.
+function api.retain()
+ externalLeases=externalLeases+1
+end
+
+-- Release only this temporary caller; idle unowned hooks restore their native methods.
+function api.release()
+ externalLeases=math.max(0,externalLeases-1)
+ if externalLeases==0 and not owner then api.close()end
+end
+
 patch(hallObject,'sendTUserProfileReq',function(original)return function(self,uid,...)
  if owned then
   assert(not pending,'玩家资料请求尚未完成')
@@ -105,6 +122,8 @@ end end)
 
 -- Restore native methods on disconnect; unrelated wrappers installed later are never overwritten.
 function api.close()
+ owner=false
+ if externalLeases>0 then return end
  active=false;interrupted=false;pending=nil;foreground={}
  for i=#patches,1,-1 do local p=patches[i];if rawget(p[1],p[2])==p[4]then rawset(p[1],p[2],p[3])end end
  if REA_PLAYER_QUERY_UI==api then REA_PLAYER_QUERY_UI=nil end

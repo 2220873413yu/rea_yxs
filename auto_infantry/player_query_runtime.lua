@@ -3,6 +3,8 @@ local api={};REA_PLAYER_QUERY=api
 local mm=CSLTypes.ModelManager.sharedInstance();local account=mm:getModel(CSLTypes.MainModel)
 local login=account.mTLoginRsp;local main=mm:getModel(CSLTypes.SLGMainModel);local world=main.mTSLGLoginMapRsp
 local db=CSLTypes.DBSearcher.sharedInstance();local target,uid,before
+local own=account.myUserId
+local ownIdentity=own and {own[1],own[2],own[3],own[4]}
 
 -- Serialize only explicit public hero fields; internal account identifiers never leave this adapter.
 local function json(v)
@@ -20,11 +22,27 @@ end
 local function count(v)return v and v:get_Count()or 0 end
 local function text(v)return v and CSLTypes.YXSUtils.GBK2UTF8(v)or''end
 
--- Reject late work after an account/world change, including requests queued before switching accounts.
+-- Public profiles belong to the logged-in account connection, independently of world-map readiness.
 local function guard()
  if REA_PLAYER_QUERY_UI then REA_PLAYER_QUERY_UI.check()end
- assert(mm:getModel(CSLTypes.MainModel)==account and account.mTLoginRsp==login and
-  main.mTSLGLoginMapRsp==world and main.mIsMapLoaded,'账号或地图已改变，请重新连接助手')
+ assert(mm:getModel(CSLTypes.MainModel)==account and login and login[1]==0 and account.mTLoginRsp==login,
+  '账号已改变或尚未登录，请重新读取账号')
+ if ownIdentity then local live=account.myUserId
+  assert(live and live[1]==ownIdentity[1]and live[2]==ownIdentity[2]and live[3]==ownIdentity[3]and live[4]==ownIdentity[4],'账号身份已改变')
+ end
+end
+
+-- Return local login/cache scope only; never enter a map or request game data.
+function api.login_context()
+ guard();assert(account.myUserId,'当前账号尚未登录')
+ local stage=package.loaded.HeroPalaceItem.__instanceDict.getCurrentStageName({})
+ assert(stage~='LoginStage','请先登录游戏')
+ local zone=CSLTypes.QQGameSystem.getSystemInstance():getCurZoneID();local mapId=0
+ local owner=world and world[5]and world[5][1];local me=account.myUserId
+ if owner and owner[1]==me[1]and owner[2]==me[2]and owner[3]==me[3]and owner[4]==me[4]then
+  local scope=main:getTMapGameDataID();if scope then mapId=scope[1];zone=scope[2]end
+ end
+ return json({zone_id=zone,map_id=mapId})
 end
 
 -- Reuse only a successful profile's exact public-ID mapping; always fetch fresh details afterwards.
@@ -39,7 +57,8 @@ end
 
 -- Bind only an identity already returned by the league roster adapter; member details still require a fresh reply.
 function api.bind_member(identity)
- guard();assert(type(identity)=='table'and((type(identity[1])=='number'and identity[1]~=0)or
+ guard();assert(main and main.mIsMapLoaded and main.mTSLGLoginMapRsp==world,'账号或地图已改变，请重新连接助手')
+ assert(type(identity)=='table'and((type(identity[1])=='number'and identity[1]~=0)or
   (type(identity[2])=='string'and identity[2]~='')),'成员身份未返回')
  if REA_PLAYER_QUERY_UI then REA_PLAYER_QUERY_UI.begin()end
  target=0;uid=identity;before=nil
@@ -121,6 +140,7 @@ function api.snapshot(id)
  local p=r[2];local rows={}
  if p[10]and p[10][5]and p[10][5]>0 then rows[#rows+1]=hero(p[10],'最强武将',p[11])end
  for i=0,count(p[25])-1 do rows[#rows+1]=hero(p[25]:get_Item(i),'展示武将'..(i+1),p[26])end
- return json({ready=true,display_id=id>0 and id or r[17],nickname=text(r[5]),heroes=rows,confirmed_ms=CSLTypes.SLGMainModel.GetMapTimeNow()})
+ local now=CSLTypes.RefreshTimer and math.floor(CSLTypes.RefreshTimer.getServerTimeNow()*1000)or CSLTypes.SLGMainModel.GetMapTimeNow()
+ return json({ready=true,display_id=id>0 and id or r[17],nickname=text(r[5]),heroes=rows,confirmed_ms=now})
 end
 return 'player_query_api_installed'

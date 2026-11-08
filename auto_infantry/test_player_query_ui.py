@@ -109,6 +109,20 @@ Game.registeredParser=hall.parseTUserProfileRsp
         with self.assertRaisesRegex(Exception,'等待响应'):
             self.lua.execute('REA_PLAYER_QUERY_UI.begin()')
 
+    def test_hall_lease_survives_world_close_and_restores_when_last_user_releases(self):
+        """A world reconnect cannot remove a hall query's navigation filter halfway through its reply."""
+        self.lua.execute('REA_PLAYER_QUERY_UI.claim();REA_PLAYER_QUERY_UI.retain();REA_PLAYER_QUERY_UI.close()')
+        self.assertTrue(self.lua.execute('return REA_PLAYER_QUERY_UI~=nil and Game.notifier.notifyStateChange~=Game.originalNotify'))
+        self.lua.execute('REA_PLAYER_QUERY_UI.release()')
+        self.assertTrue(self.lua.execute('return REA_PLAYER_QUERY_UI==nil and Game.notifier.notifyStateChange==Game.originalNotify'))
+
+    def test_hall_release_keeps_an_active_world_owners_hooks(self):
+        """Finishing a temporary hall query does not tear down the map worker's shared hook."""
+        self.lua.execute('REA_PLAYER_QUERY_UI.claim();REA_PLAYER_QUERY_UI.retain();REA_PLAYER_QUERY_UI.release()')
+        self.assertTrue(self.lua.execute('return REA_PLAYER_QUERY_UI~=nil'))
+        self.lua.execute('REA_PLAYER_QUERY_UI.close()')
+        self.assertTrue(self.lua.execute('return Game.notifier.notifyStateChange==Game.originalNotify'))
+
     def test_own_profile_navigation_is_filtered_only_for_matching_helper_reply(self):
         """The alternate own-profile notification shares the identity gate; unrelated 1035 stays native."""
         self.lua.execute('REA_PLAYER_QUERY.bind_member(Game.uid);REA_PLAYER_QUERY.profile(0);Game.profile=profile(Game.uid);Game.notifier:notifyStateChange(1035)')

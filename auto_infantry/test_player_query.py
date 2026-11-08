@@ -112,7 +112,7 @@ class PlayerReceiptTests(unittest.TestCase):
 FIXTURE=r'''
 function L(rows)return {get_Count=function()return #rows end,get_Item=function(self,i)return rows[i+1]end}end
 Game={sent={},uid={123,'private',0,0}}
-Game.account={mTLoginRsp={},getCurrUserProfileRsp=function()return Game.profile end}
+Game.account={mTLoginRsp={0},getCurrUserProfileRsp=function()return Game.profile end}
 Game.world={mIsMapLoaded=true,mTSLGLoginMapRsp={}}
 Game.friends={GetVecFindUserInfo=function()return L({{lFriendSequence=7,iRet=0,stUserSimpleProfile={Game.uid,'Player'}}})end}
 local models={account=Game.account,world=Game.world,friends=Game.friends}
