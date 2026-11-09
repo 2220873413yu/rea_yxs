@@ -184,7 +184,7 @@ class AccountService:
             return self._login(cancel, publish, profile_id, qr_context)
 
     def _login(self, cancel, publish, profile_id, qr_context):
-        """Perform the restart transaction while exclusive account ownership blocks other helper instances."""
+        """Restart with exclusive ownership; reuse a persisted pause without depending on a broken old Lua realm."""
         profile = self.store.load(profile_id) if profile_id else None
         if profile is not None and profile.get('ticket_status') == '需要重新扫码':
             raise TicketExpired('此账号票据已标记失效，请选择对应平台重新扫码；未重启或重复登录')
@@ -195,8 +195,14 @@ class AccountService:
                 raise AccountError('请选择扫码登录的平台')
             mobile, open_platform = qr_context
         publish(status='正在准备重启客户端，自动功能全部关闭…')
-        with self.connection(cancel) as connection:
-            previous_auto = int(self.call(connection, 'pause'))
+        cancelled(cancel)
+        if self.transport.startup_auto_paused() is True:
+            previous_auto=1
+            publish(status='已确认启动自动登录处于关闭状态，直接重启客户端；尚未发起认证…')
+        else:
+            publish(status='正在连接旧客户端以暂停启动自动登录，尚未重启或发起认证…')
+            with self.connection(cancel) as connection:
+                previous_auto = int(self.call(connection, 'pause'))
         if self.paused_auto is None:
             self.paused_auto = previous_auto
         original_auto = profile['no_auto_login'] if profile else self.paused_auto

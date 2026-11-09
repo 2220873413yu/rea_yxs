@@ -228,6 +228,19 @@ class TransportTests(unittest.TestCase):
             db.close()
 
 
+class StartupPauseTests(unittest.TestCase):
+    """Only one unambiguous persisted startup-off flag may bypass the old client bridge."""
+    def test_persisted_pause_requires_one_exact_enabled_marker(self):
+        """Missing, duplicate, enabled-auto-login or truncated values cannot authorize the restart shortcut."""
+        transport=AccountTransport()
+        cases=[(b'prefixmNoAutoLogin\x10\x01suffix',True),(b'mNoAutoLogin\x10\x00',False),
+               (b'mNoAutoLogin\x10',False),(b'other-setting',False),
+               (b'mNoAutoLogin\x10\x01mNoAutoLogin\x10\x01',False)]
+        for data,expected in cases:
+            with self.subTest(data=data),patch.object(transport,'read',return_value=data):
+                self.assertIs(transport.startup_auto_paused(),expected)
+
+
 class AccountLoginTests(unittest.TestCase):
     """Authentication observation must respect agreement, identity and cancellation without resending."""
 
@@ -242,6 +255,24 @@ class AccountLoginTests(unittest.TestCase):
         with patch.object(self.cancel, 'wait', side_effect=lambda n: self.cancel.set()):
             with self.assertRaises(InterruptedError):self.service._agreement(self.connection, self.cancel, Mock())
         self.connection.script.exports_sync.query.assert_not_called()
+
+    def test_persisted_pause_can_restart_without_attaching_to_broken_old_realm(self):
+        """An already persisted no-auto-login setting permits restart before connecting to the new process only."""
+        self.service.transport.startup_auto_paused.return_value=True
+        self.service._finish_login=Mock(return_value=('logged','saved'))
+        self.service.call=Mock(return_value='1')
+        connections=[]
+        @contextmanager
+        def bridge(cancel):
+            """Count bridge acquisition without touching a live client or SDK files."""
+            connections.append(True);yield self.connection
+        self.service.connection=bridge
+        result=self.service._login(self.cancel,Mock(),None,(1,0))
+        self.assertEqual(result,('logged','saved'))
+        self.assertEqual(len(connections),1)
+        self.service.transport.restart.assert_called_once_with(self.cancel,None)
+        self.service.call.assert_not_called()
+        self.assertEqual(self.service._finish_login.call_args.args[-1],1)
 
     def test_startup_bridge_can_be_recreated_before_any_authentication(self):
         """Libraries can appear before the emulated Lua bridge is ready; retry only this local initialization."""

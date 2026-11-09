@@ -112,6 +112,14 @@ class AccountTransport:
         value = self.run("sh -c 'pidof com.qqgame.mic || true'").strip().decode('ascii')
         return value.split()[0] if value else None
 
+    def startup_auto_paused(self):
+        """Read the exact persisted startup flag so a paused login screen need not attach its old Lua realm."""
+        setting=self.read(GAME_SETTING)
+        marker=b'mNoAutoLogin'
+        if setting.count(marker)!=1:return False
+        index=setting.find(marker)+len(marker)
+        return setting[index:index+2]==b'\x10\x01'
+
     def wait_modules(self, cancel, seconds=100):
         """Wait without Frida during unpacking; require stable game/Lua mappings before a new bridge attaches."""
         deadline, stable_pid, stable_at = time.monotonic() + seconds, None, None
