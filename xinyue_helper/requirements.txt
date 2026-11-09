@@ -1,0 +1,2 @@
+cryptography==50.0.2
+Pillow>=10,<13
