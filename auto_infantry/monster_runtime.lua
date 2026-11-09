@@ -46,9 +46,10 @@ local function methods(name)
  return c.__instanceDict
 end
 
--- Use the native fog layer rather than inferring visibility from presence in a map cache.
+-- Match native monster rendering/detail buttons: the third argument is -1, not the map position's z value.
+-- Discovery, detail metrics and final departure all use this predicate; cached presence never implies visibility.
 local function visible(pos)
- return fog:isCellVisible(pos[1],pos[2],pos[3] or 0)==true
+ return fog:isCellVisible(pos[1],pos[2],-1)==true
 end
 
 -- Interpret cached monster flags conservatively; absent local state alone never authorizes spending.

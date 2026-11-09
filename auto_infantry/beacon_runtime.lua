@@ -47,6 +47,13 @@ local function checkWorld()
   'World map changed; reconnect the helper')
 end
 
+-- Match native beacon dialogs: -1 is the visibility argument, not the position's third coordinate.
+-- Share this read-only predicate across event filtering, hero/scout eligibility and final execution guards.
+local function visible(pos)
+ return manager:getModel(CSLTypes.SLGWarFogModel):isCellVisible(pos[1],pos[2],-1)==true
+end
+native.visible=visible
+
 -- Express every scheduling timestamp in server epoch milliseconds.
 local function nowMs()
  return clock():GetCurrentServerTime()*1000
@@ -179,13 +186,12 @@ function api.beacon_snapshot()
  assert(type(r[6])=='number' and r[6]>0 and r[6]==math.floor(r[6]),'Beacon queue capacity unknown')
  local events,armies={},{}
  local home=map:getMyMainCityCoordinates()
- local fog=manager:getModel(CSLTypes.SLGWarFogModel)
  for i=0,r[4]:get_Count()-1 do local e=r[4]:get_Item(i)
   local c=assert(search:searchTMapIntelStation_Event_Map(e[2]),'Beacon event config missing')
   local p=e[1][1];local shown=CSLTypes.SLGMapUtils.logicToDisplay(p)
   events[#events+1]=encode({event_id=e[1][2],config_id=e[2],kind=c[2],state=e[3],army_id=e[4],
    start_ms=e[5]*1000,end_ms=e[6]*1000,x=shown[1],y=shown[2],
-   distance=CSLTypes.SLGMapUtils.calMapP2PDistance(home,p),visible=fog:isCellVisible(p[1],p[2],p[3])})
+   distance=CSLTypes.SLGMapUtils.calMapP2PDistance(home,p),visible=visible(p)})
  end
  local world=api.read_hero_state()
  assert(world.army_known,'Own army state unavailable for beacon')
@@ -216,7 +222,7 @@ function api.beacon_candidates_query(id)
   end
   if not found then attempts.dispatch[id]=nil end
  end
- assert(manager:getModel(CSLTypes.SLGWarFogModel):isCellVisible(p[1],p[2],p[3]),'Rescue has no vision')
+ assert(visible(p),'Rescue has no vision')
  target=id;available=nil;want=true
  local secondary=native.beforeCandidates and native.beforeCandidates(e) or 0
  package.loaded.SLGMainController.__instanceDict.sendTSLGGetAvailHeroListReq(id,aim,secondary or 0,0)
@@ -241,13 +247,15 @@ function api.beacon_cancel_query()
  want=false;suppress=false;available=nil;return 'beacon_candidate_query_cancelled'
 end
 
--- Read target-bound candidates; busy and cooling heroes are shown but never eligible for a departure.
+-- Read target-bound candidates using the same current native visibility as filtering and final departure.
+-- Busy and cooling heroes remain visible in the result but cannot qualify for departure.
 function api.beacon_candidates_result()
  checkWorld();if not available then return '{"ready":false}' end
  assert(available[1]==0,'Rescue hero query refused: '..tostring(available[1]))
  local e=authorized(target);assert(available[2]==target and available[3]==aim,'Beacon hero response mismatched')
  if native.candidatesReady and not native.candidatesReady(e) then return '{"ready":false}' end
  assert(available[5][1]==e[1][1][1] and available[5][2]==e[1][1][2],'Rescue position mismatch')
+ local eventVisible=visible(e[1][1])
  local rows={}
  for i=0,available[4]:get_Count()-1 do local h=available[4]:get_Item(i);local id=h[1][1][3]
   local state=api.read_hero_state(id)
@@ -258,7 +266,7 @@ function api.beacon_candidates_result()
   local extra=native.metrics and native.metrics(h,e) or {power=h[4],eligible=true}
   rows[#rows+1]=encode({hero_id=id,name=state.name,power=extra.power,speed=h[6] or 0,load=h[5] or 0,
    overwhelming=extra.overwhelming,strength_known=extra.strength_known~=false,travel_seconds=h[3],remaining_ms=state.remaining_ms,
-   ready=state.found and state.fresh and state.army_known and not state.busy and state.hero_state==0 and
+   ready=eventVisible and state.found and state.fresh and state.army_known and not state.busy and state.hero_state==0 and
     state.remaining_ms<=0 and methods('SLGChooseHeroItem').getActionState(h)==0 and enough and extra.eligible})
  end
  return '{"ready":true,"target_id":'..target..',"heroes":['..table.concat(rows,',')..']}'
@@ -307,7 +315,7 @@ function api.beacon_dispatch(id,heroId)
  assert(available and target==id and available[1]==0 and available[2]==id and available[3]==aim and
   nowMs()>=availableAt and nowMs()-availableAt<=3000,'Rescue candidates stale or mismatched')
  assert(available[5][1]==e[1][1][1] and available[5][2]==e[1][1][2] and available[11]==0,'Rescue target or force-trip decision changed')
- local p=e[1][1];assert(manager:getModel(CSLTypes.SLGWarFogModel):isCellVisible(p[1],p[2],p[3]),'Rescue vision lost')
+ local p=e[1][1];assert(visible(p),'Rescue vision lost')
  local state=api.read_hero_state(heroId)
  assert(state.found and state.fresh and state.army_known and not state.busy and state.hero_state==0 and state.remaining_ms<=0,
   'Rescue hero is not ready')

@@ -140,7 +140,7 @@ function api.beacon_scout_result(id)
  assert(divisor>0,'Scout cost configuration invalid')
  local distance=CSLTypes.SLGMapUtils.calMapP2PDistance(e[1][1],map:getMyMainCityCoordinates())
  local cost=math.floor((distance+divisor-1)/divisor)
- local p=e[1][1];local visible=n.manager:getModel(CSLTypes.SLGWarFogModel):isCellVisible(p[1],p[2],p[3])
+ local p=e[1][1];local visible=n.visible(p)
  local shown=CSLTypes.SLGMapUtils.logicToDisplay(p);local busy=false
  for _,s in ipairs(scoutStages()) do if s.x==shown[1] and s.y==shown[2] and s.end_ms>n.now() then busy=true end end
  return api.encode_flat_state({ready=true,event_id=id,cost=cost,stock=scoutCount,x=shown[1],y=shown[2],
@@ -154,7 +154,7 @@ function api.beacon_scout(id)
  assert(kind(e)==2 and e[3]==0 and not attempts.scout[id] and not scoutPending and scoutCount~=nil and
   n.now()-scoutAt<=3000,'Fresh treasure scout stock required')
  local p=e[1][1];local shown=CSLTypes.SLGMapUtils.logicToDisplay(p)
- assert(n.manager:getModel(CSLTypes.SLGWarFogModel):isCellVisible(p[1],p[2],p[3]),'Treasure vision lost')
+ assert(n.visible(p),'Treasure vision lost')
  local k=math.floor(tonumber(search:searchGlobalVariable(103010)[2]));assert(k>0,'Invalid scout cost')
  local cost=math.floor((CSLTypes.SLGMapUtils.calMapP2PDistance(p,map:getMyMainCityCoordinates())+k-1)/k)
  assert(scoutCount>=cost,'Insufficient scouts; no purchase')

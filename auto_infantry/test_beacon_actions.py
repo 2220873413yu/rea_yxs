@@ -121,6 +121,47 @@ class BeaconActionsTests(unittest.TestCase):
         self.assertFalse(self.lua.execute('return pcall(REA_AUTO_INFANTRY.beacon_scout,10)')[0])
         self.assertEqual(len(self.lua.globals().Game.sends),0)
 
+    def test_native_visible_events_share_filter_eligibility_and_final_guards(self):
+        """Replay layer0=false/native-parameter=true for each type without extra task-list or area requests."""
+        for kind in (1,2,3,4):
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.lua.execute(f'Game.singleLayerVisible=false;Game.visible=true;Game.events[1][2]={kind};Game.fogCalls={{}}')
+                snapshot=json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_snapshot()'))
+                self.assertTrue(snapshot['events'][0]['visible'])
+                queries=self.lua.globals().Game.infoQueries
+                if kind==2:
+                    self.lua.execute('REA_AUTO_INFANTRY.beacon_scout_query(10)')
+                    state=json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_scout_result(10)'))
+                    self.assertTrue(state['eligible'])
+                    self.lua.execute('REA_AUTO_INFANTRY.beacon_scout(10)')
+                    self.assertEqual(self.lua.globals().Game.scoutCalls,1)
+                else:
+                    self.prepare(kind)
+                    self.assertTrue(self.result()['heroes'][0]['ready'])
+                    self.lua.execute('REA_AUTO_INFANTRY.beacon_dispatch(10,303)')
+                    self.assertEqual(len(self.lua.globals().Game.trips),1)
+                calls=self.lua.globals().Game.fogCalls
+                self.assertTrue(all(calls[i][3]==-1 for i in range(1,len(calls)+1)))
+                self.assertEqual(self.lua.globals().Game.infoQueries,queries)
+                self.assertIsNone(self.lua.globals().Game.regionRequests)
+
+    def test_native_visibility_loss_prevents_hero_and_scout_execution(self):
+        """Recheck native visibility after eligibility; an old positive result cannot authorize spending."""
+        self.prepare(1)
+        self.assertTrue(self.result()['heroes'][0]['ready'])
+        self.lua.execute('Game.visible=false')
+        self.assertFalse(self.result()['heroes'][0]['ready'])
+        self.assertFalse(self.lua.execute('return pcall(REA_AUTO_INFANTRY.beacon_dispatch,10,303)')[0])
+        self.assertEqual(len(self.lua.globals().Game.trips),0)
+        self.setUp()
+        self.lua.execute('Game.events[1][2]=2;REA_AUTO_INFANTRY.beacon_scout_query(10)')
+        self.assertTrue(json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_scout_result(10)'))['eligible'])
+        self.lua.execute('Game.visible=false')
+        self.assertFalse(json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_scout_result(10)'))['eligible'])
+        self.assertFalse(self.lua.execute('return pcall(REA_AUTO_INFANTRY.beacon_scout,10)')[0])
+        self.assertIsNone(self.lua.globals().Game.scoutCalls)
+
     def test_scout_insufficient_stale_and_manual_inbound_are_blocked(self):
         """A pre-existing scout journey, stale stock or shortage cannot trigger another scout or purchase."""
         for change in ('Game.distance=40','Game.time=Game.time+3001',

@@ -239,9 +239,7 @@ class MonsterService:
             self.candidates = [r for r in self.candidates if r['target_id'] not in reserved and
                                r['target_id'] not in self.completed and (r['x'], r['y']) not in self.ignored and
                                (r['x'], r['y']) not in self.waiting]
-            wait_ring = min((w['ring'] for w in self.waiting.values()), default=self.options.radius)
-            region = self.discovery.next_region(self.candidates[0]['distance'] if self.candidates else float('inf'),
-                                                 wait_ring)
+            region = self.discovery.next_region(self.candidates[0]['distance'] if self.candidates else float('inf'))
             if region is not None:
                 if not self.alive(epoch):
                     return
@@ -255,9 +253,9 @@ class MonsterService:
                     self.due = 0
                 self.publish_snapshot(schedule)
                 return
-            if not self.candidates or ring_for(self.candidates[0]['distance'], self.options.radius) > wait_ring:
+            if not self.candidates:
                 self.schedule_waiting()
-                self.publish('附近目标暂缺可用英雄或兵力，等待；不因此向更远圈扩展' if self.waiting else
+                self.publish('范围内其余目标已检查，暂缺可用英雄、兵力或完整战力数据，等待状态变化' if self.waiting else
                              f'范围内暂无可打点；区域已查{self.discovery.cursor}/{len(self.discovery.regions)}，'
                              f'独立记录{len(self.discovery.records)}个目标；等待状态变化或手动检查')
                 return
@@ -314,7 +312,7 @@ class MonsterService:
             self.publish(f"已确认{plan['name']}＋{plan['followers']}名小兵出征（{t['x']},{t['y']}），继续核对剩余额度")
 
     def reject_plan(self, target, metrics, ring, schedule):
-        """Remember only proven full-strength failures by coordinate; transient blockers stay reconsiderable."""
+        """Exclude a proven weak coordinate or defer a temporary blocker, then continue other targets and regions."""
         point = (target['x'], target['y'])
         if metrics.get('strength_known') is True and metrics.get('can_win_full') is False:
             self.due = 0
@@ -325,8 +323,7 @@ class MonsterService:
             end = metrics.get('cooldown_ms', 0)
             if end > schedule['server_now_ms']:
                 self.waiting[point]['due'] = time.monotonic() + (end - schedule['server_now_ms']) / 1000 + 1
-            if any((r['x'], r['y']) not in self.waiting and ring_for(r['distance'],self.options.radius)<=ring
-                   for r in self.candidates or []):
+            if any((r['x'], r['y']) not in self.waiting for r in self.candidates or []) or self.discovery.next_region() is not None:
                 self.due = 0
             else:
                 self.schedule_waiting()

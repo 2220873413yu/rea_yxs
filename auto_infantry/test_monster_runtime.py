@@ -26,7 +26,12 @@ Game.base=110;Game.per=20;Game.enemy=100;Game.visible=true;Game.monsterIdle=true
 Game.followerStock=4;Game.infantry=4;Game.skipAllowed=true;Game.skipCalls=0
 Game.combatLimit=3
 CSLTypes.SLGWarFogModel='fog';CSLTypes.SLGWildMonsterModel='wild'
-local fog={isCellVisible=function(self,x,y,layer) assert(layer==0);return Game.visible end}
+local fog={isCellVisible=function(self,x,y,layer)
+ assert(layer==0 or layer==-1)
+ Game.fogCalls=Game.fogCalls or {};table.insert(Game.fogCalls,{x,y,layer})
+ if layer==0 and Game.singleLayerVisible~=nil then return Game.singleLayerVisible end
+ return Game.visible
+end}
 local wild={GetMonsterState=function() return Game.monsterIdle and 0 or 1 end,
  GetMonsterArmyId=function() return Game.attacker end,GetDieMonsterViewData=function() return Game.dead end}
 CSLTypes.ModelManager.sharedInstance=function() return {getModel=function(self,name)
@@ -227,6 +232,39 @@ class MonsterLuaTests(unittest.TestCase):
         self.assertFalse(self.send()[0]);self.assertEqual(len(self.lua.globals().Game.trips),1)
         self.setUp();self.prepare('Game.base=1;Game.per=1')
         self.assertEqual(json.loads(self.lua.execute('return REA_AUTO_INFANTRY.hunt_metrics()'))['formations'],[])
+
+    def test_native_visibility_parameter_matches_discovery_details_and_final_guard(self):
+        """Replay a native-visible point rejected by layer0 without adding region requests or skipping final checks."""
+        self.prepare('Game.singleLayerVisible=false;Game.visible=true')
+        self.lua.execute('''
+         local map=CSLTypes.ModelManager.sharedInstance():getModel('map')
+         local point={{{101,59,0},2792},20101}
+         local points={GetDictKeys=function() return list({2792}) end,get_Item=function() return point end}
+         local cache={ContainsKey=function(self,kind) return kind==3000 end,get_Item=function() return points end}
+         map.mInViewDataChunkCacheManager.getAllViewData=function() return list({{mViewDataCache=cache}}) end
+        ''')
+        rows=json.loads(self.lua.execute('return REA_AUTO_INFANTRY.hunt_candidates(20)'))
+        self.assertTrue(rows[0]['visible'])
+        metrics=json.loads(self.lua.execute('return REA_AUTO_INFANTRY.hunt_metrics()'))
+        self.assertTrue(metrics['target']['visible'])
+        self.assertIsNone(self.lua.globals().Game.regionRequests)
+        self.assertEqual(len(self.lua.globals().Game.trips),0)
+        self.assertTrue(self.send()[0])
+        calls=self.lua.globals().Game.fogCalls
+        self.assertGreaterEqual(len(calls),4)
+        self.assertTrue(all(calls[i][3]==-1 for i in range(1,len(calls)+1)))
+        self.assertIsNone(self.lua.globals().Game.regionRequests)
+
+    def test_native_hidden_after_details_still_blocks_departure(self):
+        """A previously visible default formation cannot authorize departure once native visibility changes."""
+        self.prepare('Game.singleLayerVisible=false;Game.visible=true')
+        metrics=json.loads(self.lua.execute('return REA_AUTO_INFANTRY.hunt_metrics()'))
+        self.assertTrue(metrics['target']['visible'])
+        self.lua.execute('Game.visible=false')
+        result=self.send()
+        self.assertFalse(result[0])
+        self.assertIn('Monster is hidden or occupied',str(result))
+        self.assertEqual(len(self.lua.globals().Game.trips),0)
 
     def test_captured_6012_case_cannot_plan_or_send_above_native_total_limit(self):
         """Replay the rejected307 formation: 138442 + 3*24000 must not bypass the game's TOTAL cap2."""

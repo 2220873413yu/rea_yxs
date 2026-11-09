@@ -125,13 +125,60 @@ class MonsterServiceTests(unittest.TestCase):
         for at in range(101,130):self.tick(at)
         self.c.refresh_heroes.assert_called_once();self.c.dispatch_hunt.assert_not_called()
 
-    def test_busy_potential_waits_without_expanding_and_cooldown_schedules_once(self):
-        """A nearby target needing a recovering hero does not cause attacks farther from home."""
+    def test_only_busy_target_waits_and_cooldown_schedules_once(self):
+        """After exhausting other targets, a recovering hero schedules one check without fixed polling."""
         self.c.query_monster.return_value={**self.metrics,'formations':[],'potential':True,'cooldown_ms':1060000}
         self.tick(100)
         self.assertEqual(self.service.due,161)
         for at in (101,120,160):self.tick(at)
         self.c.query_monster.assert_called_once();self.c.dispatch_hunt.assert_not_called()
+
+    def test_unknown_near_target_does_not_block_ready_target_in_farther_ring(self):
+        """A transiently unplannable monster must not hold all free armies behind its distance ring."""
+        near=target()
+        far={**target(),'target_id':2,'x':110,'distance':15}
+        original=self.c.hunt_call.side_effect
+        self.c.hunt_call.side_effect=lambda op,args=(): [near,far] if op=='hunt_candidates' else original(op,args)
+        self.c.query_monster.side_effect=lambda identifier: (
+            {**self.metrics,'target':near,'formations':[],'strength_known':False,'can_win_full':False}
+            if identifier==1 else {**self.metrics,'target':far})
+        self.tick(100);self.tick(101)
+        self.assertEqual([c.args[0] for c in self.c.query_monster.call_args_list],[1,2])
+        self.c.dispatch_hunt.assert_called_once()
+        self.assertEqual(self.c.dispatch_hunt.call_args.args[0]['target_id'],2)
+        self.assertFalse(self.service.ignored)
+
+    def test_waiting_target_does_not_block_unqueried_far_region(self):
+        """Keep expanding the finite scan frontier when the only known near target cannot be planned."""
+        far={**target(),'target_id':2,'x':110,'distance':15}
+        region=dict(x=100,y=15,min_distance=10,distance=15)
+        self.service.discovery.plan([region])
+        self.c.query_hunt_region.return_value=[far]
+        self.c.query_monster.side_effect=lambda identifier: (
+            {**self.metrics,'formations':[],'strength_known':False,'can_win_full':False}
+            if identifier==1 else {**self.metrics,'target':far})
+        self.tick(100)
+        self.c.query_hunt_region.assert_not_called()
+        self.tick(101)
+        self.c.query_hunt_region.assert_called_once_with(region,20,9)
+        self.tick(102)
+        self.c.dispatch_hunt.assert_called_once()
+        self.assertEqual(self.c.dispatch_hunt.call_args.args[0]['target_id'],2)
+
+    def test_all_temporary_blockers_exhaust_search_once_then_wait_without_queries(self):
+        """Without timers or new pushes, skipped coordinates cannot trigger repeated server checks."""
+        rows=[target(),{**target(),'target_id':2,'x':110,'distance':15}]
+        original=self.c.hunt_call.side_effect
+        self.c.hunt_call.side_effect=lambda op,args=(): rows if op=='hunt_candidates' else original(op,args)
+        self.c.query_monster.side_effect=lambda identifier: {
+            **self.metrics,'target':rows[identifier-1],'formations':[],'strength_known':False,'can_win_full':False}
+        self.tick(100);self.tick(101);self.tick(102)
+        reads=self.c.refresh_heroes.call_count
+        for at in range(103,140):self.tick(at)
+        self.assertEqual([c.args[0] for c in self.c.query_monster.call_args_list],[1,2])
+        self.assertEqual(self.c.refresh_heroes.call_count,reads)
+        self.assertTrue(math.isinf(self.service.due))
+        self.assertFalse(self.service.ignored)
 
     def test_full_queue_unknown_capacity_or_missing_entitlement_never_dispatches(self):
         """Manual occupancy counts toward capacity; unknown capacity or missing entitlement prevents spending."""
