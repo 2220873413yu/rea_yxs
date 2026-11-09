@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from .gifts import GiftClient
+from .context import request_headers
 from .secure_store import crypt
 from .transport import ServiceError
 from . import protocol as p
@@ -41,7 +42,7 @@ class GScoreClient(GiftClient):
 
     def query(self,account):
         """Read only the G-score page, with no Hero Kill binding request or sign side effect."""
-        data=self.request('xyapi.PageService/GScorePageNew',b'',account['headers'])
+        data=self.request('xyapi.PageService/GScorePageNew',b'',request_headers(account))
         info=p.get(data,1);sign=p.get(data,2)
         valid=isinstance(info,bytes) and isinstance(sign,bytes)
         i=p.parse(info) if isinstance(info,bytes) else []
@@ -76,7 +77,7 @@ class GScoreClient(GiftClient):
         # This endpoint may omit an empty data object. Check the envelope ourselves, never replay it.
         from .auth import BGW
         self.dispatched=True
-        response=self.session.request(BGW+'xyapi.PageService/GScoreSignWithAd',body,account['headers'])
+        response=self.session.request(BGW+'xyapi.PageService/GScoreSignWithAd',body,request_headers(account))
         self.retain_response('xyapi.PageService/GScoreSignWithAd',response)
         if response.status!=200:raise ServiceError('G分签到响应异常；结果待确认，不重试。')
         if 'json' in response.headers.get('Content-Type','').lower():

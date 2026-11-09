@@ -10,6 +10,8 @@ from .auth import BGW
 from .transport import Session,ServiceError
 from . import protocol as p
 from .binding_session import check_binding_session
+from .context import request_headers
+from .labels import readable_name,account_name
 
 
 def role_text(value):
@@ -34,7 +36,7 @@ class GiftState:
 
     def describe(self):
         """Render server state without inferring success from cumulative sign-in days alone."""
-        if self.binding_restricted:return '服务器提示绑定受限；请打开“选择角色 / 绑定”→“检查 / 处理当前绑定受限”，单独确认后处理。'
+        if self.binding_restricted:return '服务器提示绑定受限；请核对所选安卓/iOS平台，再打开“选择角色 / 绑定”→“检查当前绑定状态”。'
         if not self.role_key:return '未取得英雄杀绑定角色，请先在心悦APP绑定。'
         return f'已签到 {self.days} 天；'+('可签到' if self.status==0 else '今日已签到' if self.status==5 else f'暂不可签到（状态 {self.status}）')
 
@@ -74,9 +76,10 @@ class GiftClient:
         self.dispatched=False;self.result_status='uncertain';self.actual_rewards=();self.reward_description=''
 
     def binding(self,account):
-        """Read a binding, validating any restriction via native CheckBind so old tickets cannot trigger rebind advice."""
-        headers=account['headers']
+        """Read the chosen platform's binding and validate restrictions without treating another platform as unbound."""
+        headers=request_headers(account)
         self._bound_role=b''
+        self.bound_role_name=''
         card=self.request('xyapp.GiftSrv/GetPassCardV2',b'',headers)
         self.bound_game_ids=[p.get(p.parse(value),1,0) for tag,wire,value in card if tag==3 and wire==2]
         key='';label='未绑定英雄杀';restricted=bool(p.get(card,6,0))
@@ -89,7 +92,8 @@ class GiftClient:
             if role:
                 self._bound_role=role
                 fields=p.parse(role)
-                name=role_text(p.get(fields,8,b'')) or account.get('nickname') or '已绑定角色'
+                self.bound_role_name=readable_name(role_text(p.get(fields,8,b'')))
+                name=self.bound_role_name or account_name(account)
                 partition=role_text(p.get(fields,6,b''))
                 label='英雄杀 / '+name+(' / '+partition if partition else '')
                 device=p.text(p.get(fields,9,b''))
@@ -103,7 +107,7 @@ class GiftClient:
     def query(self,account):
         """Read the current binding and Hero Kill sign-in state; never refresh bindings or claim gifts."""
         key,label,restricted=self.binding(account)
-        headers=account['headers']
+        headers=request_headers(account)
         gifts=self.request('xyapp.GiftSrv/GetGamesGifts',p.message_string(1,'signin')+p.varint(16)+p.varint(1187),headers)
         desc=p.parse(p.get(gifts,1,b''))
         if not desc:raise ServiceError('服务器未返回签到状态，不能领取')
@@ -126,7 +130,7 @@ class GiftClient:
         except FileExistsError:
             raise ServiceError('本账号今天已有签到尝试记录；请核对状态，不会重复领取') from None
         # The exact header was observed on the successful native day-seven claim, not guessed from gift enums.
-        headers={**account['headers'],'T-GIFT-TYPE':'signin'}
+        headers={**request_headers(account),'T-GIFT-TYPE':'signin'}
         self.dispatched=True
         data=self.request('xyapp.GiftSrv/ReceiveGamesGift',p.message_string(1,'signin'),headers)
         success=p.get(data,3,0);failed=p.get(data,4,0)

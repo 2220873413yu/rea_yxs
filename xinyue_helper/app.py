@@ -21,6 +21,7 @@ from .secure_store import AccountStore,StoreError
 from .transport import ServiceError
 from .protocol import ProtocolError
 from .binding_session import LoginExpiredError
+from .labels import account_name,readable_name
 
 
 class App:
@@ -42,8 +43,11 @@ class App:
         batch_button=ttk.Button(bar,text='一键签到（全部账号）',command=self.start_batch);batch_button.pack(side='left',padx=(0,8));self.actions.append(batch_button)
         self.batch_stop_button=ttk.Button(bar,text='停止批量',command=self.stop_batch,state='disabled');self.batch_stop_button.pack(side='left',padx=(0,8))
         ttk.Button(bar,text='领取记录',command=self.show_history).pack(side='left')
+        deletebar=ttk.Frame(box);deletebar.pack(fill='x',pady=(6,0))
+        delete_button=ttk.Button(deletebar,text='删除选中账号',command=self.delete_account)
+        delete_button.pack(side='left');self.actions.append(delete_button)
         self.accounts=ttk.Treeview(box,columns=('name','provider','saved'),show='headings',height=4,selectmode='browse')
-        for key,title,width in [('name','账号昵称',210),('provider','选定平台 / 登录方式',200),('saved','票据保存时间（UTC）',300)]:
+        for key,title,width in [('name','账号昵称 / 角色',210),('provider','选定平台 / 登录方式',200),('saved','票据保存时间（UTC）',300)]:
             self.accounts.heading(key,text=title);self.accounts.column(key,width=width)
         self.accounts.pack(fill='x',pady=14);self.accounts.bind('<<TreeviewSelect>>',self.select)
         self.detail=tk.StringVar(value='尚未查询服务器状态。')
@@ -183,9 +187,27 @@ class App:
         rows=self.store.list()
         for row in rows:
             platform=PLATFORMS.get(row.get('game_device'),'平台未选择')
-            key=row['profile_id'];self.accounts.insert('', 'end',iid=key,values=(row.get('nickname') or '已保存账号',platform+' / '+PROVIDERS[row['provider']],row['saved_at'][:19].replace('T',' ')))
+            key=row['profile_id'];self.accounts.insert('', 'end',iid=key,values=(account_name(row),platform+' / '+PROVIDERS[row['provider']],row['saved_at'][:19].replace('T',' ')))
         selected=selected or (max(rows,key=lambda row:row['saved_at'])['profile_id'] if rows else '')
         if selected and self.accounts.exists(selected):self.accounts.selection_set(selected);self.active=selected
+
+    def delete_account(self):
+        """Confirm local-only deletion while idle, then discard that account's cached state and retain history."""
+        if self.busy:return
+        selected=self.accounts.selection()
+        if not selected:self.status.set('请先选择要删除的账号。');return
+        key=selected[0]
+        values=self.accounts.item(key,'values')
+        if not messagebox.askokcancel('删除本地账号',
+                f'删除本机保存的账号：{values[0]}（{values[1]}）？\n\n'
+                '将删除登录票据和角色缓存，保留领取记录。\n不会注销游戏账号或解除角色绑定。\n以后可重新扫码添加。',parent=self.root):return
+        try:self.store.delete(key)
+        except StoreError as error:self.status.set(str(error));return
+        for cache in (self.states,self.bounty_states,self.weekly_states,self.gscore_states,self.exchange_states):
+            cache.pop(key,None)
+        self.active=''
+        self.reload();self.select()
+        self.status.set('已删除本地账号和登录票据，领取记录已保留；需要时可重新扫码添加。')
 
     def select(self,event=None):
         """Show only the selected account's cached state, without automatic queries on selection."""
@@ -222,7 +244,7 @@ class App:
         self.status.set('正在只读查询G分兑换状态、价格和剩余次数…')
         def job():
             """Keep the exchange snapshot associated with the account selected when query was clicked."""
-            state=ExchangeClient().query(self.store.load(key));self.events.put(('exchange',(key,state)))
+            state=self.query_role_state(key,'exchange',ExchangeClient())
             self.events.put(('status',f'兑换查询完成：余额 {state.balance} G分；本次仅查询，未兑换。'))
         self.run(job)
 
@@ -235,7 +257,7 @@ class App:
         account=self.store.load(key)
         # Unlike free-gift role consent, remembered consent never skips a G-score spending confirmation.
         confirmed=messagebox.askokcancel('确认消耗G分兑换',
-            f"账号：{account.get('nickname') or 'QQ账号'}\n角色：{state.role_label}\n\n"
+            f"账号：{account_name(account)}\n角色：{state.role_label}\n\n"
             f'兑换：{gift.title} ×{gift.quantity}\n消耗：{gift.cost} G分\n当前余额：{state.balance} G分\n\n仅提交一次，超时不重发。',parent=self.root)
         if not confirmed:return
         self.status.set('正在重新核对角色、价格和次数；符合确认内容才兑换一次…')
@@ -291,7 +313,7 @@ class App:
         self.status.set('正在只读查询周礼包资格、角色、次数和消耗…')
         def job():
             """Keep the weekly response tied to the account selected at dispatch."""
-            state=WeeklyClient().query(self.store.load(key));self.events.put(('weekly',(key,state)))
+            state=self.query_role_state(key,'weekly',WeeklyClient())
             self.events.put(('status','周礼包查询完成：'+state.describe()+'。本次操作仅查询。'))
         self.run(job)
 
@@ -341,7 +363,7 @@ class App:
         self.status.set('正在只读查询赏金任务、次数和消耗…')
         def job():
             """Return an account-keyed snapshot and summarize actual task states without claiming or drawing."""
-            state=BountyClient().query(self.store.load(key));self.events.put(('bounty',(key,state)))
+            state=self.query_role_state(key,'bounty',BountyClient())
             summary='；'.join(task.title+'：'+task.describe()+f'（{task.used}/{task.total}）' for task in state.tasks)
             self.events.put(('status','赏金任务查询完成：'+(summary or '服务器未返回这两项任务')+'。本次操作仅查询。'))
         self.run(job)
@@ -458,6 +480,18 @@ class App:
         if self.qr and self.qr.winfo_exists():self.qr.destroy()
         self.qr=None
 
+    def query_role_state(self,key,kind,client):
+        """Publish a manual query and cache its verified role name, without extra requests or credential edits."""
+        account=self.store.load(key)
+        state=client.query(account)
+        name=readable_name(getattr(client,'bound_role_name',''))
+        if name and state.role_key:
+            try:row=self.store.remember_role(key,name)
+            except (StoreError,OSError):row={**account,'role_name':name}
+            self.events.put(('account_name',(key,account_name(row))))
+        self.events.put((kind,(key,state)))
+        return state
+
     def query(self):
         """Request current binding and sign-in state once for the explicitly selected account."""
         key=self.active
@@ -465,7 +499,7 @@ class App:
         self.status.set('正在只读查询绑定角色和签到状态…')
         def job():
             """Bind the query result to the account captured when its button was pressed."""
-            value=GiftClient().query(self.store.load(key));self.events.put(('state',(key,value)))
+            value=self.query_role_state(key,'state',GiftClient())
             self.events.put(('status','签到查询完成：'+value.describe()+'。本次操作仅查询。'))
         self.run(job)
 
@@ -513,6 +547,11 @@ class App:
                 if kind=='status':self.status.set(value)
                 elif kind=='session_expired':
                     self.login_expired(value)
+                elif kind=='account_name':
+                    key,name=value
+                    if self.accounts.exists(key):
+                        row=self.accounts.item(key,'values')
+                        self.accounts.item(key,values=(name,*row[1:]))
                 elif kind=='state':
                     key,state=value;self.states[key]=state
                     if key==self.active:self.detail.set(state.role_label+'\n'+state.describe())

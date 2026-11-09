@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from .labels import readable_name,account_name
 
 
 class StoreError(RuntimeError):
@@ -77,6 +78,7 @@ class AccountStore:
                 old=self.load(key)
                 value['role_confirmation']=old.get('role_confirmation',{})
                 if old.get('game_device') in ('ios','android'):value['game_device']=old['game_device']
+                if readable_name(old.get('role_name')):value['role_name']=old['role_name']
             except StoreError:
                 pass
         self.write(value)
@@ -109,9 +111,29 @@ class AccountStore:
     def set_game_device(self,key,device,clear_confirmation=False):
         """Save the person's explicit game platform encrypted; binding changes invalidate old claim consent."""
         if device not in ('ios','android'):raise StoreError('请选择安卓或iOS平台')
-        value=self.load(key);value['game_device']=device
+        value=self.load(key)
+        if value.get('game_device')!=device:value.pop('role_name',None)
+        value['game_device']=device
         if clear_confirmation:value.pop('role_confirmation',None)
         self.write(value)
+
+    def remember_role(self,key,name):
+        """Cache a server-confirmed display name locally, preserving credentials and their saved timestamp."""
+        name=readable_name(name)
+        value=self.load(key)
+        if name and value.get('role_name')!=name:
+            value['role_name']=name
+            self.write(value)
+        return self.public(value)
+
+    def delete(self,key):
+        """Remove only the selected local encrypted record; never log out, unbind or delete receipt history."""
+        if not isinstance(key,str) or len(key)!=64 or any(c not in '0123456789abcdef' for c in key):
+            raise StoreError('账号标识无效')
+        try:
+            (self.folder/(key+'.dpapi')).unlink(missing_ok=True)
+        except OSError:
+            raise StoreError('本地账号删除失败，请检查文件权限后重试') from None
 
     def load(self, key):
         """Decrypt only a validated account identifier; never accept caller-supplied filesystem traversal."""
@@ -131,7 +153,10 @@ class AccountStore:
     @staticmethod
     def public(value):
         """Expose account labels and dates only; no Token, OpenID, cookie or refresh secret reaches widgets."""
-        return {key:value.get(key) for key in ('profile_id','provider','nickname','saved_at','expires_at','game_device')}
+        row={key:value.get(key) for key in ('profile_id','provider','saved_at','expires_at','game_device')}
+        row.update(nickname=readable_name(value.get('nickname')),role_name=readable_name(value.get('role_name')),
+                   display_name=account_name(value))
+        return row
 
     def list(self):
         """Load local records without networking; damaged records remain untouched and are omitted."""

@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import os,sqlite3
 from pathlib import Path
 from .transport import ServiceError
+from .labels import account_name
 
 STATUSES={'running':'处理中','success':'成功','skipped':'跳过','failed':'失败','uncertain':'待确认'}
 
@@ -65,7 +66,7 @@ class ClaimRecorder:
 
     def execute(self,account,role,action,client,operation):
         """Persist before dispatch, classify structured client results, and never retry ambiguous outcomes."""
-        row=self.history.begin(account['profile_id'],account.get('nickname') or 'QQ账号',role,action)
+        row=self.history.begin(account['profile_id'],account_name(account),role,action)
         try:
             message=operation()
             status=getattr(client,'result_status','uncertain')

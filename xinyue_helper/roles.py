@@ -11,6 +11,7 @@ from .secure_store import crypt
 from .gifts import GiftClient
 from . import protocol as p
 from .binding_session import check_binding_session
+from .context import account_context,request_headers
 
 GID=1187
 PLATFORMS={'android':'安卓','ios':'iOS'}
@@ -106,13 +107,14 @@ class RoleClient:
         self.attempt_folder=Path(attempt_folder) if attempt_folder else Path(os.environ['LOCALAPPDATA'])/'REA_YXS/xinyue_helper/binding_attempts'
 
     def check_account(self,account,choice):
-        """Require the chosen provider to match this immutable saved account before any external request."""
+        """Validate ownership and return an immutable platform-scoped copy for this picker operation."""
         if not isinstance(choice,LoginChoice) or account.get('provider')!=choice.provider:
             raise ServiceError('账号与登录方式不一致，请重新选择。')
+        return account_context(account,choice.device)
 
     def read(self,path,body,account):
         """Read a native JSON role endpoint and surface privacy gates and safe numeric errors only."""
-        result=self.session.json(BGW+path,body,account['headers'])
+        result=self.session.json(BGW+path,body,request_headers(account))
         code=result.get('ret')
         if code==400000:
             raise RoleConsentRequired('心悦俱乐部将获取你在《英雄杀》的大区信息、角色昵称，以发放游戏权益内容。')
@@ -121,15 +123,15 @@ class RoleClient:
 
     def consent_private(self,account,choice):
         """Submit the person's explicit game-info consent once, using native private visibility action 2."""
-        self.check_account(account,choice)
+        account=self.check_account(account,choice)
         entry=p.message_string(1,'GameRole')+p.message_string(2,'{"gid":1187, "authAction":2}')
         body=p.varint(10)+p.varint(len(entry))+entry
-        response=self.session.request(BGW+'xyapi.PageService/UpdateSettingSwitch',body,account['headers'])
+        response=self.session.request(BGW+'xyapi.PageService/UpdateSettingSwitch',body,request_headers(account))
         self.checked_response(response,'资料授权')
 
     def partitions(self,account,choice):
         """Validate the current ticket using native CheckBind before reading the explicitly requested platform."""
-        self.check_account(account,choice)
+        account=self.check_account(account,choice)
         check_binding_session(account,self.session)
         result=self.read('amp2.RoleSrv/GetPartitionList',{'gid':GID,'device':choice.device,
                          'is_auth':True,'area_channel_id':''},account)
@@ -144,7 +146,7 @@ class RoleClient:
 
     def roles(self,account,choice,partition):
         """Read bounded pages for the selected server partition and deduplicate without changing platform."""
-        self.check_account(account,choice)
+        account=self.check_account(account,choice)
         page=1;pages=set();out={}
         while page not in pages and len(pages)<20:
             pages.add(page)
@@ -187,7 +189,7 @@ class RoleClient:
 
     def confirm_native_role(self,account,role):
         """Complete the observed native xinyue role-selection acknowledgement once, without rebinding the pass card."""
-        self.check_account(account,role.choice)
+        account=self.check_account(account,role.choice)
         if role.owner!=account['profile_id']:raise ServiceError('角色确认不属于当前账号。')
         self.attempt_folder.mkdir(parents=True,exist_ok=True)
         marker=self.attempt_folder/('register-'+role.binding_key()+'.json')
@@ -203,7 +205,7 @@ class RoleClient:
         body={'scene':'xinyue','gid':GID,'device':role.choice.device,
               'role':{key:role.raw[key] for key in ('game_open_id','game_app_id','area_id','plat_id',
                        'partition_id','partition_name','role_id','role_name','device')},'is_auth':True}
-        result=self.session.json(BGW+'amp2.RoleSrv/BindRole',body,account['headers'])
+        result=self.session.json(BGW+'amp2.RoleSrv/BindRole',body,request_headers(account))
         marker.with_suffix('.dpapi').write_bytes(b'XYBIND1\0'+crypt(json.dumps(result,ensure_ascii=False).encode('utf-8')))
         if result.get('ret')!=0:raise ServiceError('原生角色确认被拒绝，返回码：'+str(result.get('ret')))
         marker.write_text(json.dumps({'state':'confirmed_response'}),encoding='utf-8')
@@ -227,7 +229,7 @@ class RoleClient:
 
     def repair(self,account,snapshot):
         """After explicit confirmation, unbind once and bind back the exact same recipient, stopping on any failure."""
-        role=snapshot.role;self.check_account(account,role.choice)
+        role=snapshot.role;account=self.check_account(account,role.choice)
         if role.owner!=account['profile_id']:raise ServiceError('确认的绑定不属于当前账号，已停止。')
         check_binding_session(account,self.session)
         # Revalidate both the displayed binding snapshot and the account's own role list before either write.
@@ -247,7 +249,7 @@ class RoleClient:
         body=p.varint(8)+p.varint(GID)+p.varint(18)+p.varint(len(snapshot.wire))+snapshot.wire
         stage='解除绑定'
         try:
-            response=self.session.request(BGW+'xyapp.GiftSrv/PassCardUnbindGameRole',body,account['headers'])
+            response=self.session.request(BGW+'xyapp.GiftSrv/PassCardUnbindGameRole',body,request_headers(account))
             marker.with_suffix('.unbind.dpapi').write_bytes(b'XYBIND1\0'+crypt(response.body))
             self.checked_response(response,'解除礼包绑定')
             current,_=self.current_binding(account)
@@ -256,7 +258,7 @@ class RoleClient:
             # Only a confirmed empty binding permits the second and final write, using the original wire bytes.
             stage='重新绑定'
             marker.write_text(json.dumps({'state':'rebind_dispatched'}),encoding='utf-8')
-            response=self.session.request(BGW+'xyapp.GiftSrv/PassCardBindGameRoleV2',body,account['headers'])
+            response=self.session.request(BGW+'xyapp.GiftSrv/PassCardBindGameRoleV2',body,request_headers(account))
             marker.with_suffix('.rebind.dpapi').write_bytes(b'XYBIND1\0'+crypt(response.body))
             self.checked_response(response,'重新绑定礼包角色')
             current,restricted=self.current_binding(account)
@@ -270,10 +272,11 @@ class RoleClient:
 
     @staticmethod
     def matches(wire,role):
-        """Match all role identity/platform fields from the pass card against the confirmed server snapshot."""
+        """Match stable recipient/platform fields; display-name changes do not require a new binding."""
         if not wire:return False
         current=p.parse(wire);wanted=p.parse(role.wire())
-        return all(p.get(current,tag,0 if tag in (3,4,5) else b'')==value for tag,_,value in wanted)
+        return all(p.get(current,tag,0 if tag in (3,4,5) else b'')==value
+                   for tag,_,value in wanted if tag in (1,2,3,4,5,7,9))
 
     def reserve_binding_attempt(self,role):
         """Retain verified history while permitting a new explicit attempt only after the caller confirms no current binding."""
@@ -301,7 +304,7 @@ class RoleClient:
 
     def bind(self,account,role):
         """Revalidate the selected own role, submit at most once durably, then read back the binding only."""
-        self.check_account(account,role.choice)
+        account=self.check_account(account,role.choice)
         if role.owner!=account['profile_id']:raise ServiceError('角色不属于本次账号查询，已停止。')
         check_binding_session(account,self.session)
         fresh=self.roles(account,role.choice,Partition(role.partition,role.partition_name))
@@ -321,7 +324,7 @@ class RoleClient:
         self.confirm_native_role(account,role)
         marker=self.reserve_binding_attempt(role)
         wire=role.wire();body=p.varint(8)+p.varint(GID)+p.varint(18)+p.varint(len(wire))+wire
-        response=self.session.request(BGW+'xyapp.GiftSrv/PassCardBindGameRoleV2',body,account['headers'])
+        response=self.session.request(BGW+'xyapp.GiftSrv/PassCardBindGameRoleV2',body,request_headers(account))
         (marker.with_suffix('.dpapi')).write_bytes(b'XYBIND1\0'+crypt(response.body))
         self.checked_response(response,'角色绑定')
         current,restricted=self.current_binding(account)

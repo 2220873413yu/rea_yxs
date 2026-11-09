@@ -8,6 +8,7 @@ from .transport import ServiceError
 from .secure_store import StoreError
 from .protocol import ProtocolError
 from .binding_session import LoginExpiredError
+from .labels import account_name
 
 
 def choose_login(parent,callback):
@@ -38,10 +39,10 @@ class RoleDialog:
         self.window=tk.Toplevel(parent);self.window.title('英雄杀 · 区服与角色绑定');self.window.geometry('760x590')
         self.window.transient(parent);self.window.grab_set();self.window.protocol('WM_DELETE_WINDOW',self.close)
         frame=ttk.Frame(self.window,padding=15);frame.pack(fill='both',expand=True)
-        ttk.Label(frame,text='账号：'+(self.account.get('nickname') or '已保存账号')+' / '+PROVIDERS[self.account['provider']],font=('Microsoft YaHei UI',12,'bold')).pack(anchor='w')
+        ttk.Label(frame,text='账号：'+account_name(self.account)+' / '+PROVIDERS[self.account['provider']],font=('Microsoft YaHei UI',12,'bold')).pack(anchor='w')
         self.current_detail=tk.StringVar(value='服务器当前绑定：尚未检查。受限处理只针对当前绑定，不使用下方选中的其他平台或角色。')
         ttk.Label(frame,textvariable=self.current_detail,wraplength=710,justify='left').pack(fill='x',pady=(10,4))
-        self.repair_button=ttk.Button(frame,text='检查 / 处理当前绑定受限',command=self.check_repair);self.repair_button.pack(anchor='w')
+        self.repair_button=ttk.Button(frame,text='检查当前绑定状态',command=self.check_repair);self.repair_button.pack(anchor='w')
         bar=ttk.Frame(frame);bar.pack(fill='x',pady=12)
         ttk.Label(bar,text='英雄杀平台：').pack(side='left')
         self.platform=tk.StringVar(value=PLATFORMS[choice.device] if choice else '')
@@ -132,7 +133,7 @@ class RoleDialog:
         role=self.roles[int(selected[0])]
         if role.choice!=self.choice():self.status.set('平台已变化，请重新查询。');return
         if not messagebox.askokcancel('确认绑定英雄杀角色',
-                '账号：'+(self.account.get('nickname') or '已保存账号')+'\n角色：'+role.label+
+                '账号：'+account_name(self.account)+'\n角色：'+role.label+
                 '\n\n仅绑定此角色，不签到、不领奖；不自动解绑已有角色。',parent=self.window):return
         self.status.set('正在重新核对角色并绑定一次；结果不明不重复提交…')
         self.run(lambda:self.client.bind(self.account,role),lambda message:self.bound(role,message))
@@ -148,9 +149,11 @@ class RoleDialog:
         role=snapshot.role
         self.current_detail.set('服务器当前绑定：'+role.label+'；'+('绑定受限' if snapshot.restricted else '未受限'))
         if not snapshot.restricted:
-            self.status.set('当前绑定未受限，本次仅查询，未解绑或重绑。');return
+            try:self.store.remember_role(self.account['profile_id'],role.name)
+            except (StoreError,OSError):pass
+            self.status.set('同一角色已绑定且未受限，可直接使用；本次仅查询，未解绑或重绑。');return
         confirmed=messagebox.askokcancel('处理当前礼包绑定受限',
-            '账号：'+(self.account.get('nickname') or '已保存账号')+'\n服务器当前绑定：'+role.label+
+            '账号：'+account_name(self.account)+'\n服务器当前绑定：'+role.label+
             '\n\n将先解除英雄杀礼包绑定，再绑定回上述同一个角色。'
             '\n不会改成下方选中的其他平台或角色，不签到、不领奖。'
             '\n若中途失败，可能暂时没有礼包绑定；停止且不自动重试。'
@@ -162,6 +165,7 @@ class RoleDialog:
     def bound(self,role,message):
         """Persist explicit verified selection, clear old claim consent, and invalidate parent role caches."""
         self.store.set_game_device(self.account['profile_id'],role.choice.device,clear_confirmation=True)
+        self.store.remember_role(self.account['profile_id'],role.name)
         self.current_detail.set('服务器当前绑定：'+role.label+'；已核对，未受限')
         self.status.set(message);self.on_bound(self.account['profile_id'])
 

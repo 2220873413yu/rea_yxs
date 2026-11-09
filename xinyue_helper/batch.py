@@ -1,5 +1,6 @@
 """An explicitly confirmed, sequential batch of four free actions; no scheduler or exchange import."""
 from dataclasses import dataclass
+from .labels import account_name
 from collections import Counter
 from .gscore import GScoreClient
 from .weekly import WeeklyClient
@@ -34,7 +35,7 @@ class BatchRunner:
         plan=[]
         for index,row in enumerate(rows):
             if stop.is_set():break
-            key=row['profile_id'];name=row.get('nickname') or 'QQ账号'
+            key=row['profile_id'];name=account_name(row)
             on_progress(f'预查账号 {index+1}/{len(rows)}：{name}')
             for kind in ('gscore','weekly','bounty'):
                 if stop.is_set():break

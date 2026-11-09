@@ -4,6 +4,7 @@ from datetime import datetime,timezone,timedelta
 import hashlib,json,os
 from pathlib import Path
 from .gifts import GiftClient
+from .context import request_headers
 from .secure_store import crypt
 from .transport import ServiceError
 from . import protocol as p
@@ -70,7 +71,7 @@ class ExchangeClient(GiftClient):
     def query(self,account):
         """Read the bound role and G-score page once, retaining only the two requested Hero Kill rewards."""
         key,label,restricted=self.binding(account)
-        data=self.request('xyapi.PageService/GScorePageNew',b'',account['headers'])
+        data=self.request('xyapi.PageService/GScorePageNew',b'',request_headers(account))
         info=p.get(data,1)
         if not isinstance(info,bytes):raise ServiceError('未取得G分余额，停止兑换')
         balance=p.get(p.parse(info),1,0);gifts=[]
@@ -122,7 +123,7 @@ class ExchangeClient(GiftClient):
         # Native capture: gid=1187, scene=score, giftId and exact amp2.Role. No num/baseUin/t-gift-type.
         body=p.varint(8)+p.varint(1187)+p.message_string(2,'score')+p.message_string(3,gift.gift_id)
         body+=p.varint(34)+p.varint(len(role))+role
-        headers={k:v for k,v in account['headers'].items() if k.lower()!='t-gift-type'}
+        headers={k:v for k,v in request_headers(account).items() if k.lower()!='t-gift-type'}
         self.receipt_path=marker.with_suffix('.response.dpapi')
         self.dispatched=True
         result=self.request('xyapp.GiftSrv/ReceiveGift',body,headers)

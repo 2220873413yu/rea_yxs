@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from .gifts import GiftClient
+from .context import request_headers
 from .transport import ServiceError
 from .secure_store import crypt
 from .rewards import item_rewards
@@ -66,7 +67,7 @@ class BountyClient(GiftClient):
     def query(self,account):
         """Read role and scene=task once; ignore recharge, membership and unrelated activity gifts."""
         key,label,restricted=self.binding(account)
-        data=self.request('xyapp.GiftSrv/GetGamesGifts',p.message_string(1,'task')+p.varint(16)+p.varint(1187),account['headers'])
+        data=self.request('xyapp.GiftSrv/GetGamesGifts',p.message_string(1,'task')+p.varint(16)+p.varint(1187),request_headers(account))
         games=p.parse(p.get(data,2,b''));tasks=[]
         for tag,wire,value in games:
             if tag!=1 or wire!=2:continue
@@ -109,7 +110,7 @@ class BountyClient(GiftClient):
         # Native daily claim uses ReceiveGift, no t-gift-type, and a 14-byte payload.
         # gid(3 bytes)+scene=task(6)+giftId=381(5) matches that payload length. Role is resolved from the existing binding.
         body=p.varint(8)+p.varint(1187)+p.message_string(2,'task')+p.message_string(3,task.gift_id)
-        headers={k:v for k,v in account['headers'].items() if k.lower()!='t-gift-type'}
+        headers={k:v for k,v in request_headers(account).items() if k.lower()!='t-gift-type'}
         self.receipt_path=marker.with_suffix('.response.dpapi')
         self.dispatched=True
         result=self.request('xyapp.GiftSrv/ReceiveGift',body,headers)

@@ -3,6 +3,7 @@ import json
 from .auth import BGW
 from .transport import ServiceError
 from . import protocol as p
+from .context import request_headers
 
 
 class LoginExpiredError(ServiceError):
@@ -11,7 +12,7 @@ class LoginExpiredError(ServiceError):
 
 def check_binding_session(account,session,require_allowed=False):
     """Perform one native read-only eligibility check using this account's ticket, without binding or claiming."""
-    response=session.request(BGW+'xyapp.GiftSrv/CheckBind',p.varint(8)+p.varint(1187),account['headers'])
+    response=session.request(BGW+'xyapp.GiftSrv/CheckBind',p.varint(8)+p.varint(1187),request_headers(account))
     if response.status!=200:raise ServiceError('绑定资格检查HTTP错误：'+str(response.status))
     if 'json' in response.headers.get('Content-Type',''):
         try:code=json.loads(response.body).get('ret')

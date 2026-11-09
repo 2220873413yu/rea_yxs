@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from .gifts import GiftClient
+from .context import request_headers
 from .secure_store import crypt
 from .transport import ServiceError
 from . import protocol as p
@@ -64,7 +65,7 @@ class WeeklyClient(GiftClient):
     def query(self,account):
         """Read the bound role and weekGift scene once; missing or ambiguous gift data fail closed."""
         key,label,restricted=self.binding(account)
-        data=self.request('xyapp.GiftSrv/GetGamesGifts',p.message_string(1,'weekGift')+p.varint(16)+p.varint(1187),account['headers'])
+        data=self.request('xyapp.GiftSrv/GetGamesGifts',p.message_string(1,'weekGift')+p.varint(16)+p.varint(1187),request_headers(account))
         desc=p.parse(p.get(data,1,b''));matches=[]
         for tag,wire,raw in p.parse(p.get(data,2,b'')):
             if tag!=1 or wire!=2:continue
@@ -104,7 +105,7 @@ class WeeklyClient(GiftClient):
         self.receipt_path=marker.with_suffix('.response.dpapi')
         self.dispatched=True
         result=self.request('xyapp.GiftSrv/ReceiveGamesGift',p.message_string(1,'weekGift'),
-                            {**account['headers'],'T-GIFT-TYPE':'weekGift'})
+                            {**request_headers(account),'T-GIFT-TYPE':'weekGift'})
         success=p.get(result,3,0);failed=p.get(result,4,0)
         rewards=[]
         for tag,wire,raw in result:
