@@ -134,6 +134,16 @@ class WeChatAuth:
             raise ServiceError('微信登录凭据字段未通过校验')
         return Credentials('wx', access, openid, time.time() + expires if expires else None, refresh)
 
+    def user_info(self,credentials):
+        """Read the native post-token WechatUserInfo endpoint with this wx ticket; never bind or claim."""
+        if credentials.provider!='wx':raise ServiceError('微信用户资料查询要求微信票据')
+        body=protocol.message_string(1,credentials.access_token)+protocol.message_string(2,credentials.openid)
+        response=self.session.request(BGW+'XySrv.UserSrv/WechatUserInfo',body,credentials.headers())
+        if response.status!=200:raise ServiceError('微信用户资料查询HTTP错误：'+str(response.status))
+        fields=protocol.parse(response.body);ret=protocol.get(fields,1,0);raw=protocol.get(fields,3)
+        if ret!=0 or not isinstance(raw,bytes):raise ServiceError('微信用户资料查询未确认，返回码：'+str(ret))
+        return protocol.text(protocol.get(protocol.parse(raw),1,b''))
+
 
 class QQAuth:
     """Use QQ's official mobile OAuth QR flow in an isolated HTTPS/cookie session."""

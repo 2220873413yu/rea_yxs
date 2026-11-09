@@ -1,7 +1,8 @@
-"""Public account metadata controls; credentials are never returned to Tk variables or widgets."""
+"""Public account-list metadata and transient masked migration passwords; saved tickets never enter widgets."""
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from account_store import AccountError
+from account_migration import MIN_PASSWORD, MAX_PROFILES, password_bytes
 
 from collection_display import display_time
 
@@ -9,21 +10,21 @@ PLATFORMS = {'安卓 QQ': (0, 1), '安卓微信': (0, 0), 'iOS QQ': (1, 1), 'iOS
 
 
 class AccountDialog(tk.Toplevel):
-    """Save the authenticated role or select a stored SDK profile for a default-off restart switch."""
+    """Manage saved roles, single-account login and explicit multi-account encrypted migration."""
 
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
-        self.title('账号保存与切换')
-        self.geometry('760x410')
-        self.minsize(680, 370)
+        self.title('账号保存、切换与迁移')
+        self.geometry('800x465')
+        self.minsize(720, 430)
         self.records = {}
         panel = ttk.Frame(self, padding=12)
         panel.pack(fill='both', expand=True)
         ttk.Label(panel, text='切换会关闭全部自动功能并重启游戏；登录协议需本人勾选，成功后重新读取账号数据。',
                   wraplength=710).pack(anchor='w', pady=(0, 8))
         self.tree = ttk.Treeview(panel, columns=('name', 'level', 'mobile', 'platform', 'status', 'updated'),
-                                 show='headings', selectmode='browse', height=8)
+                                 show='headings', selectmode='extended', height=8)
         for key, title, width in (('name', '角色', 120), ('level', '等级', 55), ('mobile', '系统', 65),
                                    ('platform', '登录方式', 75), ('status', '票据状态', 190), ('updated', '保存时间（北京）', 140)):
             self.tree.heading(key, text=title)
@@ -46,8 +47,15 @@ class AccountDialog(tk.Toplevel):
         self.platform_box.pack(side='left')
         self.scan_button = ttk.Button(scan, text='扫码登录 / 更新票据', command=self.scan)
         self.scan_button.pack(side='left', padx=8)
+        migration = ttk.Frame(panel)
+        migration.pack(fill='x', pady=(8, 0))
+        self.export_button = ttk.Button(migration, text='加密导出选中账号', command=self.export_selected)
+        self.export_button.pack(side='left')
+        self.import_button = ttk.Button(migration, text='导入账号迁移文件', command=self.import_archive)
+        self.import_button.pack(side='left', padx=8)
+        ttk.Label(migration, text='Ctrl / Shift 多选；已有账号不覆盖。').pack(side='left')
         ttk.Label(panel, textvariable=app.status, wraplength=710).pack(anchor='w', pady=(8, 3))
-        ttk.Label(panel, text='票据仅以当前Windows用户加密保存；失效时重新扫码。不会保存密码或将票据写入Git/操作日志。',
+        ttk.Label(panel, text='本机票据使用Windows用户加密；迁移文件另设密码加密。导入/导出关闭自动功能，不自动登录；失效时重新扫码。',
                   foreground='#666666', wraplength=710).pack(anchor='w')
         self.refresh(app.sessions.store.list())
 
@@ -59,21 +67,25 @@ class AccountDialog(tk.Toplevel):
         for record in records:
             self.tree.insert('', 'end', iid=record['profile_id'], values=(record['name'], record['level'], record['mobile'],
                 record['platform'], record['status'], display_time(int(record['updated'] * 1000)) if record['updated'] else '未知'))
-        if selected and selected[0] in self.records:
-            self.tree.selection_set(selected[0])
+        retained = [key for key in selected if key in self.records]
+        if retained:
+            self.tree.selection_set(retained)
         self.update_controls()
 
     def update_controls(self):
         """Never allow simultaneous switch/scan/save requests; cancellation remains available during local waits."""
         enabled = not self.app.login_busy and not self.app.closing
-        for control in (self.save_button, self.scan_button):
+        for control in (self.save_button, self.scan_button, self.import_button):
             control.state(['!disabled'] if enabled else ['disabled'])
         self.platform_box.state(['!disabled', 'readonly'] if enabled else ['disabled'])
         selected = self.tree.selection()
-        valid = bool(selected and not self.records.get(selected[0], {}).get('unreadable') and
+        valid = bool(len(selected) == 1 and not self.records.get(selected[0], {}).get('unreadable') and
                      self.records.get(selected[0], {}).get('status') != '需要重新扫码')
         self.switch_button.state(['!disabled'] if enabled and valid else ['disabled'])
-        self.delete_button.state(['!disabled'] if enabled and bool(selected) else ['disabled'])
+        self.delete_button.state(['!disabled'] if enabled and len(selected) == 1 else ['disabled'])
+        exportable = (1 <= len(selected) <= MAX_PROFILES and
+                      all(key in self.records and not self.records[key].get('unreadable', False) for key in selected))
+        self.export_button.state(['!disabled'] if enabled and exportable else ['disabled'])
 
     def select(self, event=None):
         """Choose the matching native QR platform for a profile that needs a renewed authorization."""
@@ -88,7 +100,7 @@ class AccountDialog(tk.Toplevel):
     def switch(self):
         """Pass only the stable digest key to the session owner; no credential data reaches the callback."""
         selected = self.tree.selection()
-        if selected:
+        if len(selected) == 1 and not self.app.login_busy and not self.app.closing:
             self.app.request_session('account_switch', selected[0])
 
     def scan(self):
@@ -100,7 +112,7 @@ class AccountDialog(tk.Toplevel):
         if self.app.login_busy or self.app.closing:
             return
         selected = self.tree.selection()
-        if not selected or selected[0] not in self.records:
+        if len(selected) != 1 or selected[0] not in self.records:
             return
         key = selected[0]
         row = self.records[key]
@@ -117,3 +129,52 @@ class AccountDialog(tk.Toplevel):
         except (AccountError, RuntimeError) as error:
             messagebox.showerror('删除未完成', str(error), parent=self)
         self.refresh(self.app.sessions.store.list())
+
+    def migration_password(self, exporting=False):
+        """Collect masked input briefly; return no password on cancellation or mismatched export confirmation."""
+        password = simpledialog.askstring('账号迁移密码',
+            f'请输入迁移密码（至少{MIN_PASSWORD}个字符，密码不会保存）：', show='*', parent=self)
+        if password is None:
+            return None
+        try:
+            password_bytes(password)
+        except AccountError as error:
+            messagebox.showerror('密码不符合要求', str(error), parent=self)
+            return None
+        if exporting:
+            confirm = simpledialog.askstring('确认迁移密码', '请再次输入密码：', show='*', parent=self)
+            if confirm is None:
+                return None
+            if confirm != password:
+                messagebox.showerror('密码不一致', '两次密码不一致，未导出', parent=self)
+                return None
+        return password
+
+    def export_selected(self):
+        """Queue only explicit readable selections and a masked password; the session stops automation before export."""
+        if self.app.login_busy or self.app.closing:
+            return
+        keys = tuple(self.tree.selection())
+        if (not 1 <= len(keys) <= MAX_PROFILES or
+                any(key not in self.records or self.records[key].get('unreadable', False) for key in keys)):
+            return
+        path = filedialog.asksaveasfilename(parent=self, title='加密导出选中账号',
+            defaultextension='.yxsaccounts', initialfile='英雄杀账号迁移.yxsaccounts',
+            filetypes=[('加密账号迁移文件', '*.yxsaccounts')])
+        if not path:
+            return
+        password = self.migration_password(exporting=True)
+        if password is not None and not self.app.login_busy and not self.app.closing:
+            self.app.request_session('account_export', (keys, path, password))
+
+    def import_archive(self):
+        """Queue a portable archive for validation and local DPAPI storage; never request login from this control."""
+        if self.app.login_busy or self.app.closing:
+            return
+        path = filedialog.askopenfilename(parent=self, title='导入账号迁移文件',
+            filetypes=[('加密账号迁移文件', '*.yxsaccounts')])
+        if not path:
+            return
+        password = self.migration_password()
+        if password is not None and not self.app.login_busy and not self.app.closing:
+            self.app.request_session('account_import', (path, password))

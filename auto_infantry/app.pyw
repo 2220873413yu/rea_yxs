@@ -189,13 +189,15 @@ class App:
             self.accounts_dialog.lift()
 
     def request_session(self, mode, selection=None):
-        """Stop old automation, clear its display, then request native login or current-account reconstruction."""
+        """Stop old automation before login, local migration or reconstruction; credentials never reach status text."""
         if self.closing:
             return
         self.clear_account_views()
         self.login_busy = True
-        self.account_status.set('当前账号：正在重新读取，自动功能关闭')
-        self.status.set('正在停止旧连接并处理账号操作…' if mode != 'connect' else '正在重新连接当前账号…')
+        migrating = mode in {'account_export', 'account_import'}
+        self.account_status.set('正在处理本地账号迁移，自动功能全部关闭' if migrating else '当前账号：正在重新读取，自动功能关闭')
+        self.status.set('正在停止旧连接并加密处理迁移文件…' if migrating else
+                        '正在停止旧连接并处理账号操作…' if mode != 'connect' else '正在重新连接当前账号…')
         self.sessions.request(mode, selection)
         self.worker = None
         self.update_controls()

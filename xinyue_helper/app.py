@@ -1,4 +1,4 @@
-"""Standalone QQ accounts, encrypted storage, role confirmation and explicit Hero Kill sign-in."""
+"""Standalone QQ/WeChat accounts, explicit game platforms, role binding and manual gift actions."""
 from io import BytesIO
 from dataclasses import replace
 import queue
@@ -7,7 +7,9 @@ import time
 import tkinter as tk
 from tkinter import ttk,messagebox
 from PIL import Image,ImageTk
-from .auth import QQAuth
+from .auth import QQAuth,WeChatAuth
+from .roles import PLATFORMS,PROVIDERS
+from .role_dialog import choose_login,RoleDialog
 from .gifts import GiftClient
 from .bounty import BountyClient
 from .weekly import WeeklyClient
@@ -18,29 +20,30 @@ from .batch import BatchRunner
 from .secure_store import AccountStore,StoreError
 from .transport import ServiceError
 from .protocol import ProtocolError
+from .binding_session import LoginExpiredError
 
 
 class App:
     """Keep all network work in one worker and expose only safe account/state projections to Tk."""
     def __init__(self):
         """Build manual account-specific gift and G-score controls; startup performs no business requests."""
-        self.root=tk.Tk();self.root.title('心悦助手 · QQ账号与英雄杀礼包');self.root.geometry('1000x980')
+        self.root=tk.Tk();self.root.title('心悦助手 · 账号与英雄杀礼包');self.root.geometry('1000x980')
         self.store=AccountStore();self.events=queue.Queue();self.busy=False;self.stop=threading.Event()
         self.history=HistoryStore();self.batch_stop=threading.Event();self.history_window=None
-        self.states={};self.bounty_states={};self.weekly_states={};self.gscore_states={};self.exchange_states={};self.active='';self.photo=None;self.qr=None
+        self.states={};self.bounty_states={};self.weekly_states={};self.gscore_states={};self.exchange_states={};self.active='';self.photo=None;self.qr=None;self.pending_roles=None
         self.status=tk.StringVar(value='仅加载本地账号；选择账号后手动查询或签到。')
         box=ttk.Frame(self.root,padding=18);box.pack(fill='both',expand=True)
         ttk.Label(box,text='心悦俱乐部 · 英雄杀礼包',font=('Microsoft YaHei UI',18,'bold')).pack(anchor='w')
-        ttk.Label(box,text='QQ独立扫码；账号本机加密保存。启动不查询、不签到，无固定轮询。').pack(anchor='w',pady=(5,14))
+        ttk.Label(box,text='QQ / 微信独立扫码；先选安卓或iOS，角色确认后才绑定。账号本机加密保存，启动不查询、不签到。').pack(anchor='w',pady=(5,14))
         bar=ttk.Frame(box);bar.pack(fill='x')
         self.actions=[]
-        for label,command in [('添加 / 更新QQ账号',self.login),('查询签到状态',self.query),('签到一次',self.signin)]:
+        for label,command in [('添加 / 更新账号',self.login),('选择角色 / 绑定',self.open_roles),('查询签到状态',self.query),('签到一次',self.signin)]:
             button=ttk.Button(bar,text=label,command=command);button.pack(side='left',padx=(0,8));self.actions.append(button)
         batch_button=ttk.Button(bar,text='一键签到（全部账号）',command=self.start_batch);batch_button.pack(side='left',padx=(0,8));self.actions.append(batch_button)
         self.batch_stop_button=ttk.Button(bar,text='停止批量',command=self.stop_batch,state='disabled');self.batch_stop_button.pack(side='left',padx=(0,8))
         ttk.Button(bar,text='领取记录',command=self.show_history).pack(side='left')
         self.accounts=ttk.Treeview(box,columns=('name','provider','saved'),show='headings',height=4,selectmode='browse')
-        for key,title,width in [('name','QQ昵称',210),('provider','登录方式',110),('saved','票据保存时间（UTC）',390)]:
+        for key,title,width in [('name','账号昵称',210),('provider','选定平台 / 登录方式',200),('saved','票据保存时间（UTC）',300)]:
             self.accounts.heading(key,text=title);self.accounts.column(key,width=width)
         self.accounts.pack(fill='x',pady=14);self.accounts.bind('<<TreeviewSelect>>',self.select)
         self.detail=tk.StringVar(value='尚未查询服务器状态。')
@@ -87,7 +90,7 @@ class App:
         ttk.Label(tasks,textvariable=self.bounty_detail,wraplength=810,justify='left').pack(anchor='w')
         ttk.Separator(box).pack(fill='x',pady=12)
         ttk.Label(box,textvariable=self.status,wraplength=790,justify='left').pack(anchor='w')
-        ttk.Label(box,text='支持G分普通签到和手动兑换、七天签到、普通周礼包、每日礼包和免费抽奖；不激活、不升级、不改绑定、不购买。\n按账号、周期防重复；结果不明不自动重发。启动无业务轮询，当前先支持QQ。',
+        ttk.Label(box,text='支持QQ / 微信独立扫码；角色绑定须单独选择确认，不自动解绑。添加账号不签到、不领奖。\n签到、礼包和手动兑换保持点击触发，按账号、周期防重复；结果不明不自动重发，无固定业务轮询。',
                   foreground='#666666',wraplength=790).pack(anchor='w',pady=16)
         self.reload();self.root.after(100,self.consume);self.root.protocol('WM_DELETE_WINDOW',self.close)
 
@@ -179,7 +182,8 @@ class App:
         self.accounts.delete(*self.accounts.get_children())
         rows=self.store.list()
         for row in rows:
-            key=row['profile_id'];self.accounts.insert('', 'end',iid=key,values=(row.get('nickname') or 'QQ账号',row['provider'].upper(),row['saved_at'][:19].replace('T',' ')))
+            platform=PLATFORMS.get(row.get('game_device'),'平台未选择')
+            key=row['profile_id'];self.accounts.insert('', 'end',iid=key,values=(row.get('nickname') or '已保存账号',platform+' / '+PROVIDERS[row['provider']],row['saved_at'][:19].replace('T',' ')))
         selected=selected or (max(rows,key=lambda row:row['saved_at'])['profile_id'] if rows else '')
         if selected and self.accounts.exists(selected):self.accounts.selection_set(selected);self.active=selected
 
@@ -364,31 +368,45 @@ class App:
     def run(self,job):
         """Serialize work and disable entry points so repeated clicks cannot dispatch overlapping claims."""
         if self.busy:return
-        self.busy=True
+        self.busy=True;account_key=self.active
         for button in self.actions:button.configure(state='disabled')
         def worker():
-            """Report only safe domain errors and public results; never format raw exceptions or credentials."""
+            """Report safe errors to both the main status and any active QR dialog; never echo raw exceptions."""
             try:job()
-            except (ServiceError,StoreError,ProtocolError) as error:self.events.put(('status',str(error)))
-            except Exception:self.events.put(('status','操作未完成，未输出凭据；领取请求不会自动重试。'))
+            except LoginExpiredError as error:
+                self.events.put(('session_expired',account_key))
+                self.events.put(('status',str(error)));self.events.put(('qr_status',str(error)))
+            except (ServiceError,StoreError,ProtocolError) as error:
+                self.events.put(('status',str(error)));self.events.put(('qr_status',str(error)))
+            except Exception:
+                message='操作未完成，未输出凭据；请求不会自动重试。'
+                self.events.put(('status',message));self.events.put(('qr_status',message))
             finally:self.events.put(('finished',None))
         threading.Thread(target=worker,daemon=True).start()
 
     def login(self):
-        """Open a fresh QQ authorization session; save phone-approved credentials and query, never sign automatically."""
+        """Require a deliberate platform and provider selection before requesting a fresh official QR."""
+        if self.busy:return
+        choose_login(self.root,self.start_login)
+
+    def start_login(self,choice):
+        """Freeze QR provider and game platform; save approved credentials before opening the role picker."""
         if self.busy:return
         self.stop=threading.Event();stop=self.stop
-        self.qr=tk.Toplevel(self.root);self.qr.title('QQ扫码登录心悦');self.qr.geometry('500x590')
+        label=PROVIDERS[choice.provider]
+        self.qr=tk.Toplevel(self.root);self.qr.title(choice.label+' · 扫码登录心悦');self.qr.geometry('500x590')
+        self.qr.transient(self.root);self.qr.grab_set()
         self.qr.protocol('WM_DELETE_WINDOW',self.cancel_login)
-        ttk.Label(self.qr,text='用本人手机QQ扫码并确认授权',font=('Microsoft YaHei UI',14,'bold')).pack(pady=15)
+        ttk.Label(self.qr,text=choice.label+'：用本人手机'+label+'扫码',font=('Microsoft YaHei UI',14,'bold')).pack(pady=15)
         self.qr_label=ttk.Label(self.qr,anchor='center');self.qr_label.pack(fill='both',expand=True)
-        self.qr_status=tk.StringVar(value='正在申请新的QQ二维码…')
+        self.qr_status=tk.StringVar(value='正在申请新的'+label+'二维码…')
         ttk.Label(self.qr,textvariable=self.qr_status,wraplength=450).pack(pady=10)
         ttk.Button(self.qr,text='取消 / 关闭',command=self.cancel_login).pack(pady=10)
-        self.status.set('QQ授权期间只查询登录状态，不签到。')
+        self.status.set(choice.label+'授权期间仅处理登录；之后选择区服和角色，不签到、不领奖。')
         def job():
             """Bound QR waiting to its expiry and ignore any result arriving after user cancellation."""
-            provider=QQAuth();challenge=provider.begin()
+            provider=QQAuth() if choice.provider=='qq' else WeChatAuth()
+            challenge=provider.begin()
             if stop.is_set():return
             self.events.put(('qr_image',challenge.image))
             while not stop.is_set() and time.monotonic()<challenge.expires_at:
@@ -396,20 +414,47 @@ class App:
                 if stop.is_set():return
                 if credentials:
                     row=self.store.save(credentials,credentials.headers())
+                    self.store.set_game_device(row['profile_id'],choice.device)
                     self.events.put(('saved',row))
-                    value=GiftClient().query(self.store.load(row['profile_id']))
-                    if not stop.is_set():self.events.put(('state',(row['profile_id'],value)))
-                    self.events.put(('status','QQ登录成功，Token已本机加密保存；未执行签到。'))
+                    if choice.provider=='wx':
+                        try:
+                            credentials.nickname=provider.user_info(credentials)
+                            row=self.store.save(credentials,credentials.headers())
+                            self.events.put(('saved',row))
+                        except ServiceError:
+                            self.events.put(('status','微信票据已保存；昵称暂未取得，继续只读查询角色，不自动重试登录。'))
+                    if stop.is_set():return
+                    self.events.put(('status',choice.label+'登录成功，Token已本机加密保存；请选择角色，未执行签到领奖。'))
+                    self.events.put(('roles_after_login',(row['profile_id'],choice)))
                     self.events.put(('qr_done',None));return
                 if state=='expired':break
-                self.events.put(('qr_status','已扫码，请在手机确认。' if state=='scanned' else '等待QQ扫码…'))
+                self.events.put(('qr_status','已扫码，请在手机确认。' if state=='scanned' else '等待'+label+'扫码…'))
                 stop.wait(3)
-            if not stop.is_set():self.events.put(('qr_status','二维码已过期。关闭后点击“添加 / 更新QQ账号”重新生成。'))
+            if not stop.is_set():self.events.put(('qr_status','二维码已过期。关闭后点击“添加 / 更新账号”重新生成。'))
         self.run(job)
+
+    def open_roles(self,key=None,choice=None):
+        """Open manual account-scoped role discovery; existing accounts must explicitly choose a platform."""
+        if self.busy:return
+        key=key or self.active
+        if not key:self.status.set('请先选择账号。');return
+        RoleDialog(self.root,self.store,key,self.binding_changed,choice,on_expired=self.login_expired)
+
+    def login_expired(self,key):
+        """Discard cached recipients for a stale ticket, retaining its encrypted file until explicit re-login."""
+        for cache in (self.states,self.bounty_states,self.weekly_states,self.gscore_states,self.exchange_states):cache.pop(key,None)
+        if key==self.active:
+            self.detail.set('登录票据已失效或不是最新，请添加 / 更新账号重新扫码；不要因此解绑。')
+            self.render_bounty();self.render_weekly();self.render_gscore();self.render_exchange()
+
+    def binding_changed(self,key):
+        """Invalidate cached gift recipients and display verified binding changes without claiming anything."""
+        for cache in (self.states,self.bounty_states,self.weekly_states,self.gscore_states,self.exchange_states):cache.pop(key,None)
+        self.reload(key);self.select();self.status.set('角色绑定已核对；已清除旧礼包状态，请按需手动查询，未签到领奖。')
 
     def cancel_login(self):
         """Cancel only this helper's pending authorization; never log out or invalidate saved accounts."""
-        self.stop.set()
+        self.stop.set();self.pending_roles=None
         if self.qr and self.qr.winfo_exists():self.qr.destroy()
         self.qr=None
 
@@ -466,6 +511,8 @@ class App:
             while True:
                 kind,value=self.events.get_nowait()
                 if kind=='status':self.status.set(value)
+                elif kind=='session_expired':
+                    self.login_expired(value)
                 elif kind=='state':
                     key,state=value;self.states[key]=state
                     if key==self.active:self.detail.set(state.role_label+'\n'+state.describe())
@@ -485,11 +532,13 @@ class App:
                     if key==self.active:self.render_exchange();self.render_gscore()
                 elif kind=='batch_plan':self.confirm_batch(*value)
                 elif kind=='saved':self.reload(value['profile_id'])
+                elif kind=='roles_after_login' and not self.stop.is_set():self.pending_roles=value
                 elif kind=='qr_image' and self.qr and not self.stop.is_set():
                     picture=Image.open(BytesIO(value));picture=picture.resize((410,410),Image.Resampling.NEAREST)
                     self.photo=ImageTk.PhotoImage(picture);self.qr_label.configure(image=self.photo)
                 elif kind=='qr_status' and self.qr and not self.stop.is_set():self.qr_status.set(value)
-                elif kind=='qr_done':self.cancel_login()
+                elif kind=='qr_done':
+                    pending=self.pending_roles;self.cancel_login();self.pending_roles=pending
                 elif kind=='finished':
                     self.busy=False
                     self.batch_stop_button.configure(state='disabled')
@@ -499,6 +548,9 @@ class App:
                     self.render_weekly()
                     self.render_gscore()
                     self.render_exchange()
+                    if self.pending_roles:
+                        key,choice=self.pending_roles;self.pending_roles=None
+                        self.root.after_idle(lambda key=key,choice=choice:self.open_roles(key,choice))
         except queue.Empty:pass
         self.root.after(100,self.consume)
 

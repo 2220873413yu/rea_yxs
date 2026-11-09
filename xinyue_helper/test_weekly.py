@@ -16,7 +16,7 @@ class WeekSession(GiftSession):
 
     def request(self,url,body=None,headers=None,timeout=20):
         """Assert the weekly scene is kept distinct from sign-in and task gift protocols."""
-        if url.endswith('GetPassCardV2'):return super().request(url,body,headers,timeout)
+        if url.endswith(('GetPassCardV2','CheckBind')):return super().request(url,body,headers,timeout)
         self.calls.append(url.rsplit('/',1)[-1])
         if url.endswith('GetGamesGifts'):
             assert body==p.message_string(1,'weekGift')+number(2,1187)

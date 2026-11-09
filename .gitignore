@@ -26,6 +26,7 @@ dist/
 /auto_infantry/startup-error.txt
 *.log
 *.dpapi
+*.yxsaccounts
 /auto_infantry/accounts/
 /auto_infantry/map_player_indexes/
 /auto_infantry/player_profile_caches/

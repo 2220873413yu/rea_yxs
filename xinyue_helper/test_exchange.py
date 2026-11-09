@@ -17,6 +17,7 @@ class ExchangeSession(GiftSession):
 
     def request(self,url,body=None,headers=None,timeout=20):
         """Assert score scene, exact current binding and absence of unrelated optional mutation fields."""
+        if url.endswith('CheckBind'):return super().request(url,body,headers,timeout)
         if url.endswith('GetPassCardV2'):
             value=super().request(url,body,headers,timeout)
             card=p.parse(p.get(p.parse(value.body),3));game=p.parse(p.get(card,3));self.bound_role=p.get(game,5)

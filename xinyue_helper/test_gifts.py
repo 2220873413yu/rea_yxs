@@ -34,6 +34,7 @@ class GiftSession:
     def request(self,url,body=None,headers=None,timeout=20):
         """Emulate the relevant server transitions and assert native scene/header use at the claim boundary."""
         self.calls.append(url.rsplit('/',1)[-1])
+        if url.endswith('CheckBind'):return response(number(2,3))
         if url.endswith('GetPassCardV2'):
             role=p.message_string(8,base64.b64encode('秋风'.encode()).decode())+p.message_string(6,base64.b64encode('QQ大区'.encode()).decode())+nested(5,self.role)
             game=number(1,1187)+nested(5,role)+number(10,int(self.restricted))
@@ -68,6 +69,22 @@ class GiftTests(unittest.TestCase):
         self.assertEqual(self.client.last_state.days,7)
         self.client.signin(self.account,state.role_key)
         self.assertEqual(self.session.calls.count('ReceiveGamesGift'),1)
+
+    def test_actual_bound_platform_is_visible_without_overriding_user_selection(self):
+        """Show the server's platform separately when a native APP binding differs from the user's saved choice."""
+        original=self.session.request
+        def current_android(url,body=None,headers=None,timeout=20):
+            """Add the actual native role device only to the synthetic binding response."""
+            result=original(url,body,headers,timeout)
+            if url.endswith('GetPassCardV2'):
+                card=p.parse(p.get(p.parse(result.body),3));game=p.parse(p.get(card,3))
+                role=p.get(game,5)+p.message_string(9,'android')
+                return response(nested(3,number(1,1187)+nested(5,role)))
+            return result
+        self.session.request=current_android
+        state=self.client.query({**self.account,'game_device':'ios'})
+        self.assertIn('当前绑定：安卓',state.role_label)
+        self.assertEqual(self.session.calls.count('ReceiveGamesGift'),0)
 
     def test_changed_role_never_claims(self):
         """A binding changed after UI confirmation must require a new explicit confirmation."""

@@ -74,7 +74,9 @@ class AccountStore:
             'headers':headers,'refresh_token':credentials.refresh_token})
         if (self.folder/(key+'.dpapi')).exists():
             try:
-                value['role_confirmation']=self.load(key).get('role_confirmation',{})
+                old=self.load(key)
+                value['role_confirmation']=old.get('role_confirmation',{})
+                if old.get('game_device') in ('ios','android'):value['game_device']=old['game_device']
             except StoreError:
                 pass
         self.write(value)
@@ -104,6 +106,13 @@ class AccountStore:
                                     'expires_at':time.time()+30*86400 if remember else 0}
         self.write(value)
 
+    def set_game_device(self,key,device,clear_confirmation=False):
+        """Save the person's explicit game platform encrypted; binding changes invalidate old claim consent."""
+        if device not in ('ios','android'):raise StoreError('请选择安卓或iOS平台')
+        value=self.load(key);value['game_device']=device
+        if clear_confirmation:value.pop('role_confirmation',None)
+        self.write(value)
+
     def load(self, key):
         """Decrypt only a validated account identifier; never accept caller-supplied filesystem traversal."""
         if len(key)!=64 or any(c not in '0123456789abcdef' for c in key):
@@ -122,7 +131,7 @@ class AccountStore:
     @staticmethod
     def public(value):
         """Expose account labels and dates only; no Token, OpenID, cookie or refresh secret reaches widgets."""
-        return {key:value.get(key) for key in ('profile_id','provider','nickname','saved_at','expires_at')}
+        return {key:value.get(key) for key in ('profile_id','provider','nickname','saved_at','expires_at','game_device')}
 
     def list(self):
         """Load local records without networking; damaged records remain untouched and are omitted."""

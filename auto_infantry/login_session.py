@@ -50,8 +50,9 @@ class LoginSession:
         self.accounts = AccountService(self.store)
 
     def request(self, mode='connect', selection=None):
-        """Cancel earlier work before asynchronously detaching and opening a fresh default-off session."""
-        if mode not in {'connect', 'ios_wechat', 'account_save', 'account_switch', 'account_qr'}:
+        """Cancel earlier work before serial login, default-off reconnection or local encrypted migration."""
+        if mode not in {'connect', 'ios_wechat', 'account_save', 'account_switch', 'account_qr',
+                        'account_export', 'account_import'}:
             raise ValueError('Unsupported session mode')
         with self.guard:
             if self.closed:
@@ -66,7 +67,7 @@ class LoginSession:
             self.job.start()
 
     def _replace(self, mode, epoch, cancel, previous, old_job, selection=None):
-        """Join old owners before acquiring a bridge; no account caches or services survive replacement."""
+        """Join old owners before any account job; migration returns without a bridge or replacement worker."""
         sink = SessionEvents(self.events, epoch)
         connection = None
         try:
@@ -80,6 +81,21 @@ class LoginSession:
                 if old_job.is_alive():
                     raise RuntimeError('上次登录操作尚未退出，请稍后重试')
             if cancel.is_set():
+                return
+            if mode in {'account_export', 'account_import'}:
+                # Migration never needs ADB, a running game, SDK writes or an automatic replacement worker.
+                from account_migration import export_accounts, import_accounts
+                if mode == 'account_export':
+                    keys, path, password = selection
+                    result = export_accounts(self.store, keys, path, password, cancel)
+                    message = f"已加密导出{result['exported']}个账号；密码不会保存"
+                else:
+                    path, password = selection
+                    result = import_accounts(self.store, path, password, cancel)
+                    message = f"已导入{result['imported']}个账号，跳过{result['skipped']}个本机已有账号；未自动登录"
+                sink.put({'profiles': self.store.list(), 'ready': False,
+                          'account_status': '当前游戏账号未切换；自动功能全部关闭',
+                          'status': message + '。需要使用时请选择账号切换，票据失效请重新扫码。'})
                 return
             ensure_server()
             legacy = Path(__file__).resolve().parents[1] / 'analysis/evidence'

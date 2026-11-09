@@ -9,12 +9,13 @@ from pathlib import Path
 from .auth import BGW
 from .transport import Session,ServiceError
 from . import protocol as p
+from .binding_session import check_binding_session
 
 
 def role_text(value):
-    """Decode base64-encoded role labels used by the native binding model, with a plain-text fallback."""
+    """Decode standard or URL-safe native role labels, retaining ordinary text if decoding is invalid."""
     text=p.text(value)
-    try:return base64.b64decode(text,validate=True).decode('utf-8') if text else ''
+    try:return base64.b64decode(text+'='*(-len(text)%4),altchars=b'-_',validate=True).decode('utf-8') if text else ''
     except (ValueError,UnicodeError):return text
 
 
@@ -33,7 +34,7 @@ class GiftState:
 
     def describe(self):
         """Render server state without inferring success from cumulative sign-in days alone."""
-        if self.binding_restricted:return '服务器提示绑定受限，请在心悦APP核对；助手不会解绑或重绑。'
+        if self.binding_restricted:return '服务器提示绑定受限；请打开“选择角色 / 绑定”→“检查 / 处理当前绑定受限”，单独确认后处理。'
         if not self.role_key:return '未取得英雄杀绑定角色，请先在心悦APP绑定。'
         return f'已签到 {self.days} 天；'+('可签到' if self.status==0 else '今日已签到' if self.status==5 else f'暂不可签到（状态 {self.status}）')
 
@@ -58,6 +59,7 @@ class GiftClient:
         fields=p.parse(response.body);ret=p.get(fields,1,0)
         if ret!=0:
             if ret==10010:raise ServiceError('10010：服务器提示游戏绑定受限，请核对绑定；不会自动重试。')
+            if ret==10020:raise ServiceError('10020：请先绑定英雄杀游戏角色；本次未修改绑定，不需要因此重新扫码。')
             raise ServiceError('心悦服务器拒绝，返回码：'+str(ret))
         data=p.get(fields,3)
         if not isinstance(data,bytes):raise ServiceError('服务器未返回完整数据，停止操作')
@@ -72,7 +74,7 @@ class GiftClient:
         self.dispatched=False;self.result_status='uncertain';self.actual_rewards=();self.reward_description=''
 
     def binding(self,account):
-        """Read one binding and safe summary; retain its exact role bytes in RAM for scoped native requests."""
+        """Read a binding, validating any restriction via native CheckBind so old tickets cannot trigger rebind advice."""
         headers=account['headers']
         self._bound_role=b''
         card=self.request('xyapp.GiftSrv/GetPassCardV2',b'',headers)
@@ -90,8 +92,12 @@ class GiftClient:
                 name=role_text(p.get(fields,8,b'')) or account.get('nickname') or '已绑定角色'
                 partition=role_text(p.get(fields,6,b''))
                 label='英雄杀 / '+name+(' / '+partition if partition else '')
+                device=p.text(p.get(fields,9,b''))
+                if device in ('android','ios'):
+                    label+=' / 当前绑定：'+('安卓' if device=='android' else 'iOS')
                 key=hashlib.sha256(role).hexdigest()
             break
+        if restricted:check_binding_session(account,self.session)
         return key,label,restricted
 
     def query(self,account):

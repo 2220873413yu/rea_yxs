@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 
@@ -212,6 +213,49 @@ class AccountStore:
     def mark_scan_required(self, key):
         """Retain the old ciphertext record for replacement by the next successful scan, but never retry it automatically."""
         return self.save(self.load(key), '需要重新扫码')
+
+    def import_profiles(self, values, cancel=None):
+        """Stage a fully validated batch in local ciphertext, skip existing identities and roll back new files on failure."""
+        from account_lock import account_operation
+        from account_migration import check_cancel, validate_batch
+        validate_batch(values)
+        with account_operation():
+            check_cancel(cancel)
+            self.directory.mkdir(parents=True, exist_ok=True)
+            skipped = 0
+            prepared = []
+            created = []
+            with tempfile.TemporaryDirectory(prefix='.import-', dir=self.directory) as staging:
+                try:
+                    # Every imported ticket is unverified on this PC; explicit expired marks remain expired.
+                    for value in values:
+                        check_cancel(cancel)
+                        key = profile_key(value)
+                        path = self._path(key)
+                        if path.exists():
+                            skipped += 1
+                            continue
+                        status = '需要重新扫码' if value.get('ticket_status') == '需要重新扫码' else '已保存，切换时验证'
+                        record = dict(value, format=2, saved_at=time.time(), ticket_status=status)
+                        encrypted = self.cipher(json.dumps(record, separators=(',', ':')).encode(), False)
+                        if json.loads(self.cipher(encrypted, True)) != record:
+                            raise AccountError('本机加密回读校验失败，未导入账号')
+                        staged = Path(staging) / path.name
+                        with staged.open('wb') as output:
+                            output.write(encrypted)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        prepared.append((staged, path))
+                    check_cancel(cancel)
+                    # Create only new names. A competing file cannot be overwritten, even across processes.
+                    for staged, path in prepared:
+                        os.link(staged, path)
+                        created.append(path)
+                except Exception:
+                    for path in created:
+                        path.unlink(missing_ok=True)
+                    raise
+            return {'imported': len(created), 'skipped': skipped}
 
     def delete(self, key):
         """Forget one local ciphertext record and block legacy re-import; leave the running game and SDK untouched."""
