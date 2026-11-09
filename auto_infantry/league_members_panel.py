@@ -50,6 +50,13 @@ class LeagueMembersPanel(ttk.Frame):
         self.comparison.bind('<Button-3>',self.open_league_menu)
         self.member_title=tk.StringVar(value='选择联盟后显示本地玩家')
         ttk.Label(member_area,textvariable=self.member_title,wraplength=205).pack(anchor='w',pady=(0,3))
+        name_bar=ttk.Frame(member_area);name_bar.pack(fill='x',pady=(0,4))
+        ttk.Label(name_bar,text='全图名字搜索').pack(side='left')
+        self.name_filter=tk.StringVar()
+        self.name_entry=ttk.Entry(name_bar,textvariable=self.name_filter,width=12)
+        self.name_entry.pack(side='left',fill='x',expand=True,padx=4)
+        self.clear_name=ttk.Button(name_bar,text='清空',width=4,command=lambda:self.name_filter.set(''))
+        self.clear_name.pack(side='left')
         members=ttk.Frame(member_area);members.pack(fill='both',expand=True)
         self.tree=ttk.Treeview(members,columns=('name','league','coords'),displaycolumns=('name','coords'),show='headings',height=5,selectmode='browse')
         for key,label,width in (('name','玩家',115),('league','联盟',100),('coords','坐标',70)):
@@ -63,6 +70,7 @@ class LeagueMembersPanel(ttk.Frame):
         self.details=tk.Text(detail_area,height=8,width=36,wrap='word',font=('Microsoft YaHei UI',10),state='disabled')
         scroll=ttk.Scrollbar(detail_area,orient='vertical',command=self.details.yview)
         self.details.configure(yscrollcommand=scroll.set);scroll.pack(side='right',fill='y');self.details.pack(fill='both',expand=True)
+        self.name_filter.trace_add('write',self.filter_names)
         self.update_controls(False)
 
     def update_controls(self,ready):
@@ -73,6 +81,7 @@ class LeagueMembersPanel(ttk.Frame):
         self.query.state(['!disabled']if enabled and self.tree.get_children() else['disabled'])
         self.stop_search.state(['!disabled']if ready and self.search_running else['disabled'])
         self.stop_export.state(['!disabled']if ready and self.export_running else['disabled'])
+        for widget in (self.name_entry,self.clear_name):widget.state(['disabled']if self.busy else['!disabled'])
 
     def open_league_menu(self,event):
         """Right-click the actual alliance row; merely opening its menu sends no request."""
@@ -114,6 +123,7 @@ class LeagueMembersPanel(ttk.Frame):
         """Drop all previous-account league choices, sightings and profile results."""
         self.local_records=[];self.local_scope=None;self.league_snapshot=None;self.remote_leagues={};self.own_league_id=None
         self.selected_league=None;self.comparison_rows=[];self.search_running=False;self.export_running=False;self.busy=False;self.view_source='local'
+        self.name_filter.set('')
         self.comparison.delete(*self.comparison.get_children());self.clear_roster()
         self.comparison_time.set('人数更新：未查询\n本地记录：暂无')
         self.comparison_note.set('差额仅供参考，不保证完整名单。');self.member_title.set('选择联盟后显示本地玩家')
@@ -175,15 +185,23 @@ class LeagueMembersPanel(ttk.Frame):
         self.comparison_note.set(row['note']if row else'差额仅供参考，不保证完整名单。')
 
     def show_local(self):
-        """Display only the selected league's locally saved users, with no automatic league/profile query."""
+        """Browse one league normally; a nickname fragment searches all saved map players without requests."""
         self.clear_roster();self.view_source='local'
-        rows=[r for r in self.local_records if r['league_id']==self.selected_league]
+        keyword=self.name_filter.get().strip().casefold()
+        rows=([r for r in self.local_records if keyword in r['name'].casefold()]if keyword else
+              [r for r in self.local_records if r['league_id']==self.selected_league])
+        self.tree.configure(displaycolumns=('name','league','coords')if keyword else('name','coords'))
         name=next((r['name']for r in self.comparison_rows if r['league_id']==self.selected_league),'未选择联盟')
         for row in rows:self.tree.insert('','end',iid='local:'+row['record_key'],values=(row['name'],row['league_name']or'未入盟',f"{row['x']},{row['y']}"))
-        self.member_title.set(f'{name} · 本地 {len(rows)}人')
-        self.status.set(f'{name}：本地已发现{len(rows)}人；点击玩家后可查询武将。'+
+        self.member_title.set(f'全图匹配 {len(rows)} / {len(self.local_records)}人'if keyword else f'{name} · 本地 {len(rows)}人')
+        self.status.set(f'名字搜索：全图本地记录匹配{len(rows)}人，不区分联盟；点击玩家后可查询武将。'if keyword else
+                        f'{name}：本地已发现{len(rows)}人；点击玩家后可查询武将。'+
                         ('该联盟尚无本地记录，可搜索本图用户或手动加载服务器成员。'if not rows else'差额仅供参考。'))
         self.update_controls(self.ready)
+
+    def filter_names(self,*_):
+        """Filter cached map names on typing; never send searches or disturb an in-flight player query."""
+        if not self.busy:self.show_local()
 
     def apply_search_progress(self,snapshot):
         """Display the clicked search's finite progress, without generating additional requests."""
@@ -205,6 +223,8 @@ class LeagueMembersPanel(ttk.Frame):
         scope='公开成员资料，不保证完整名单'if snapshot['public']else'本盟成员名单'
         self.member_title.set(f"{snapshot['name']} · 服务器 {len(snapshot['members'])}人")
         self.status.set(f"{snapshot['name']}：{scope}；确认 {display_time(snapshot['confirmed_ms'])}。查看本地记录可切回地图已发现玩家。")
+        if self.name_filter.get().strip():self.show_local()
+        else:self.tree.configure(displaycolumns=('name','coords'))
         self.update_controls(self.ready)
 
     def apply_member(self,snapshot):

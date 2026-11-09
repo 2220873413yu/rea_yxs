@@ -7,6 +7,7 @@ from pathlib import Path
 from .gifts import GiftClient
 from .context import request_headers
 from .secure_store import crypt
+from .rewards import item_rewards
 from .transport import ServiceError
 from . import protocol as p
 
@@ -59,7 +60,7 @@ class WeeklyClient(GiftClient):
 
     def retain_response(self,path,response):
         """Retain only an encrypted weekly mutation receipt so diagnostics never require another claim."""
-        if path=='xyapp.GiftSrv/ReceiveGamesGift' and self.receipt_path:
+        if path=='xyapp.GiftSrv/ReceiveGift' and self.receipt_path:
             self.receipt_path.write_bytes(b'XYWEEK1\0'+crypt(response.body))
 
     def query(self,account):
@@ -79,7 +80,7 @@ class WeeklyClient(GiftClient):
             if tag==5 and wire==2:
                 item=p.parse(value);rewards.append((p.text(p.get(item,2,b'')),p.get(item,4,0)))
         title=p.text(p.get(gd,1,b''));summary=p.text(p.get(desc,1,b''))
-        normal=(set(self.bound_game_ids)=={1187} and len(matches)==1 and summary=='超级周礼包' and title=='每周礼包'
+        normal=(len(matches)==1 and summary=='超级周礼包' and title=='每周礼包'
                 and p.get(g,2,0)==0 and p.get(g,3,0)==0 and p.get(g,7,0)==2 and p.get(g,14,0)==1)
         self.last_state=WeeklyState(key,label,restricted,p.text(p.get(g,1,b'')),title,
             p.get(g,6,0),p.get(desc,6,0),p.get(g,8,0),p.get(g,9,0),
@@ -92,31 +93,52 @@ class WeeklyClient(GiftClient):
         self.reset_result();before=self.query(account)
         if before.role_key!=expected_role_key:raise ServiceError('领取角色已变化，请重新查询并确认')
         if before.gift_id!=expected_gift_id:raise ServiceError('周礼包配置已变化，请重新查询并确认')
+        if (before.role_key and not before.restricted and before.normal_config and before.total>0
+                and before.used>=before.total):
+            self.result_status='skipped'
+            return '本周期周礼包已领取，跳过；未提交领取请求。'
         if not before.available:raise ServiceError(before.describe())
+        role=self._bound_role
+        if not role:raise ServiceError('未取得当前绑定角色，停止领取')
         # Calendar week is only a duplicate guard. It never grants server eligibility on its own.
         now=datetime.now(timezone(timedelta(hours=8)));year,week,_=now.isocalendar()
         self.attempt_folder.mkdir(parents=True,exist_ok=True)
         marker=self.attempt_folder/(account['profile_id']+f'-{year}-W{week:02d}.json')
         try:
             with marker.open('x',encoding='utf-8') as file:
-                json.dump({'state':'dispatched_do_not_repeat','gift_id':before.gift_id,'scene':'weekGift'},file)
+                json.dump({'state':'dispatched_do_not_repeat','gid':1187,'gift_id':before.gift_id,
+                           'scene':'weekGift','endpoint':'ReceiveGift'},file)
                 file.flush();os.fsync(file.fileno())
         except FileExistsError:raise ServiceError('本账号本周已有周礼包尝试记录，不重复提交；请只读查询核对') from None
         self.receipt_path=marker.with_suffix('.response.dpapi')
         self.dispatched=True
-        result=self.request('xyapp.GiftSrv/ReceiveGamesGift',p.message_string(1,'weekGift'),
-                            {**request_headers(account),'T-GIFT-TYPE':'weekGift'})
-        success=p.get(result,3,0);failed=p.get(result,4,0)
-        rewards=[]
-        for tag,wire,raw in result:
-            if tag==8 and wire==2:
-                item=p.parse(raw);rewards.append((p.text(p.get(item,2,b'')),p.get(item,4,0)))
+        # Target only this game's live gift and exact bound role; never fall back to the bulk endpoint.
+        body=(p.varint(8)+p.varint(1187)+p.message_string(2,'weekGift')
+              +p.message_string(3,before.gift_id)+p.varint(34)+p.varint(len(role))+role)
+        headers={k:v for k,v in request_headers(account).items() if k.lower()!='t-gift-type'}
+        result=self.request('xyapp.GiftSrv/ReceiveGift',body,headers)
+        wrapped=p.get(result,1)
+        if isinstance(wrapped,bytes):
+            try:inner=p.parse(wrapped)
+            except p.ProtocolError:inner=[]
+            if any(tag in (5,6,7,8,12) for tag,wire,value in inner):result=inner
+        result_ret=p.get(result,8,0)
+        if not isinstance(result_ret,int):raise ServiceError('周礼包结果结构待核对；不重复提交')
+        if result_ret!=0:raise ServiceError('周礼包返回错误：'+str(result_ret)+'；不重复提交')
+        rewards=item_rewards(result)
         after=self.query(account)
-        verified=success>0 and failed==0 and after.gift_id==before.gift_id and after.used>before.used
+        verified=(after.role_key==before.role_key and after.gift_id==before.gift_id
+                  and after.used>before.used and after.status==1)
         self.result_status='success' if verified else 'uncertain';self.actual_rewards=tuple(rewards)
-        marker.write_text(json.dumps({'state':'confirmed_response' if verified else 'uncertain',
-            'success':success,'failed':failed,'before_used':before.used,'after_used':after.used,'after_status':after.status,
-            'actual_rewards':rewards},ensure_ascii=False),encoding='utf-8')
         reward_text='、'.join(f'{name} ×{count}' for name,count in rewards if name)
-        return (f'周礼包领取成功：成功 {success} 个，次数 {after.used}/{after.total}。'+(reward_text+'。' if reward_text else '') if verified
-                else f'已提交一次周礼包请求：成功 {success}，失败 {failed}；结果待核对。')+'不会自动重试。'
+        if not reward_text and verified:
+            fixed=tuple((name,count) for name,count in before.rewards if name and isinstance(count,int) and count>0)
+            if fixed:
+                self.reward_description='、'.join(f'{name} ×{count}' for name,count in fixed)+'（礼包配置；回执仅确认成功）'
+                reward_text=self.reward_description
+        marker.write_text(json.dumps({'state':'confirmed_response' if verified else 'uncertain',
+            'gid':1187,'scene':'weekGift','endpoint':'ReceiveGift','gift_id':before.gift_id,
+            'before_used':before.used,'after_used':after.used,'after_status':after.status,
+            'actual_rewards':rewards,'reward_description':self.reward_description},ensure_ascii=False),encoding='utf-8')
+        return (f'英雄杀周礼包领取成功，次数 {after.used}/{after.total}。'+(reward_text+'。' if reward_text else '') if verified
+                else '已提交一次英雄杀周礼包请求，结果待核对。')+'不会自动重试。'

@@ -95,8 +95,27 @@ class BatchHistoryTests(unittest.TestCase):
         plan=self.runner.prepare(self.rows,self.stop);self.servers['a'*64]['weekly'].role=b'new-role';self.servers['b'*64]['bounty'].cost=10
         totals=self.runner.execute(plan,self.stop)
         self.assertGreaterEqual(totals['failed'],2)
-        self.assertEqual(self.servers['a'*64]['weekly'].calls.count('ReceiveGamesGift'),0)
+        self.assertEqual(self.servers['a'*64]['weekly'].calls.count('ReceiveGift'),0)
         self.assertEqual(self.servers['b'*64]['bounty'].calls.count('ReceiveGift'),1)  # daily only, paid draw blocked
+
+    def test_batch_weekly_multi_game_and_already_claimed_after_preflight(self):
+        """Batch uses the same targeted client and skips a claim completed after its preview."""
+        first=self.servers['a'*64]['weekly'];second=self.servers['b'*64]['weekly']
+        first.multi_game=True;second.multi_game=True
+        plan=self.runner.prepare(self.rows,self.stop)
+        second.used=1;second.gift_status=1
+        totals=self.runner.execute(plan,self.stop)
+        self.assertEqual(totals['success'],7);self.assertEqual(totals['skipped'],1)
+        self.assertEqual(len(first.claim_bodies),1);self.assertEqual(second.claim_bodies,[])
+        self.assertEqual(first.peace_used,0);self.assertEqual(second.peace_used,0)
+
+    def test_batch_uncertain_weekly_stops_account_remaining_claims(self):
+        """No counter confirmation after a weekly mutation blocks subsequent rewards for that account."""
+        server=self.servers['a'*64]['weekly'];server.multi_game=True;server.advance=False
+        totals=self.runner.execute(self.runner.prepare(self.rows,self.stop),self.stop)
+        self.assertEqual(totals['uncertain'],1);self.assertEqual(totals['skipped'],2)
+        self.assertEqual(totals['success'],5);self.assertEqual(len(server.claim_bodies),1)
+        self.assertEqual(self.servers['a'*64]['bounty'].calls.count('ReceiveGift'),0)
 
     def test_pending_history_persists_and_never_copies_extra_account_fields(self):
         """Interrupted rows survive restart, while private dictionaries never enter the history schema."""
