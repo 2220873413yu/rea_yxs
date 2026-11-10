@@ -126,7 +126,10 @@ local function scoutStages()
  if list then for i=0,list:get_Count()-1 do local s=list:get_Item(i);local path=s[3]
   assert(path and path:get_Count()>0,'Scout path unavailable')
   local p=path:get_Item(path:get_Count()-1);local shown=CSLTypes.SLGMapUtils.logicToDisplay(p)
-  rows[#rows+1]={end_ms=s[2]*1000,x=shown[1],y=shown[2]}
+  -- Native lEndTime is already milliseconds and may outlive the corresponding treasure event.
+  if type(s[2])=='number' and s[2]>n.now() then
+   rows[#rows+1]={end_ms=s[2],x=shown[1],y=shown[2]}
+  end
  end end
  return rows
 end

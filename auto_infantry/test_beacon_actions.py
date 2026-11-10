@@ -165,10 +165,23 @@ class BeaconActionsTests(unittest.TestCase):
     def test_scout_insufficient_stale_and_manual_inbound_are_blocked(self):
         """A pre-existing scout journey, stale stock or shortage cannot trigger another scout or purchase."""
         for change in ('Game.distance=40','Game.time=Game.time+3001',
-                       'CSLTypes.ModelManager.sharedInstance():getModel("main")._myScoutInfoList:Add({0,2000,list({{101,59,0}})})'):
+                       'CSLTypes.ModelManager.sharedInstance():getModel("main")._myScoutInfoList:Add({0,2000000,list({{101,59,0}})})'):
             self.setUp();self.lua.execute('Game.events[1][2]=2;REA_AUTO_INFANTRY.beacon_scout_query(10);'+change)
             self.assertFalse(self.lua.execute('return pcall(REA_AUTO_INFANTRY.beacon_scout,10)')[0])
             self.assertIsNone(self.lua.globals().Game.scoutCalls)
+
+    def test_scout_cache_uses_milliseconds_and_disappears_with_completed_event(self):
+        """Retained native scout history must not survive its treasure task in the assistant's snapshot."""
+        self.lua.execute('Game.events[1][2]=2;local main=CSLTypes.ModelManager.sharedInstance():getModel("main");'
+                         'main._myScoutInfoList:Add({Game.time,Game.time+3600000,list({Game.events[1][1][1]})})')
+        snapshot=json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_snapshot()'))
+        self.assertEqual(len(snapshot['scouts']),1)
+        self.assertEqual(snapshot['scouts'][0]['end_ms'],self.lua.globals().Game.time+3600000)
+        self.lua.execute('Game.events[1][3]=3')
+        self.assertEqual(json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_snapshot()'))['scouts'],[])
+        self.lua.execute('Game.events={}')
+        self.assertEqual(json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_snapshot()'))['scouts'],[])
+        self.assertEqual(self.lua.execute('return CSLTypes.ModelManager.sharedInstance():getModel("main")._myScoutInfoList:get_Count()'),1)
 
     def test_selected_types_guard_claim_and_arrived_monster_skip(self):
         """Only an exact owned aim45 monster army may skip, and unselected rewards remain untouched."""

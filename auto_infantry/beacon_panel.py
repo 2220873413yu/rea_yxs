@@ -116,4 +116,4 @@ class BeaconPanel(ttk.Frame):
                     '返城中' if army['state']==9 else f"行动中（{army['state']}）",
                     f"{army['name']} / {army['army_id']}",display_time(army['end_ms']) if army['end_ms'] else '—'))
         for scout in snapshot.get('scouts',[]):
-            self.tree.insert('','end',values=('斥候',f"({scout['x']},{scout['y']})",'侦察中','—',display_time(scout['end_ms'])))
+            self.tree.insert('','end',values=('斥候',f"({scout['x']},{scout['y']})",'已侦察，等待事件更新','—','—'))

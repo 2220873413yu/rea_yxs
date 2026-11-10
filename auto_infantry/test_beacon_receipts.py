@@ -98,7 +98,11 @@ class BeaconReceiptTests(unittest.TestCase):
         sent=bytes.fromhex('1a00561100b50b')
         received=bytes.fromhex('0c1a0c1107d02900010a00561100b50b0b')
         result=self.log(11014,sent,received).wait_beacon_scout(86,181)
-        self.assertEqual(result['end_ms'],2000000)
+        self.assertEqual(result['end_ms'],2000)
+        # Replay the magnitude observed in the real receipt; it is already an epoch millisecond value.
+        epoch=1794278362771
+        live=bytes.fromhex('0c1a0c13')+epoch.to_bytes(8,'big')+bytes.fromhex('2900010a00561100b50b0b')
+        self.assertEqual(self.log(11014,sent,live).wait_beacon_scout(86,181)['end_ms'],epoch)
         for a,b in ((sent.replace(bytes.fromhex('0056'),bytes.fromhex('0057')),received),
                     (sent,received.replace(bytes.fromhex('0056'),bytes.fromhex('0057')))):
             with self.assertRaises(RuntimeError):self.log(11014,a,b).wait_beacon_scout(86,181)

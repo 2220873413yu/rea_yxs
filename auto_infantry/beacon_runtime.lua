@@ -184,11 +184,14 @@ function api.beacon_snapshot()
  assert(r[1]==0,'Beacon information refused: '..tostring(r[1]))
  acceptInfo(r);queryPending=false
  assert(type(r[6])=='number' and r[6]>0 and r[6]==math.floor(r[6]),'Beacon queue capacity unknown')
- local events,armies={},{}
+ local events,armies,treasures={},{},{}
  local home=map:getMyMainCityCoordinates()
  for i=0,r[4]:get_Count()-1 do local e=r[4]:get_Item(i)
   local c=assert(search:searchTMapIntelStation_Event_Map(e[2]),'Beacon event config missing')
   local p=e[1][1];local shown=CSLTypes.SLGMapUtils.logicToDisplay(p)
+  if c[2]==2 and (e[3]==0 or e[3]==1 or e[3]==2) then
+   treasures[shown[1]..':'..shown[2]]=e[1][2]
+  end
   events[#events+1]=encode({event_id=e[1][2],config_id=e[2],kind=c[2],state=e[3],army_id=e[4],
    start_ms=e[5]*1000,end_ms=e[6]*1000,x=shown[1],y=shown[2],
    distance=CSLTypes.SLGMapUtils.calMapP2PDistance(home,p),visible=visible(p)})
@@ -203,7 +206,11 @@ function api.beacon_snapshot()
    armies[#armies+1]=encode({army_id=a[1],hero_id=id,name=h.name,state=a[4],target_id=a[6],end_ms=a[11]})
   end
  end
- local scouts={};if native.scoutStages then for _,s in ipairs(native.scoutStages()) do scouts[#scouts+1]=encode(s) end end
+ -- A cached scout record alone cannot keep a completed/removed treasure visible as a pending task.
+ local scouts={};if native.scoutStages then for _,s in ipairs(native.scoutStages()) do
+  local eventId=treasures[s.x..':'..s.y]
+  if eventId then scouts[#scouts+1]=encode({event_id=eventId,x=s.x,y=s.y,end_ms=s.end_ms}) end
+ end end
  return '{"ready":true,"server_now_ms":'..string.format('%.0f',nowMs())..
   ',"refresh_end_ms":'..string.format('%.0f',refreshEnd)..',"queue_limit":'..r[6]..',"queue_used":'..used..
   ',"returning_count":'..returning..',"queue_full":'..tostring(used>=r[6] or main:checkMaxFengHuoTaiArmyCount())..

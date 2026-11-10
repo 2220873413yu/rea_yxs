@@ -204,8 +204,8 @@ class BeaconServiceTests(unittest.TestCase):
         self.s.request_check();self.s.tick(self.c)
         self.assertEqual(self.c.beacon_action.call_args.args[0],'claim')
 
-    def test_type_rotation_and_scout_deadline_are_server_based(self):
-        """Selected types rotate; a scout path contributes its server seconds-derived deadline."""
+    def test_type_rotation_does_not_treat_scout_cache_expiry_as_completion(self):
+        """Selected types rotate, while scout cache lifetime never schedules a false event-completion check."""
         self.snapshot['events']=[event(kind=1),event(11,kind=3)]
         self.c.query_beacon_candidates.return_value=dict(heroes=[dict(hero_id=303,ready=True,power=100,
                                                                     speed=300,load=40000,travel_seconds=5)])
@@ -213,7 +213,7 @@ class BeaconServiceTests(unittest.TestCase):
         self.assertEqual(self.c.beacon_action.call_args.args[1],11)
         self.snapshot['scouts']=[dict(x=86,y=69,end_ms=120000)]
         stages=beacon_schedule(self.snapshot,self.roster,(2,))['stages']
-        self.assertTrue(any(s['army_id']<-1000000000 and s['end_ms']==120000 for s in stages))
+        self.assertFalse(any(s['army_id']<-1000000000 for s in stages))
 
     def test_passive_watch_failure_stops_only_beacon_before_planning(self):
         """A local Lua getter error must not escape to Worker and disconnect unrelated automation."""

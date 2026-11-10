@@ -173,7 +173,7 @@ class GameResponseLog:
                     raise RuntimeError('侦察返回路径与目标不符，不重发')
                 if not isinstance(info.get(1),(int,float)) or info[1]<=0:
                     raise RuntimeError('侦察返回结束时间无效，不重发')
-                return dict(ret=0,logic_x=x,logic_y=y,end_ms=info[1]*1000)
+                return dict(ret=0,logic_x=x,logic_y=y,end_ms=info[1])
             time.sleep(.1)
         raise TimeoutError('侦察结果不明，已停止且不自动重发')
 

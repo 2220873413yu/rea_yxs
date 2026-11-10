@@ -22,9 +22,8 @@ def beacon_schedule(snapshot, roster, kinds=(1,)):
             stages.append(dict(army_id=-event['event_id']-100, state=6, end_ms=event['end_ms']))
     if snapshot['refresh_end_ms'] > 0:
         stages.append(dict(army_id=-1, state=2, end_ms=snapshot['refresh_end_ms']))
-    if 2 in kinds:
-        for scout in snapshot.get('scouts',[]):
-            stages.append(dict(army_id=-1000000000-scout['x']*1000-scout['y'],state=2,end_ms=scout['end_ms']))
+    # Scout cache lifetime can exceed treasure completion; it is not an event/arrival deadline.
+    # Treasure completion is reconciled by existing event pushes, manual checks and beacon refresh.
     finishes = [h['finish_ms'] for h in roster['heroes'] if h.get('found') and not h.get('busy') and
                 h.get('hero_state') == 0 and h.get('finish_ms', 0) > snapshot['server_now_ms']]
     if finishes and any(e['kind'] in kinds and e['kind']!=2 and e['state'] == 0 for e in snapshot['events']):
