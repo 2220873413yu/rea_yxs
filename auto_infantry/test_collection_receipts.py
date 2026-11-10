@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from connection import Connection
+from collection import CollectionReplan
 from game_log import GameResponseLog
 from test_hero_recovery import hero_state, hero_roster
 
@@ -56,7 +57,8 @@ class DispatchTransportTests(unittest.TestCase):
         connection.response_log.wait_collection.return_value = dict(hero_id=303, target_id=2792, army_id=123)
         connection.collection_call = Mock(side_effect=lambda op,*args: {'stages':[dict(
             army_id=123,hero_id=303,target_id=2792,aim=1,state=2)]} if op=='collect_schedule' else 'sent')
-        connection.refresh_heroes = Mock(return_value=hero_roster(hero_state(busy=True, hero_state=1)))
+        connection.refresh_heroes = Mock(side_effect=lambda:hero_roster(hero_state(
+            remaining_ms=0,busy=bool(connection.collection_call.call_count),hero_state=1 if connection.collection_call.call_count else 0)))
         target = dict(target_id=2792, kind=3, level=2, detail_seq=1, available_seq=1, scope_radius=20, x=101, y=191)
         receipt, roster = connection.dispatch_collection({'target': target}, 303, 9)
         self.assertEqual(receipt['army_id'], 123)
@@ -88,13 +90,25 @@ class DispatchTransportTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 c=Connection();c.response_log=Mock()
                 c.response_log.wait_collection.return_value=dict(hero_id=303,target_id=2792,army_id=123)
-                c.refresh_heroes=Mock(return_value=hero_roster(hero_state(busy=True,hero_state=1)))
+                c.refresh_heroes=Mock(side_effect=[hero_roster(hero_state(remaining_ms=0)),hero_roster(hero_state(busy=True,hero_state=1))])
                 row={**dict(army_id=123,hero_id=303,target_id=2792,aim=1,state=2),**changes}
                 c.collection_call=Mock(side_effect=lambda op,*args: {'stages':[row]} if op=='collect_schedule' else 'sent')
                 target=dict(target_id=2792,kind=3,level=2,detail_seq=1,available_seq=1,scope_radius=20,x=101,y=191)
                 with self.assertRaisesRegex(RuntimeError,'目标'):
                     c.dispatch_collection({'target':target},303,9)
                 self.assertEqual(sum(call.args[0]=='collect_dispatch' for call in c.collection_call.call_args_list),1)
+
+    def test_busy_preflight_and_native_unsent_guard_never_wait_for_receipt(self):
+        """Only explicit unsent conditions can replan; no native send happens for a known occupied hero."""
+        target=dict(target_id=2792,kind=3,level=2,detail_seq=1,available_seq=1,scope_radius=20,x=101,y=191)
+        for busy in (True,False):
+            with self.subTest(busy=busy):
+                c=Connection();c.response_log=Mock()
+                c.refresh_heroes=Mock(return_value=hero_roster(hero_state(busy=busy,remaining_ms=0)))
+                c.collection_call=Mock(return_value='collection_replan:stale')
+                with self.assertRaises(CollectionReplan):c.dispatch_collection({'target':target},303,9)
+                self.assertEqual(c.collection_call.call_count,0 if busy else 1)
+                c.response_log.wait_collection.assert_not_called()
 
 
 if __name__ == '__main__':

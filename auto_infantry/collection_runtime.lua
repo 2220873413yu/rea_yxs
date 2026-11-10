@@ -220,7 +220,8 @@ function api.collect_status()
  local world=api.read_hero_state()
  local queue=api.read_collection_queue(world)
  local state={detail_seq=detailSeq,available_seq=availableSeq,target_id=pendingTarget or 0,ready=false,observer_error=observerFailed,
-  queue_free=queue.queue_free,queue_used=queue.queue_used,queue_known=queue.queue_known,queue_limit=queue.queue_limit}
+  queue_free=queue.queue_free,queue_used=queue.queue_used,queue_known=queue.queue_known,queue_limit=queue.queue_limit,
+  queue_reason=queue.queue_reason}
  if detail and available then
   local now=clock():GetCurrentServerTime()*1000
   local point=detail[2][1]
@@ -378,10 +379,13 @@ function api.collect_dispatch(target,heroId,kind,level,expectedDetail,expectedAv
  assert(target==pendingTarget and detail and available,'Collection target changed')
  assert(expectedDetail==detailSeq and expectedAvailable==availableSeq,'Collection query generation changed')
  local raw=api.read_hero_state(heroId)
- assert(raw.found and raw.fresh and raw.army_known and not raw.busy and raw.hero_state==0 and raw.remaining_ms<=0,
-  'Collection hero is not ready')
+ if not (raw.found and raw.fresh and raw.army_known and not raw.busy and raw.hero_state==0 and raw.remaining_ms<=0) then
+  return 'collection_replan:hero_state'
+ end
  local now=clock():GetCurrentServerTime()*1000
- assert(now>=detailAt and now>=availableAt and now-detailAt<=3000 and now-availableAt<=3000,'Collection data is stale')
+ if not (now>=detailAt and now>=availableAt and now-detailAt<=3000 and now-availableAt<=3000) then
+  return 'collection_replan:stale'
+ end
  local point=detail[2][1]
  local display=CSLTypes.SLGMapUtils.logicToDisplay(point[1][1])
  assert(display[1]==expectedX and display[2]==expectedY,'Collection coordinates changed')
@@ -411,8 +415,9 @@ function api.collect_dispatch(target,heroId,kind,level,expectedDetail,expectedAv
     (h[5]==best[5] and (h[3]<best[3] or (h[3]==best[3] and id<best[1][1][3]))))) then best=h end
   end
  end
- assert(best and best[1][1][3]==heroId and methods('SLGChooseHeroItem').getActionState(best)==0,
-  'Fastest available hero changed or still recovering')
+ if not (best and best[1][1][3]==heroId and methods('SLGChooseHeroItem').getActionState(best)==0) then
+  return 'collection_replan:selection'
+ end
  -- The native selection scene uses this hero's first soldier option, not a universal infantry ID.
  local options=best[2]
  assert(type(options)=='table' and options.get_Count and options:get_Count()>0,'Hero follower options are unavailable')

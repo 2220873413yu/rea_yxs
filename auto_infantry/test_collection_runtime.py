@@ -101,7 +101,19 @@ class CollectionLuaTests(unittest.TestCase):
 
     def dispatch(self, detail=1, available=1, radius=20, x=101, y=191):
         """Call only the fake world's production guard and return its success/error pair."""
-        return self.lua.execute(f'return pcall(REA_AUTO_INFANTRY.collect_dispatch,2792,303,3,2,{detail},{available},{radius},{x},{y})')
+        ok,result=self.lua.execute(f'return pcall(REA_AUTO_INFANTRY.collect_dispatch,2792,303,3,2,{detail},{available},{radius},{x},{y})')
+        return ok and result=='collection_sent',result
+
+    def test_expired_hero_is_explicitly_unsent_and_refresh_allows_same_target(self):
+        """Reproduce fresh target/expired hero without sending, then confirm one send after a bounded read refresh."""
+        self.prepare()
+        self.lua.execute('Game.time=Game.time+3001;REA_AUTO_INFANTRY.collect_query(2792)')
+        ok,result=self.dispatch(detail=2,available=2)
+        self.assertFalse(ok);self.assertEqual(result,'collection_replan:hero_state')
+        self.assertEqual(len(self.lua.globals().Game.trips),0)
+        self.lua.execute('REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_list()')
+        self.assertTrue(self.dispatch(detail=2,available=2)[0])
+        self.assertEqual(len(self.lua.globals().Game.trips),1)
 
     def test_only_normal_two_follower_collection_packet_is_sent_once(self):
         """A permitted plan sends aim1, exact target, selected hero and two one-unit infantry entries."""
@@ -259,6 +271,26 @@ class CollectionLuaTests(unittest.TestCase):
         state = json.loads(self.lua.execute('return REA_AUTO_INFANTRY.collect_status()'))
         self.assertEqual(state['queue_limit'], 3)
         self.assertFalse(state['queue_free'])
+
+    def test_three_of_four_with_expired_state_is_stale_not_full(self):
+        """Fresh resource replies must not disguise expired hero/army evidence as a full queue."""
+        self.prepare()
+        self.lua.execute('local main=CSLTypes.ModelManager.sharedInstance():getModel(CSLTypes.SLGMainModel);'
+                         'main.getMaxCollectionArmyCount=function() return 4 end;'
+                         'main._myActionState={[1]=0,[2]=list({{[5]=1,[4]=6,[15]={[1]=303}},'
+                         '{[5]=1,[4]=6,[15]={[1]=305}},{[5]=1,[4]=6,[15]={[1]=114}}}),[3]=list({})};'
+                         'Game.time=Game.time+3001;REA_AUTO_INFANTRY.collect_query(2792)')
+        state=json.loads(self.lua.execute('return REA_AUTO_INFANTRY.collect_status()'))
+        self.assertEqual((state['queue_used'],state['queue_limit']),(3,4))
+        self.assertFalse(state['queue_free']);self.assertTrue(state['fresh'])
+        self.assertEqual(state['queue_reason'],'stale')
+
+    def test_native_block_is_distinct_from_full_capacity(self):
+        """Respect the native gate even if it disagrees with visible counts, without labeling it full."""
+        self.prepare('Game.finish=0;Game.queueFull=true')
+        state=json.loads(self.lua.execute('return REA_AUTO_INFANTRY.collect_status()'))
+        self.assertFalse(state['queue_free'])
+        self.assertEqual(state['queue_reason'],'native_blocked')
 
     def test_only_own_native_pushes_increment_a_local_counter_without_game_actions(self):
         """Foreign, malformed and ordinary query notifications cannot generate push-driven requests."""

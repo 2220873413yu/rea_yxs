@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from collection import CollectionOptions, candidate_targets, best_collector, quantity_allowed, collection_slot_available, active_resource_targets
+from collection import CollectionOptions, CollectionReplan, candidate_targets, best_collector, quantity_allowed, collection_slot_available, active_resource_targets
 from controller import Worker
 from test_hero_recovery import hero_state, hero_roster
 from game_log import GameResponseLog
@@ -207,6 +207,55 @@ class SharedRecoveryTests(unittest.TestCase):
             self.worker.switch_hero(True, (303,))
         self.worker.switch_collection(True, CollectionOptions())
         self.worker.collection.tick(self.game)
+
+    def test_unsent_busy_hero_replans_to_next_hero_without_closing(self):
+        """A hero occupied after selection causes one bounded recheck and a new eligible selection."""
+        self.game.states[303]['remaining_ms']=0
+        original=self.game.dispatch_collection
+        attempts=[]
+        def dispatch(metrics,hero_id,generation):
+            """Simulate a pre-send race once, then use the real fake sender to verify selection."""
+            attempts.append(hero_id)
+            if len(attempts)==1:
+                self.game.states[303].update(busy=True,hero_state=1)
+                raise CollectionReplan('definitely unsent')
+            return original(metrics,hero_id,generation)
+        self.game.dispatch_collection=dispatch
+        self.start(normal=False)
+        self.assertTrue(self.worker.collection.enabled);self.assertEqual(self.game.departures,[])
+        self.clock.return_value=101;self.worker.collection.tick(self.game)
+        self.assertEqual(attempts,[303,305]);self.assertEqual(self.game.departures,[305])
+        self.assertTrue(self.worker.collection.enabled)
+
+    def test_repeated_unsent_changes_wait_for_event_not_fixed_retries(self):
+        """Persistent preflight changes retain the master but stop automatic rechecks after one retry."""
+        self.game.states[303]['remaining_ms']=0
+        self.game.dispatch_collection=Mock(side_effect=CollectionReplan('definitely unsent'))
+        self.start(normal=False)
+        self.clock.return_value=101;self.worker.collection.tick(self.game)
+        for now in (102,103,9999):
+            self.clock.return_value=now;self.worker.collection.tick(self.game)
+        self.assertTrue(self.worker.collection.enabled)
+        self.assertEqual(self.game.dispatch_collection.call_count,2)
+        self.assertEqual(self.game.departures,[])
+
+    def test_expired_target_queue_status_rechecks_without_reporting_full(self):
+        """A3/4 stale preflight goes through bounded refresh instead of waiting as though all slots are used."""
+        self.game.states[303]['remaining_ms']=0
+        original=self.game.query_collection
+        reads=[]
+        def query(target):
+            """Expire only the first target's hero/army evidence after the earlier capacity snapshot."""
+            result=original(target);reads.append(target)
+            if len(reads)==1:
+                result['target'].update(queue_free=False,queue_reason='stale',queue_used=3,queue_limit=4)
+            return result
+        self.game.query_collection=query
+        self.start(normal=False)
+        self.assertTrue(self.worker.collection.enabled);self.assertEqual(self.game.departures,[])
+        self.assertEqual(self.worker.collection.due,0)
+        self.clock.return_value=101;self.worker.collection.tick(self.game)
+        self.assertEqual(self.game.departures,[303]);self.assertEqual(len(reads),2)
 
     def test_overlapping_sources_charge_only_once_per_confirmed_item(self):
         """Two sources for303 produce two needed items, not two parallel two-item sequences."""

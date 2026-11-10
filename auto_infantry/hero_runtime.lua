@@ -186,8 +186,16 @@ function api.read_collection_queue(world)
  end
  local limit=type(main.getMaxCollectionArmyCount)=='function' and main:getMaxCollectionArmyCount() or -1
  known=known and type(limit)=='number' and limit>=0 and limit==math.floor(limit)
- local free=known and world.fresh and type(main.checkMaxCollectionArmyCount)=='function' and main:checkMaxCollectionArmyCount()~=true
- return {queue_used=known and used or -1,queue_limit=limit,queue_known=known,queue_free=free}
+ local nativeKnown=type(main.checkMaxCollectionArmyCount)=='function'
+ local blocked=nativeKnown and main:checkMaxCollectionArmyCount()==true
+ -- An expired snapshot is not a full queue; keep counts visible while denying unverified departures.
+ local reason='available'
+ if not known or not nativeKnown then reason='unknown'
+ elseif not world.fresh then reason='stale'
+ elseif used>=limit then reason='full'
+ elseif blocked then reason='native_blocked' end
+ return {queue_used=known and used or -1,queue_limit=limit,queue_known=known,
+  queue_free=reason=='available',queue_reason=reason}
 end
 
 -- Export the server roster; selection is caller-owned and new heroes are never auto-selected.

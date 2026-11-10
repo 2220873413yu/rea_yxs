@@ -3,7 +3,7 @@ import threading
 import time
 from dataclasses import replace
 
-from collection import CollectionOptions, CollectionRun, candidate_targets, best_collector, quantity_allowed, collection_slot_available, active_resource_targets, RESOURCE_NAMES
+from collection import CollectionOptions, CollectionRun, CollectionReplan, collection_queue_reason, candidate_targets, best_collector, quantity_allowed, collection_slot_available, active_resource_targets, RESOURCE_NAMES
 from collection_wakeup import CollectionWakeup
 from collection_display import team_snapshot
 from game_log import ResourceMissing
@@ -21,6 +21,7 @@ class CollectionService:
         self.run = None
         self.due = 0
         self.queue_blocked = False
+        self.preflight_replans = 0
         self.attributes_requested = threading.Event()
         self.wakeup = CollectionWakeup()
 
@@ -38,6 +39,7 @@ class CollectionService:
             self.epoch += 1
             self.due = 0
             self.queue_blocked = False
+            self.preflight_replans = 0
             self.wakeup = CollectionWakeup()
             if self.owner.connection is not None and (prior_enabled or self.enabled):
                 self.owner.connection.set_collection_enabled(self.enabled)
@@ -148,9 +150,10 @@ class CollectionService:
                 self.queue_blocked = not queue['queue_free']
                 self.observe(roster)
                 if self.queue_blocked:
+                    reason = collection_queue_reason(queue)
                     run.needs_recovery = False
                     self.owner.sync_recovery_gate()
-                    self.owner.publish(collection_status=f"采集队列已满或状态不明（上限 {queue['queue_limit']}）；{self.schedule_status()}")
+                    self.owner.publish(collection_status=f"{reason}（上限 {queue['queue_limit']}）；{self.schedule_status()}")
                     return
                 if run.recovery_hero:
                     self.owner.sync_recovery_gate()
@@ -182,9 +185,10 @@ class CollectionService:
                             collection_teams=team_snapshot(schedule, roster, self.wakeup, observed_at),
                             collection_teams_epoch=epoch)
                         if self.queue_blocked:
+                            reason = collection_queue_reason(queue)
                             run.needs_recovery = False
                             self.owner.sync_recovery_gate()
-                            self.owner.publish(collection_status='资源已定位，但采集额度已满或未知；' + self.schedule_status())
+                            self.owner.publish(collection_status='资源已定位，' + reason + '；' + self.schedule_status())
                             return
             else:
                 rows = connection.collection_candidates(run.options.kind, run.options.level, run.options.radius)
@@ -213,7 +217,7 @@ class CollectionService:
                         run.plan = None
                         run.needs_recovery = False
                         self.owner.sync_recovery_gate()
-                        reason = '采集额度已满或未知' if self.queue_blocked else '已有采集队伍收益或类型未确认'
+                        reason = collection_queue_reason(queue) if self.queue_blocked else '已有采集队伍收益或类型未确认'
                         self.owner.publish(collection_status=reason + '；' + self.schedule_status())
                         return
                 candidates = candidate_targets(rows, run.options, run.blocked, time.monotonic(),
@@ -241,10 +245,11 @@ class CollectionService:
                             target['y'] != candidate['y']):
                         raise RuntimeError('采集目标数据或范围不符，未派出')
                     if not target['queue_free']:
+                        reason = collection_queue_reason(target)
                         self.queue_blocked = True
                         run.needs_recovery = False
                         self.owner.sync_recovery_gate()
-                        self.owner.publish(collection_status='采集队列已满；' + self.schedule_status())
+                        self.owner.publish(collection_status=reason + '；' + self.schedule_status())
                         return
                     if not collection_slot_available(target) or target['quantity'] <= 0:
                         run.blocked[candidate['target_id']] = time.monotonic() + 30
@@ -276,6 +281,7 @@ class CollectionService:
                     run.needs_recovery = False
                     self.owner.sync_recovery_gate()
                     self.due = 0
+                    self.preflight_replans = 0
                 self.owner.publish(collection_status=f"已确认{hero['name']}出征采集，继续监控队列")
                 return
             with self.owner.guard:
@@ -296,6 +302,24 @@ class CollectionService:
                 message += '；' + self.schedule_status()
             else:
                 message = '暂无符合条件的可采点；' + self.schedule_status()
+            self.owner.publish(collection_status=message)
+        except CollectionReplan as error:
+            # Only a typed, definitely-unsent result reaches here; transport/receipt errors still stop below.
+            with self.owner.guard:
+                if not self.alive(run, epoch):
+                    return
+                run.plan = None
+                run.needs_recovery = False
+                self.owner.sync_recovery_gate()
+                if self.preflight_replans == 0:
+                    self.preflight_replans = 1
+                    self.wakeup.pending = True
+                    self.due = 0
+                    message = '派出前英雄或资料已变化，重新核对并选人（未发送出征请求）'
+                else:
+                    self.preflight_replans = 0
+                    self.wakeup.pending = False
+                    message = '派出前状态持续变化，保持采集开启；' + self.schedule_status()
             self.owner.publish(collection_status=message)
         except Exception as error:
             with self.owner.guard:

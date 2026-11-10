@@ -184,7 +184,7 @@ end
 -- Share exact response attribution with saved-resource loading; validation itself never sends anything.
 function api.hunt_region_assert(seq,x,y)
  world();local vx,vy=regionView()
- assert(regionSeq==seq and regionX==x and regionY==y and vx==x and vy==y,'Regional response changed')
+ assert(regionSeq==seq and regionX==x and regionY==y and vx==x and vy==y,'HUNT_REGION_CONFLICT: Regional response changed')
  return 'region_confirmed'
 end
 
@@ -429,7 +429,9 @@ function api.hunt_dispatch(id,heroId,soldierId,n,expectedDetail,expectedAvailabl
  api.hunt_metrics()
  local now=clock():GetCurrentServerTime()*1000
  assert(id==target and expectedDetail==detailSeq and expectedAvailable==availableSeq,'Hunt query generation changed')
- assert(now-detailAt<=3000 and now-availableAt<=3000,'Hunt target data expired')
+ if not (now>=detailAt and now>=availableAt and now-detailAt<=3000 and now-availableAt<=3000) then
+  return 'hunt_replan:stale'
+ end
  assert(detail[4]==0 and visible(detail[6]) and idle(detail[6]),'Monster is hidden or occupied')
  local shown=CSLTypes.SLGMapUtils.logicToDisplay(detail[6])
  assert(shown[1]==x and shown[2]==y,'Monster moved')
@@ -438,7 +440,9 @@ function api.hunt_dispatch(id,heroId,soldierId,n,expectedDetail,expectedAvailabl
  local known,used,limit=combatQueue()
  assert(known and used<limit and main:checkMaxCombateArmyCount()==false,'Attack queues are full or unknown')
  local s=api.read_hero_state(heroId)
- assert(s.found and s.fresh and s.army_known and not s.busy and s.hero_state==0 and s.remaining_ms<=0,'Hero unavailable')
+ if not (s.found and s.fresh and s.army_known and not s.busy and s.hero_state==0 and s.remaining_ms<=0) then
+  return 'hunt_replan:hero'
+ end
  local armies=main._myActionState[2]
  for i=0,armies:get_Count()-1 do
   local a=armies:get_Item(i)
@@ -446,7 +450,7 @@ function api.hunt_dispatch(id,heroId,soldierId,n,expectedDetail,expectedAvailabl
  end
  local chosen
  for i=0,available[4]:get_Count()-1 do local h=available[4]:get_Item(i);if h[1][1][3]==heroId then chosen=h end end
- assert(chosen and methods('SLGChooseHeroItem').getActionState(chosen)==0,'Hero action changed')
+ if not (chosen and methods('SLGChooseHeroItem').getActionState(chosen)==0) then return 'hunt_replan:action' end
  local formation=defaultFormation(chosen,false)
  assert(formation.start_enabled and formation.followers>0,'Native default formation cannot start')
  assert(n==formation.followers and soldierId==formation.soldier_id,'Native default formation changed')

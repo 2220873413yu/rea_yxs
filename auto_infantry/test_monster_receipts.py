@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock
 
 from connection import Connection
+from monster import HuntReplan
 from game_log import GameResponseLog,HuntRejected
 from test_collection_receipts import request,response
 
@@ -64,6 +65,16 @@ class MonsterReceiptTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):log.wait_hunt(303,2792,timeout=0)
         with self.assertRaises(TimeoutError):log.wait_hunt_skip(123,2792,timeout=0)
         log.drain.assert_not_called()
+
+    def test_explicit_native_unsent_status_never_waits_for_a_receipt(self):
+        """The connection distinguishes native no-send returns from ambiguous transport failures."""
+        c=Connection();c.response_log=Mock();c.hunt_call=Mock(return_value='hunt_replan:hero')
+        target=dict(target_id=2792,detail_seq=1,available_seq=1,x=101,y=191)
+        formation=dict(hero_id=303,soldier_id=411,followers=2)
+        with self.assertRaises(HuntReplan):c.dispatch_hunt(target,formation,20,8)
+        c.hunt_call.assert_called_once();c.response_log.wait_hunt.assert_not_called()
+        c.hunt_call.side_effect=TimeoutError('RPC result unknown')
+        with self.assertRaises(TimeoutError):c.dispatch_hunt(target,formation,20,8)
 
     def test_transport_spending_categories_are_separate_from_collection(self):
         """Departures and skips both carry hunting generation; reads cannot smuggle Lua or string parameters."""

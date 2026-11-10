@@ -218,7 +218,19 @@ class MonsterLuaTests(unittest.TestCase):
 
     def send(self, n=2, target_id=2792, hero_id=303, seq=1):
         """Exercise the production main-thread final guard without allowing a real network request."""
-        return self.lua.execute(f'return pcall(REA_AUTO_INFANTRY.hunt_dispatch,{target_id},{hero_id},411,{n},{seq},{seq},20,{101+target_id-2792},191)')
+        ok,result=self.lua.execute(f'return pcall(REA_AUTO_INFANTRY.hunt_dispatch,{target_id},{hero_id},411,{n},{seq},{seq},20,{101+target_id-2792},191)')
+        return ok and result=='hunt_departure_submitted',result
+
+    def test_unavailable_hero_reports_unsent_without_setting_submission(self):
+        """A real pre-send cooldown race returns a typed status, permitting only a newly checked departure."""
+        self.prepare()
+        self.lua.execute('Game.finish=Game.time+60000;REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_list()')
+        ok,result=self.send()
+        self.assertFalse(ok);self.assertEqual(result,'hunt_replan:hero')
+        self.assertEqual(len(self.lua.globals().Game.trips),0)
+        self.lua.execute('Game.finish=0;REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_list();REA_AUTO_INFANTRY.hunt_query(2792)')
+        self.assertTrue(self.send(seq=2)[0])
+        self.assertEqual(len(self.lua.globals().Game.trips),1)
 
     def test_native_default_count_and_strong_side_metrics(self):
         """The native two-troop default qualifies; weak-side labels cannot leak through."""

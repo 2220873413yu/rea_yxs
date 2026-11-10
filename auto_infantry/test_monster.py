@@ -2,10 +2,12 @@
 import math
 import threading
 import unittest
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
-from monster import HuntOptions, default_formation, ordered_targets, ring_for
+from monster import HuntOptions, HuntReplan, default_formation, ordered_targets, ring_for
 from monster_service import MonsterService
+from region_conflict import RegionConflict,RegionRestoreConflict
 
 
 def target(**changes):
@@ -87,6 +89,28 @@ class MonsterServiceTests(unittest.TestCase):
         self.c.skip_hunt.return_value={'ret':0,'won':True,'target_id':1,'army_id':10}
         self.service.switch(True,HuntOptions())
 
+    def test_explicit_unsent_race_requeries_and_selects_new_hero_once(self):
+        """Only a proven unsent rejection clears uncertainty and rebuilds the candidate formation."""
+        revised={**self.metrics,'formations':[{**plan(),'hero_id':305}]}
+        self.c.query_monster.side_effect=[self.metrics,revised]
+        self.c.dispatch_hunt.side_effect=[HuntReplan('unsent'),
+            ({'ret':0,'hero_id':305,'target_id':1,'army_id':10},{'heroes':[]})]
+        self.tick(100)
+        self.assertTrue(self.service.enabled);self.assertFalse(self.service.uncertain)
+        self.assertEqual(self.c.query_monster.call_count,2)
+        self.assertEqual(self.c.dispatch_hunt.call_args.args[1]['hero_id'],305)
+        self.assertIn(10,self.service.active)
+
+    def test_persistent_unsent_race_pauses_search_without_unknown_action_latch(self):
+        """Two pre-send rejections keep the master and existing armies, without automatic third attempts."""
+        self.c.dispatch_hunt.side_effect=HuntReplan('unsent')
+        self.tick(100)
+        self.assertTrue(self.service.enabled);self.assertFalse(self.service.uncertain)
+        self.assertTrue(self.service.search_paused)
+        self.assertFalse(self.service.automatic_start_blocked())
+        self.tick(102)
+        self.assertEqual(self.c.dispatch_hunt.call_count,2)
+
     def call(self, op, arguments=()):
         """Return local watch and fresh server schedules; all mutation seams are separately mocked."""
         if op=='hunt_watch':return {'seq':0,'home_x':100,'home_y':60,'candidates':[target()]}
@@ -147,6 +171,76 @@ class MonsterServiceTests(unittest.TestCase):
         self.c.dispatch_hunt.assert_called_once()
         self.assertEqual(self.c.dispatch_hunt.call_args.args[0]['target_id'],2)
         self.assertFalse(self.service.ignored)
+
+    def test_confirmed_dispatch_survives_restore_conflict_and_still_skips_arrival(self):
+        """Replay receipt21335 followed by cleanup failure: keep the army and never repeat its departure."""
+        t={**target(),'logic_x':99,'logic_y':66}
+        original=self.c.hunt_call.side_effect
+        self.c.hunt_call.side_effect=lambda op,args=(): [t] if op=='hunt_candidates' else original(op,args)
+        self.c.query_monster.return_value={**self.metrics,'target':t}
+        @contextmanager
+        def scope(*args):
+            yield
+            raise RegionRestoreConflict('native camera replaced restoration')
+        self.c.hunt_target_region.side_effect=scope
+        self.tick(100)
+        self.assertTrue(self.service.enabled)
+        self.assertTrue(self.service.search_paused)
+        self.assertIn(10,self.service.active)
+        army=dict(army_id=10,hero_id=303,target_id=1,aim=3,state=2,end_ms=1006000)
+        self.schedule.update(stages=[army],monsters=[army],queue_used=1,queue_limit=4)
+        self.tick(101)
+        reads=self.c.refresh_heroes.call_count
+        for at in (102,103,104):self.tick(at)
+        self.assertEqual(self.c.refresh_heroes.call_count,reads)
+        army['state']=3;self.tick(108)
+        self.c.skip_hunt.assert_called_once()
+        self.c.dispatch_hunt.assert_called_once()
+
+    def test_persistent_conflict_ignores_camera_only_changes_without_server_polling(self):
+        """A moving view cannot make the paused service continuously requery the same failed scan."""
+        region=dict(x=20,y=15,min_distance=0,distance=0)
+        self.service.discovery.plan([region])
+        view=[target()]
+        original=self.c.hunt_call.side_effect
+        self.c.hunt_call.side_effect=lambda op,args=(): {**original(op,args),'candidates':view} if op=='hunt_watch' else original(op,args)
+        self.c.query_hunt_region.side_effect=RegionConflict('persistent camera race')
+        self.tick(100)
+        self.assertTrue(self.service.enabled);self.assertTrue(self.service.search_paused)
+        reads=self.c.refresh_heroes.call_count
+        for at in range(101,120):
+            view[:]=[{**target(),'target_id':at}]
+            self.tick(at)
+        self.assertEqual(self.c.refresh_heroes.call_count,reads)
+        self.c.query_hunt_region.assert_called_once()
+        self.service.request_check();self.tick(121)
+        self.assertEqual(self.c.query_hunt_region.call_count,2)
+
+    def test_unsent_target_region_rechecked_only_once(self):
+        """An initial load conflict repeats the complete read path once without resubmitting any action."""
+        t={**target(),'logic_x':99,'logic_y':66}
+        original=self.c.hunt_call.side_effect
+        self.c.hunt_call.side_effect=lambda op,args=(): [t] if op=='hunt_candidates' else original(op,args)
+        self.c.query_monster.return_value={**self.metrics,'target':t}
+        calls=[]
+        @contextmanager
+        def scope(*args):
+            calls.append(1)
+            if len(calls)==1:raise RegionConflict('first read replaced')
+            yield
+        self.c.hunt_target_region.side_effect=scope
+        self.tick(100)
+        self.assertEqual(len(calls),2)
+        self.c.query_monster.assert_called_once()
+        self.c.dispatch_hunt.assert_called_once()
+
+    def test_uncertain_action_cannot_be_reclassified_as_retryable_region_read(self):
+        """Once the departure boundary is entered, even a region exception must close the switch without replay."""
+        self.c.dispatch_hunt.side_effect=RegionConflict('failure at action boundary')
+        self.tick(100)
+        self.assertFalse(self.service.enabled)
+        self.assertTrue(self.service.uncertain)
+        self.c.dispatch_hunt.assert_called_once()
 
     def test_waiting_target_does_not_block_unqueried_far_region(self):
         """Keep expanding the finite scan frontier when the only known near target cannot be planned."""

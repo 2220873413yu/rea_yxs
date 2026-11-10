@@ -3,9 +3,10 @@ import time
 from contextlib import nullcontext
 
 from collection_wakeup import CollectionWakeup
-from monster import HuntOptions, default_formation, ordered_targets, ring_for
+from monster import HuntOptions, HuntReplan, default_formation, ordered_targets, ring_for
 from monster_discovery import MonsterDiscovery
 from monster_refresh import MonsterRefresh
+from region_conflict import RegionConflict,RegionRestoreConflict
 
 
 class MonsterService:
@@ -36,6 +37,7 @@ class MonsterService:
         self.auto_suspended = False
         self.auto_block_notified = False
         self.auto_start_epoch = None
+        self.search_paused = False
 
     def switch(self, enabled, options=None):
         """Clear weak exclusions on enable and revoke old commands while retaining accepted armies."""
@@ -59,6 +61,7 @@ class MonsterService:
             self.wakeup = CollectionWakeup()
             self.candidates = None
             self.waiting.clear()
+            self.search_paused = False
             self.signature = None
             self.poll_due = 0
             self.refresh = MonsterRefresh()
@@ -71,6 +74,7 @@ class MonsterService:
         """Recheck temporary blockers without clearing confirmed weak coordinates from the current run."""
         with self.owner.guard:
             if self.enabled:
+                self.search_paused = False
                 self.wakeup.pending = True
                 self.candidates = None
                 self.waiting.clear()
@@ -133,6 +137,7 @@ class MonsterService:
         signature = tuple(sorted((r['hero_id'], r.get('busy'), r.get('hero_state'), r.get('finish_ms'),
                                   r.get('remaining_ms', 0) <= 0, r.get('power')) for r in roster['heroes']))
         if self.enabled and self.hero_signature is not None and self.hero_signature != signature:
+            self.search_paused = False
             self.wakeup.pending = True
             self.candidates = None
             self.waiting.clear()
@@ -156,6 +161,7 @@ class MonsterService:
             full = (watch.get('queue_known') is True and type(watch.get('queue_used')) is int and
                     type(watch.get('queue_limit')) is int and watch['queue_used'] >= watch['queue_limit'])
             if not full:
+                self.search_paused = False
                 self.wakeup.pending = True
             else:
                 self.publish('已到地图配置刷新时刻，等待出征空位后重新扫描；是否刷新以服务器返回为准')
@@ -167,7 +173,11 @@ class MonsterService:
         signature = (watch['seq'], home, tuple(watch.get('troops', ())), watch.get('queue_used'), watch.get('queue_limit'),
                      tuple(sorted((r['target_id'], r['config_id'], r['visible'], r['idle']) for r in watch['candidates'])),
                      watch.get('queue_known'))
-        if self.signature is not None and self.signature != signature:
+        # A changing camera/candidate cache alone must not restart searches after persistent region conflicts.
+        state_changed=(self.signature is not None and
+                       (self.signature[:5]!=signature[:5] or self.signature[6]!=signature[6]))
+        if self.signature is not None and self.signature != signature and (not self.search_paused or state_changed):
+            self.search_paused = False
             self.wakeup.pending = True
             self.candidates = None
             self.waiting.clear()
@@ -212,6 +222,9 @@ class MonsterService:
                     return
                 self.due = self.wakeup.schedule(schedule, time.monotonic())
             if self.advance_armies(connection, schedule, epoch, generation) or not self.alive(epoch):
+                return
+            if self.search_paused:
+                self.publish('新增搜索已暂停；已确认队伍继续跟踪，等待部队/英雄状态变化、刷新时刻或立即检查')
                 return
             if not schedule['can_skip']:
                 raise RuntimeError('当前账号未具备游戏原生跳过战斗权限，未派出')
@@ -263,18 +276,55 @@ class MonsterService:
             ring = ring_for(candidate['distance'], self.options.radius)
             self.publish(f"正在检查主城{ring}格内目标（{candidate['x']},{candidate['y']}），优先近处")
             connection.prepare_collection()
-            scope = connection.hunt_target_region(candidate, self.options.radius, generation) if 'logic_x' in candidate else nullcontext()
-            with scope:
-                self.attack_candidate(connection, candidate, schedule, epoch, generation)
-        except Exception as error:
+            self.attack_with_region_recheck(connection,candidate,schedule,epoch,generation)
+        except HuntReplan:
             with self.owner.guard:
-                if not self.alive(epoch):
-                    return
-                self.switch(False)
-            note = ('；请求结果不明，不会定时恢复' if self.automatic_start_blocked() else
-                    '；定时开启已暂停，请检查连接' if self.auto_suspended else
-                    '；下个地图刷新时刻将尝试自动开启')
-            self.publish('打野已停止：' + str(error).splitlines()[0] + note, hunt_enabled=False, error=str(error))
+                if not self.alive(epoch):return
+                self.search_paused=True
+                self.candidates=None
+                self.wakeup.pending=False
+            self.publish('派出前英雄或资料持续变化，暂停新增搜索；未发送出征，现有队伍继续跟踪，等待状态变化或立即检查')
+        except RegionConflict as error:
+            if self.automatic_start_blocked():
+                self.stop_on_error(epoch,error)
+                return
+            with self.owner.guard:
+                if not self.alive(epoch):return
+                self.search_paused=True
+                self.candidates=None
+                self.wakeup.pending=False
+            self.publish('地图响应冲突，暂停新增搜索；已确认出征不重发，现有队伍继续跟踪；等待状态变化或立即检查',
+                         action='hunt_region_pause',region_phase='restore' if isinstance(error,RegionRestoreConflict) else 'read',
+                         region_error=str(error))
+        except Exception as error:
+            self.stop_on_error(epoch,error)
+
+    def stop_on_error(self,epoch,error):
+        """Stop session/spending failures independently of recoverable read conflicts, preserving unknown-result latches."""
+        with self.owner.guard:
+            if not self.alive(epoch):return
+            self.switch(False)
+        note = ('；请求结果不明，不会定时恢复' if self.automatic_start_blocked() else
+                '；定时开启已暂停，请检查连接' if self.auto_suspended else
+                '；下个地图刷新时刻将尝试自动开启')
+        self.publish('打野已停止：' + str(error).splitlines()[0] + note, hunt_enabled=False, error=str(error))
+
+    def attack_with_region_recheck(self,connection,candidate,schedule,epoch,generation):
+        """Repeat only an unsent target read once; restored-map failures and unknown actions never replay a departure."""
+        for attempt in range(2):
+            if not self.alive(epoch):return
+            try:
+                scope=connection.hunt_target_region(candidate,self.options.radius,generation) if 'logic_x' in candidate else nullcontext()
+                with scope:self.attack_candidate(connection,candidate,schedule,epoch,generation)
+                return
+            except RegionRestoreConflict:raise
+            except HuntReplan:
+                if attempt or self.automatic_start_blocked():raise
+                connection.refresh_heroes()
+                self.publish('派出前英雄或资料已变化，重新核对并选人一次；未发送出征请求')
+            except RegionConflict:
+                if attempt or self.automatic_start_blocked():raise
+                self.publish('目标区域有变化，重新核对一次；不复用旧详情或阵容')
 
     def attack_candidate(self, connection, candidate, schedule, epoch, generation):
         """Requery a loaded catalog target and preserve native eligibility, reservations and attributed receipts."""
@@ -299,7 +349,12 @@ class MonsterService:
                 self.reject_plan(t, metrics, ring_for(candidate['distance'], self.options.radius), schedule)
                 return
             self.uncertain = True
-        receipt, after = connection.dispatch_hunt(t, plan, self.options.radius, generation)
+        try:
+            receipt, after = connection.dispatch_hunt(t, plan, self.options.radius, generation)
+        except HuntReplan:
+            # Only a typed native pre-send result can clear the action latch; RPC/receipt failures cannot.
+            with self.owner.guard:self.uncertain = False
+            raise
         with self.owner.guard:
             self.active[receipt['army_id']] = {**receipt, 'name': plan['name'], 'x': t['x'], 'y': t['y'],
                                                 'followers': plan['followers'], 'skipped': False, 'skip_attempted': False,
@@ -379,6 +434,7 @@ class MonsterService:
                 self.due = 0
             return True
         if changed and self.alive(epoch):
+            self.search_paused=False
             self.due = 0
             self.publish('已有队伍返回，按当前服务器额度补队，重新优先近处目标')
         return False

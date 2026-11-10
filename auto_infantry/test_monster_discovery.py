@@ -1,9 +1,10 @@
 """Verify independent sightings and bounded exact-generation region reads without any game connection."""
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock,patch
 
 from connection import Connection
 from monster_discovery import MonsterDiscovery
+from region_conflict import RegionConflict,RegionRestoreConflict
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -77,8 +78,76 @@ class RegionConnectionTests(unittest.TestCase):
         """A timeout or another region response never becomes an empty successful search result."""
         c=Connection();c.hunt_call=Mock(return_value=dict(seq=3,last_x=92,last_y=231,view_x=92,view_y=231))
         with self.assertRaises(TimeoutError):c._load_hunt_region(92,231,timeout=0)
-        c.hunt_call=Mock(side_effect=[dict(seq=3), 'sent',dict(seq=4,last_x=100,last_y=231,view_x=100,view_y=231)])
-        with self.assertRaisesRegex(RuntimeError,'其他地图查询'):c._load_hunt_region(92,231)
+        foreign=dict(seq=4,last_x=100,last_y=231,view_x=100,view_y=231)
+        c.hunt_call=Mock(side_effect=lambda op,args=(),**kw: 'sent' if op=='hunt_region_query' else foreign)
+        clock=iter([0,0,.1,.2,.3,.4])
+        # The old generation cannot satisfy a same-center read, even after another region arrives.
+        c.hunt_call.side_effect=[dict(seq=3),'sent',foreign,foreign,foreign]
+        with patch('connection.time.monotonic',side_effect=lambda:next(clock)),patch('connection.time.sleep'):
+            with self.assertRaises(RegionConflict):c._load_hunt_region(92,231,timeout=.3)
+
+    def test_foreign_reply_before_expected_reply_is_waited_without_resend(self):
+        """Replay two interleaved map replies; only a new matching center can satisfy the current read."""
+        c=Connection()
+        foreign=dict(seq=4,last_x=184,last_y=126,view_x=184,view_y=126)
+        expected=dict(seq=5,last_x=216,last_y=103,view_x=216,view_y=103)
+        c.hunt_call=Mock(side_effect=[dict(seq=3),'sent',foreign,expected])
+        with patch('connection.time.sleep'):
+            self.assertEqual(c._load_hunt_region(216,103),expected)
+        self.assertEqual(sum(call.args[0]=='hunt_region_query' for call in c.hunt_call.call_args_list),1)
+
+    def test_restore_conflict_preserves_primary_uncertain_error(self):
+        """A cleanup collision must never turn an unknown departure into a retryable read-only failure."""
+        c,state,sends=self.connection()
+        original=c._load_hunt_region
+        def load(x,y,**kwargs):
+            if (x,y)==(88,162):raise RegionConflict('restore collision')
+            return original(x,y,**kwargs)
+        c._load_hunt_region=load
+        with self.assertRaisesRegex(TimeoutError,'uncertain departure'):
+            with c._hunt_region_scope(92,231):raise TimeoutError('uncertain departure')
+
+    def test_native_camera_response_already_restored_view_is_not_overwritten(self):
+        """After a camera move loads another area, cleanup must not issue a competing restoration request."""
+        c,state,sends=self.connection()
+        state.update(camera_x=86,camera_y=156)
+        with c._hunt_region_scope(92,231):
+            state.update(seq=2,last_x=184,last_y=126,view_x=184,view_y=126,camera_x=184,camera_y=125)
+        self.assertEqual(sends,[(92,231)])
+
+    def test_conflicted_region_read_retries_once_and_never_marks_foreign_data_empty(self):
+        """A generation conflict redoes discovery at most once; both attempts retain exact-center guards."""
+        c,state,sends=self.connection()
+        original=c.hunt_call.side_effect
+        failures=[0]
+        def call(op,args=(),**kwargs):
+            if op=='hunt_region_read':
+                failures[0]+=1
+                if failures[0]==1:raise RegionConflict('cache changed between state and read')
+            return original(op,args)
+        c.hunt_call.side_effect=call
+        self.assertEqual(len(c.query_hunt_region(dict(x=92,y=231),90)),1)
+        self.assertEqual(sends,[(92,231),(88,162),(92,231),(88,162)])
+
+    def test_post_read_restore_failure_is_typed_without_replaying_read(self):
+        """A successful body followed by a cleanup conflict has a distinct phase and no immediate replay."""
+        c,state,sends=self.connection()
+        original=c._load_hunt_region
+        def load(x,y,**kwargs):
+            if (x,y)==(88,162):raise RegionConflict('restore replaced')
+            return original(x,y,**kwargs)
+        c._load_hunt_region=load
+        with self.assertRaises(RegionRestoreConflict):c.query_hunt_region(dict(x=92,y=231),90)
+        self.assertEqual(sends,[(92,231)])
+
+    def test_only_read_guard_can_be_classified_as_retryable_conflict(self):
+        """An identical error string at a spending boundary is not permission to replay that command."""
+        c=Connection();c.script=Mock()
+        c.script.exports_sync.query.side_effect=RuntimeError('HUNT_REGION_CONFLICT: Regional response changed')
+        with self.assertRaises(RegionConflict):c.hunt_call('hunt_region_read',(90,1,92,231))
+        with self.assertRaises(RuntimeError) as raised:c.hunt_call('hunt_dispatch',(1,))
+        self.assertNotIsInstance(raised.exception,RegionConflict)
+        self.assertEqual(c.script.exports_sync.query.call_count,2)
 
     def test_scan_queries_share_the_revocable_gate_but_cleanup_is_read_only(self):
         """Stop/off-on cancels queued new-area work; the original-cache restoration may still complete."""

@@ -15,6 +15,9 @@ from hero_preferences import checked_heroes
 from game_log import GameResponseLog, ResourceMissing, BeaconCapacityUnavailable
 from account_lock import ensure_account_available
 from player_profile_cache import PlayerProfileCache
+from collection import CollectionReplan
+from monster import HuntReplan
+from region_conflict import RegionConflict,RegionRestoreConflict
 
 ROOT = Path(__file__).resolve().parent
 
@@ -348,6 +351,8 @@ class Connection:
                                                            hero_id, generation)
                 return json.loads(value) if operation in readable else value
             except Exception as error:
+                if operation=='hunt_region_read' and 'HUNT_REGION_CONFLICT:' in str(error):
+                    raise RegionConflict('读取前地图区域再次改变，需重新核对') from error
                 # These exact Lua guards precede all native callbacks and submission markers.
                 # Never retry a dispatch, transport timeout, server refusal or ambiguous skip.
                 guard = {'hunt_schedule': 'Fresh own-army response required',
@@ -357,7 +362,7 @@ class Connection:
                 self.refresh_heroes()
 
     def _load_hunt_region(self, x, y, timeout=6, generation=None, collection_generation=None):
-        """Read one exact24/18 area under the caller's gate; cleanup loads remain independently read-only."""
+        """Await the matching new response within one bounded deadline, tolerating interleaved foreign areas."""
         before = self.hunt_call('hunt_region_state')
         if collection_generation is not None:
             self.collection_call('collect_region_query', (x, y), collection_generation)
@@ -366,39 +371,60 @@ class Connection:
         else:
             self.hunt_call('hunt_region_query', (x, y), generation)
         deadline = time.monotonic() + timeout
+        foreign=None
         while time.monotonic() < deadline:
             state = self.hunt_call('hunt_region_state')
             if state['seq'] > before['seq']:
                 if (state['last_x'], state['last_y'], state['view_x'], state['view_y']) != (x, y, x, y):
-                    raise RuntimeError('其他地图查询替换了本次区域响应，未出征')
-                return state
+                    foreign=(state['last_x'],state['last_y'])
+                else:return state
             time.sleep(.1)
+        if foreign is not None:
+            raise RegionConflict(f'区域核对冲突：预期({x},{y})，最近收到{foreign}；本次未采用异区数据')
         raise TimeoutError('地图区域查询超时，未继续扫描或出征')
 
     @contextmanager
     def _hunt_region_scope(self, x, y, generation=None, collection_generation=None):
-        """Scope hunting or resource lookup to a temporary cache, preserving the user's current camera area."""
+        """Restore only our temporary view, respect a newly loaded camera area and never mask a primary action error."""
         original = self.hunt_call('hunt_region_state')
         origin = (original['view_x'], original['view_y'])
         if any(type(v) is not int or v < 0 for v in origin):
             raise RuntimeError('原地图区域未知，未开始区域查询')
+        state=None
+        primary=None
         try:
             state = self._load_hunt_region(x, y, generation=generation, collection_generation=collection_generation)
             yield state
+        except BaseException as error:
+            primary=error
+            raise
         finally:
-            latest = self.hunt_call('hunt_region_state')
-            camera = (latest.get('camera_x'), latest.get('camera_y'))
-            camera_moved = (all(type(v) is int and v >= 0 for v in camera) and
-                            camera != (original.get('camera_x'), original.get('camera_y')))
-            # Respect a user camera move made during the read instead of restoring an obsolete area.
-            if origin != (x, y) or camera_moved:
-                self._load_hunt_region(*(camera if camera_moved else origin))
+            try:
+                latest = self.hunt_call('hunt_region_state')
+                camera = (latest.get('camera_x'), latest.get('camera_y'))
+                camera_moved = (all(type(v) is int and v >= 0 for v in camera) and
+                                camera != (original.get('camera_x'), original.get('camera_y')))
+                native_view_loaded=(state is not None and latest['seq']>state['seq'] and camera_moved and
+                                    (latest['view_x'],latest['view_y'])!=(x,y))
+                # Native camera loading already took ownership; do not race it with an exact-center restore.
+                if not native_view_loaded and (origin != (x, y) or camera_moved):
+                    self._load_hunt_region(*(camera if camera_moved else origin))
+            except Exception as cleanup:
+                if primary is None:
+                    if isinstance(cleanup,(RegionConflict,TimeoutError)):
+                        raise RegionRestoreConflict('恢复地图区域未确认：'+str(cleanup)) from cleanup
+                    raise
 
     def query_hunt_region(self, region, radius, generation=None):
-        """Return independent sightings from one confirmed response, restoring the previous region before return."""
+        """Retry only a conflicted read once; post-read restoration failures never replay a successful operation."""
         x, y = region['x'], region['y']
-        with self._hunt_region_scope(x, y, generation) as state:
-            return self.hunt_call('hunt_region_read', (radius, state['seq'], x, y))
+        for attempt in range(2):
+            try:
+                with self._hunt_region_scope(x, y, generation) as state:
+                    return self.hunt_call('hunt_region_read', (radius, state['seq'], x, y))
+            except RegionRestoreConflict:raise
+            except RegionConflict:
+                if attempt:raise
 
     @contextmanager
     def hunt_target_region(self, target, radius, generation=None):
@@ -447,9 +473,11 @@ class Connection:
             self.response_log = GameResponseLog(ADB)
         self.response_log.drain()
         hero_id, target_id = formation['hero_id'], target['target_id']
-        self.hunt_call('hunt_dispatch', (target_id, hero_id, formation['soldier_id'], formation['followers'],
+        outcome=self.hunt_call('hunt_dispatch', (target_id, hero_id, formation['soldier_id'], formation['followers'],
                                         target['detail_seq'], target['available_seq'], radius, target['x'], target['y']),
                        generation, hero_id)
+        if outcome in ('hunt_replan:hero','hunt_replan:stale','hunt_replan:action'):
+            raise HuntReplan('打野英雄或资料已变化，原生确认尚未发送出征请求')
         receipt = self.response_log.wait_hunt(hero_id, target_id)
         roster = self.refresh_heroes()
         self.hunt_call('hunt_ack', (target_id, hero_id, receipt['army_id']))
@@ -695,17 +723,24 @@ class Connection:
         raise TimeoutError('采集目标或选将数据查询超时，未派出')
 
     def dispatch_collection(self, metrics, hero_id, generation):
-        """Send once, then bind the exact accepted army/hero/aim/target in fresh own actions before another team."""
+        """Refresh hero/army eligibility before one send; only explicit unsent guards permit replanning."""
         checked_heroes((hero_id,))
         target = metrics['target']
         if self.response_log is None:
             raise RuntimeError('采集响应日志尚未准备，未派出')
+        before = self.refresh_heroes()
+        hero = next((row for row in before['heroes'] if row['hero_id'] == hero_id), None)
+        if (hero is None or not hero.get('found') or not hero.get('fresh') or not hero.get('army_known') or
+                hero.get('busy') or hero.get('hero_state') != 0 or hero.get('remaining_ms',1)>0):
+            raise CollectionReplan('采集英雄状态已变化，尚未发送出征请求')
         self.response_log.drain()
         arguments = (target['target_id'], hero_id, target['kind'], target['level'],
                      target['detail_seq'], target['available_seq'], target['scope_radius'], target['x'], target['y'])
         if target.get('balance_guard'):
             arguments += (1,)
-        self.collection_call('collect_dispatch', arguments, generation, hero_id)
+        outcome = self.collection_call('collect_dispatch', arguments, generation, hero_id)
+        if outcome in ('collection_replan:hero_state','collection_replan:stale','collection_replan:selection'):
+            raise CollectionReplan('采集派出前资料或选将已变化，尚未发送出征请求')
         receipt = self.response_log.wait_collection(hero_id, target['target_id'])
         roster = self.refresh_heroes()
         hero = next((row for row in roster['heroes'] if row['hero_id'] == hero_id), None)

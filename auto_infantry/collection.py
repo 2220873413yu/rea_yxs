@@ -5,6 +5,21 @@ from resource_preferences import checked_coordinates
 RESOURCE_NAMES = {1: '粮', 2: '木', 3: '铁'}
 
 
+class CollectionReplan(RuntimeError):
+    """A confirmed pre-send eligibility change permits bounded replanning, never replay of a sent request."""
+
+
+def collection_queue_reason(state):
+    """Separate unavailable capacity from expired evidence; only fresh counts may be described as full."""
+    reason=state.get('queue_reason')
+    if reason=='stale':
+        raise CollectionReplan('英雄或部队资料已过期，尚未发送出征请求')
+    if reason=='native_blocked':return '原生采集规则暂不允许派出，队伍数量尚未满'
+    if reason=='unknown':return '采集队伍资料未确认'
+    if reason=='full':return '采集队列已满'
+    return '采集队列已满或状态不明'
+
+
 @dataclass(frozen=True)
 class CollectionOptions:
     """Freeze one run's resource scope; fixed coordinates use the game's display coordinate system."""

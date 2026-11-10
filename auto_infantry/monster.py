@@ -4,6 +4,10 @@ from dataclasses import dataclass
 MAX_HUNT_RADIUS = 200
 
 
+class HuntReplan(RuntimeError):
+    """A native pre-send check proved no hunt request was submitted; fresh selection is permitted."""
+
+
 @dataclass(frozen=True)
 class HuntOptions:
     """Bound one run to loaded ordinary monsters within a user-visible distance from home."""
