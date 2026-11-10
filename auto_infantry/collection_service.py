@@ -70,6 +70,7 @@ class CollectionService:
             if self.enabled:
                 self.wakeup.pending = True
                 self.run.blocked.clear()
+                self.run.continuing_discovery = False
 
     def remove_missing_target(self, run, epoch, candidate, error):
         """Persist only a matched6001 deletion within this active run; stop if its approved list becomes empty."""
@@ -134,6 +135,9 @@ class CollectionService:
             with self.owner.guard:
                 if not self.alive(run, epoch) or not self.wakeup.begin(time.monotonic(), self.due):
                     return
+                if not run.continuing_discovery:
+                    run.scanned_regions.clear()
+                run.continuing_discovery = False
                 self.due = float('inf')
             roster = connection.refresh_heroes()
             self.owner.publish(hero_roster=roster)
@@ -163,33 +167,13 @@ class CollectionService:
             # A full queue needs only hero/army confirmation, not another barrack/resource batch.
             connection.prepare_collection()
             if run.options.mode == 'list':
-                self.owner.publish(collection_status='正在定位清单资源，按区域加载未缓存坐标…')
-                located = connection.collection_list_candidates(run.options.coordinates, generation,
-                                                                lambda: not self.alive(run, epoch))
-                if not self.alive(run, epoch):
-                    return
-                rows = located['rows']
-                if located['regions_loaded']:
-                    # Region loads may outlive the old hero snapshot; recheck capacity and destinations once.
-                    roster = connection.refresh_heroes()
-                    schedule = connection.collection_call('collect_schedule')
-                    queue = connection.collection_call('collect_status')
-                    with self.owner.guard:
-                        if not self.alive(run, epoch):
-                            return
-                        observed_at = time.monotonic()
-                        self.due = self.wakeup.schedule(schedule, observed_at)
-                        self.queue_blocked = not queue['queue_free']
-                        self.observe(roster)
-                        self.owner.publish(hero_roster=roster, collection_queue=queue,
-                            collection_teams=team_snapshot(schedule, roster, self.wakeup, observed_at),
-                            collection_teams_epoch=epoch)
-                        if self.queue_blocked:
-                            reason = collection_queue_reason(queue)
-                            run.needs_recovery = False
-                            self.owner.sync_recovery_gate()
-                            self.owner.publish(collection_status='资源已定位，' + reason + '；' + self.schedule_status())
-                            return
+                # Discovery survives the game's single-area cache; each departure still queries live detail.
+                saved=set(run.options.coordinates)
+                run.located={p:r for p,r in run.located.items() if p in saved}
+                for row in connection.collection_candidates(0,0,0):
+                    if (row['x'],row['y']) in saved:run.located[(row['x'],row['y'])]=row
+                rows=list(run.located.values())
+                self.owner.publish(collection_status=f'先核对已定位清单资源（{len(rows)}/{len(saved)}点），有合格点直接补队')
             else:
                 rows = connection.collection_candidates(run.options.kind, run.options.level, run.options.radius)
             candidates = candidate_targets(rows, run.options, run.blocked, time.monotonic(),
@@ -229,7 +213,9 @@ class CollectionService:
                     if not self.alive(run, epoch):
                         return
                 try:
-                    metrics = connection.query_collection(candidate['target_id'])
+                    # Prepare the log cursor first, then refresh activity immediately before target reads.
+                    metrics, roster = connection.query_collection_candidate(candidate['target_id'])
+                    if not self.alive(run,epoch):return
                 except ResourceMissing as error:
                     if not self.remove_missing_target(run, epoch, candidate, error):
                         return
@@ -260,8 +246,7 @@ class CollectionService:
                         continue
                     hero = best_collector(metrics, roster)
                     if hero is None:
-                        self.owner.publish(collection_status='没有可用采集英雄；' + self.schedule_status())
-                        return
+                        continue
                     state = next(row for row in roster['heroes'] if row['hero_id'] == hero['hero_id'])
                     run.reserve(target, hero, state)
                     self.owner.sync_recovery_gate()
@@ -282,6 +267,7 @@ class CollectionService:
                     self.owner.sync_recovery_gate()
                     self.due = 0
                     self.preflight_replans = 0
+                    run.continuing_discovery = True
                 self.owner.publish(collection_status=f"已确认{hero['name']}出征采集，继续监控队列")
                 return
             with self.owner.guard:
@@ -290,6 +276,24 @@ class CollectionService:
                     run.needs_recovery = False
                     self.owner.sync_recovery_gate()
             if run.options.mode == 'list':
+                # Only an exhausted eligible cached batch may extend the finite discovery frontier.
+                self.owner.publish(collection_status='已定位点暂无合格可采目标，继续加载一个未确认区域…')
+                located=connection.collection_list_candidates(run.options.coordinates,generation,
+                    lambda:not self.alive(run,epoch),known_rows=tuple(run.located.values()),
+                    skip_regions=run.scanned_regions,max_regions=1)
+                with self.owner.guard:
+                    if not self.alive(run,epoch):return
+                    discovered_rows=[r for r in located['rows'] if (r['x'],r['y']) in run.options.coordinates]
+                    discovered=any((r['x'],r['y']) not in run.located for r in discovered_rows)
+                    for row in discovered_rows:run.located[(row['x'],row['y'])]=row
+                    run.scanned_regions.update(map(tuple,located['regions_checked']))
+                    if located['regions_loaded'] or discovered:
+                        # A completed finite read schedules its next decision; elapsed time alone never scans again.
+                        run.continuing_discovery=True
+                        self.due=0
+                        self.owner.publish(action='collection_region_loaded',regions_loaded=located['regions_loaded'],
+                            located_points=len(run.located),collection_status='区域已确认，自动继续核对并补队，无需点击立即检查')
+                        return
                 loaded = {(row['x'], row['y']) for row in rows} & set(run.options.coordinates)
                 message = f'清单{len(run.options.coordinates)}点，本次已定位{len(loaded)}点；暂无合格可采点'
                 if balance:
@@ -313,14 +317,16 @@ class CollectionService:
                 self.owner.sync_recovery_gate()
                 if self.preflight_replans == 0:
                     self.preflight_replans = 1
+                    run.continuing_discovery = True
                     self.wakeup.pending = True
                     self.due = 0
-                    message = '派出前英雄或资料已变化，重新核对并选人（未发送出征请求）'
+                    message = str(error)+'；重新核对并选人一次'
                 else:
                     self.preflight_replans = 0
                     self.wakeup.pending = False
-                    message = '派出前状态持续变化，保持采集开启；' + self.schedule_status()
-            self.owner.publish(collection_status=message)
+                    message = str(error)+'；本轮核对后仍未就绪，保持开启；' + self.schedule_status()
+            self.owner.publish(action='collection_preflight_wait',preflight_reason=error.reason,
+                               preflight_recheck=self.preflight_replans,collection_status=message)
         except Exception as error:
             with self.owner.guard:
                 if not self.alive(run, epoch):

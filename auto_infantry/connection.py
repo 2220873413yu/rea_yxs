@@ -667,8 +667,8 @@ class Connection:
         """Read only loaded resource points; never expand the map silently or select an enemy army."""
         return self.collection_call('collect_candidates', (kind, level, radius))
 
-    def collection_list_candidates(self, coordinates, generation, cancelled=None):
-        """Locate saved points across missing regions once per triggered check, keeping results outside the game cache."""
+    def collection_list_candidates(self, coordinates, generation, cancelled=None, *, known_rows=(), skip_regions=(), max_regions=None):
+        """Locate missing saved points in bounded region batches, preserving caller-owned discovery across checks."""
         saved = set(map(tuple, coordinates))
         found = {}
         def merge(rows):
@@ -677,13 +677,19 @@ class Connection:
                 point = (row['x'], row['y'])
                 if point in saved:
                     found[point] = row
+        merge(known_rows)
         merge(self.collection_candidates(0, 0, 0))
         missing = sorted(saved - found.keys())
         loaded = 0
+        checked = []
         if missing and not (cancelled and cancelled()):
             plan = self.collection_call('collect_region_plan', tuple(value for p in missing for value in p))
             for region in plan['regions']:
                 if cancelled and cancelled():
+                    break
+                if (region['x'],region['y']) in skip_regions:
+                    continue
+                if max_regions is not None and loaded >= max_regions:
                     break
                 if all(tuple(p) in found for p in region['coordinates']):
                     continue
@@ -693,13 +699,26 @@ class Connection:
                         break
                     merge(self.collection_call('collect_region_read', (state['seq'], x, y)))
                     loaded += 1
-        return {'rows': list(found.values()), 'regions_loaded': loaded}
+                    checked.append((x,y))
+        return {'rows': list(found.values()), 'regions_loaded': loaded, 'regions_checked': checked}
 
-    def query_collection(self, target_id, timeout=6):
+    def query_collection_candidate(self, target_id):
+        """Drain old traffic before refreshing activity, then read the target without a second pre-query drain."""
+        roster = None
+        def refresh_activity():
+            """Start the short eligibility window only after slow historical log preparation has finished."""
+            nonlocal roster
+            roster = self.refresh_heroes()
+        metrics = self.query_collection(target_id, before_query=refresh_activity)
+        return metrics, roster
+
+    def query_collection(self, target_id, timeout=6, *, before_query=None):
         """Match a resource wire reply, then await fresh native data; only an attributed6001 means missing."""
         if self.response_log is None:
             self.response_log = GameResponseLog(ADB)
         self.response_log.drain()
+        if before_query is not None:
+            before_query()
         before = self.collection_call('collect_status')
         self.collection_call('collect_query', (target_id,))
         try:
@@ -723,24 +742,30 @@ class Connection:
         raise TimeoutError('采集目标或选将数据查询超时，未派出')
 
     def dispatch_collection(self, metrics, hero_id, generation):
-        """Refresh hero/army eligibility before one send; only explicit unsent guards permit replanning."""
+        """Check the just-refreshed roster locally and send without aging resource detail through more network I/O."""
         checked_heroes((hero_id,))
         target = metrics['target']
         if self.response_log is None:
             raise RuntimeError('采集响应日志尚未准备，未派出')
-        before = self.refresh_heroes()
+        before = self.hero_call('hero_list')
         hero = next((row for row in before['heroes'] if row['hero_id'] == hero_id), None)
         if (hero is None or not hero.get('found') or not hero.get('fresh') or not hero.get('army_known') or
                 hero.get('busy') or hero.get('hero_state') != 0 or hero.get('remaining_ms',1)>0):
-            raise CollectionReplan('采集英雄状态已变化，尚未发送出征请求')
-        self.response_log.drain()
+            reason=('hero_missing' if hero is None else 'hero_stale' if not hero.get('fresh') else
+                    'army_unknown' if not hero.get('army_known') else 'hero_busy' if hero.get('busy') or hero.get('hero_state')!=0
+                    else 'hero_cooling')
+            raise CollectionReplan('采集英雄尚未就绪（'+reason+'），尚未发送出征请求',reason=reason)
+        # query_collection drained before its reads. Keep that cursor: a competing dispatch must be detected,
+        # not erased, and another ADB drain here could expire both resource and hero evidence.
         arguments = (target['target_id'], hero_id, target['kind'], target['level'],
                      target['detail_seq'], target['available_seq'], target['scope_radius'], target['x'], target['y'])
         if target.get('balance_guard'):
             arguments += (1,)
         outcome = self.collection_call('collect_dispatch', arguments, generation, hero_id)
         if outcome in ('collection_replan:hero_state','collection_replan:stale','collection_replan:selection'):
-            raise CollectionReplan('采集派出前资料或选将已变化，尚未发送出征请求')
+            reason=outcome.split(':',1)[1]
+            label={'hero_state':'英雄或部队状态变化','stale':'资源或选将详情已过期','selection':'最快采集英雄已变化'}[reason]
+            raise CollectionReplan(label+'，尚未发送出征请求',reason=reason)
         receipt = self.response_log.wait_collection(hero_id, target['target_id'])
         roster = self.refresh_heroes()
         hero = next((row for row in roster['heroes'] if row['hero_id'] == hero_id), None)

@@ -85,6 +85,11 @@ class FakeCollectionGame:
         """Expose one known loaded target without expanding the map."""
         return [point()] if kind == 3 and level == 2 else []
 
+    def query_collection_candidate(self, target_id):
+        """Model the ordered read preparation while preserving each test's overridden target query seam."""
+        roster=self.refresh_heroes()
+        return self.query_collection(target_id),roster
+
     def query_collection(self, target_id):
         """Build fresh rates using current hero activity and optionally simulate user interruption."""
         if self.query_hook:
@@ -376,9 +381,9 @@ class ListCollectionGame(FakeCollectionGame):
         assert (kind, level, radius) == (0, 0, 0)
         return self.points
 
-    def collection_list_candidates(self, coordinates, generation, cancelled=None):
+    def collection_list_candidates(self, coordinates, generation, cancelled=None, **options):
         """Existing scenarios have all points cached; region-loading regressions override this transport seam."""
-        return {'rows': self.collection_candidates(0,0,0), 'regions_loaded': 0}
+        return {'rows': self.collection_candidates(0,0,0), 'regions_loaded': 0, 'regions_checked': []}
 
     def collection_balance(self, cancelled):
         """Exercise the real balancing policy with isolated authoritative manual/automatic army records."""
@@ -410,6 +415,31 @@ class ResourceListServiceTests(unittest.TestCase):
     """Run list decisions through the existing serialized service and shared recovery gate."""
 
     setUp = SharedRecoveryTests.setUp
+
+    def test_usable_cached_point_departs_without_loading_missing_regions(self):
+        """A known eligible point is sent before spending any request on an unrelated missing coordinate."""
+        self.game=ListCollectionGame();self.worker.connection=self.game
+        self.game.points=self.game.points[:1];self.game.live[1]={'quantity':50000}
+        self.game.states[303]['remaining_ms']=0
+        self.game.collection_list_candidates=Mock(side_effect=AssertionError('must use cached target first'))
+        self.start_list()
+        self.assertEqual(self.game.target_departures,[1])
+        self.game.collection_list_candidates.assert_not_called()
+
+    def test_empty_first_region_automatically_continues_then_fills_without_manual_check(self):
+        """Finite empty-region progress triggers the next batch; a later match departs without user input."""
+        self.game=ListCollectionGame();self.worker.connection=self.game
+        discovered=self.game.points[1];self.game.collection_candidates=lambda *args:[]
+        self.game.states[303]['remaining_ms']=0
+        self.game.collection_list_candidates=Mock(side_effect=[
+            {'rows':[],'regions_loaded':1,'regions_checked':[(20,15)]},
+            {'rows':[discovered],'regions_loaded':1,'regions_checked':[(60,15)]}])
+        self.start_list()
+        for now in (101,102):
+            self.clock.return_value=now;self.worker.collection.tick(self.game)
+        self.assertEqual(self.game.target_departures,[2])
+        self.assertEqual(self.game.collection_list_candidates.call_count,2)
+        self.assertEqual(self.worker.collection.run.scanned_regions,{(20,15),(60,15)})
 
     def test_balance_prefers_scarce_wood_over_nearer_iron(self):
         """The serial service chooses the scarce type, then retains nearest-point ordering within it."""
@@ -612,7 +642,9 @@ class ResourceListServiceTests(unittest.TestCase):
         self.game.schedule['stages']=[dict(army_id=120+i,hero_id=h,aim=1,state=6,target_id=i,end_ms=2000000)
                                       for i,h in ((1,303),(2,305))]
         self.game.collection_candidates=lambda *args:self.game.points[:2]
-        self.game.collection_list_candidates=Mock(return_value={'rows':self.game.points,'regions_loaded':1})
+        self.game.collection_list_candidates=Mock(side_effect=lambda *args,**kwargs:
+            {'rows':self.game.points,'regions_loaded':0 if kwargs.get('skip_regions') else 1,
+             'regions_checked':[] if kwargs.get('skip_regions') else [(20,15)]})
         self.worker.switch_collection(True,CollectionOptions(mode='list',coordinates=tuple(
             (r['x'],r['y']) for r in self.game.points)))
 
@@ -621,6 +653,8 @@ class ResourceListServiceTests(unittest.TestCase):
         self.setup_region_loading()
         self.worker.collection.tick(self.game)
         self.game.collection_list_candidates.assert_called_once()
+        self.assertEqual(self.game.departures,[])
+        self.clock.return_value=101;self.worker.collection.tick(self.game)
         self.assertEqual(self.game.queries,[3])
         self.assertEqual(self.game.target_departures,[3])
         self.assertEqual(self.game.departures,[306])
@@ -628,12 +662,13 @@ class ResourceListServiceTests(unittest.TestCase):
     def test_capacity_change_during_region_loading_and_full_initial_queue_do_not_depart(self):
         """A free slot observed before a slow load cannot authorize departure after manual dispatch fills it."""
         self.setup_region_loading()
-        def load(*args):
+        def load(*args,**kwargs):
             """Simulate a manual team consuming the last quota during the region response."""
             self.game.queue_free=False
-            return {'rows':self.game.points,'regions_loaded':1}
+            return {'rows':self.game.points,'regions_loaded':1,'regions_checked':[(20,15)]}
         self.game.collection_list_candidates.side_effect=load
         self.worker.collection.tick(self.game)
+        self.clock.return_value=101;self.worker.collection.tick(self.game)
         self.assertEqual(self.game.queries,[]);self.assertEqual(self.game.departures,[])
         self.setup_region_loading();self.game.queue_free=False
         self.worker.collection.tick(self.game)
@@ -642,10 +677,10 @@ class ResourceListServiceTests(unittest.TestCase):
     def test_stop_during_missing_point_loading_never_queries_or_departs_afterward(self):
         """Cancelling a saved-list lookup invalidates its result before any target or hero is selected."""
         self.setup_region_loading()
-        def load(*args):
+        def load(*args,**kwargs):
             """Return late data only after the user has closed the collection switch."""
             self.worker.switch_collection(False)
-            return {'rows':self.game.points,'regions_loaded':1}
+            return {'rows':self.game.points,'regions_loaded':1,'regions_checked':[(20,15)]}
         self.game.collection_list_candidates.side_effect=load
         self.worker.collection.tick(self.game)
         self.assertEqual(self.game.queries,[]);self.assertEqual(self.game.departures,[])
@@ -653,13 +688,15 @@ class ResourceListServiceTests(unittest.TestCase):
     def test_empty_loaded_regions_preserve_saved_points_and_wait_without_fixed_reload(self):
         """An area with no matching resource is not an attributed6001 and cannot delete a saved coordinate."""
         self.setup_region_loading()
-        self.game.collection_list_candidates.return_value={'rows':[],'regions_loaded':1}
+        self.game.collection_list_candidates.side_effect=lambda *args,**kwargs: (
+            {'rows':[],'regions_loaded':0 if kwargs.get('skip_regions') else 1,
+             'regions_checked':[] if kwargs.get('skip_regions') else [(20,15)]})
         with patch('collection_service.remove_coordinate') as remove:
             self.worker.collection.tick(self.game)
             for now in (101,110,130,160):
                 self.clock.return_value=now;self.worker.collection.tick(self.game)
             remove.assert_not_called()
-        self.game.collection_list_candidates.assert_called_once()
+        self.assertEqual(self.game.collection_list_candidates.call_count,2)
         self.assertEqual(len(self.worker.collection.run.options.coordinates),3)
         self.assertEqual(self.game.departures,[])
 

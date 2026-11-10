@@ -66,6 +66,21 @@ class CollectionRegionTests(unittest.TestCase):
         self.assertEqual(result['regions_loaded'],0)
         self.assertEqual(len(self.lua.globals().Game.areaQueries),0)
 
+    def test_region_batches_preserve_known_points_and_do_not_repeat_empty_regions(self):
+        """Each completed batch extends a finite frontier, preserving results across native cache restoration."""
+        first=self.c.collection_list_candidates(COORDS,9,max_regions=1)
+        self.assertEqual(first['regions_loaded'],1)
+        self.assertEqual(len(first['rows']),4)
+        second=self.c.collection_list_candidates(COORDS,9,known_rows=first['rows'],
+            skip_regions=set(map(tuple,first['regions_checked'])),max_regions=1)
+        self.assertEqual(second['regions_loaded'],1)
+        self.assertEqual({(r['x'],r['y']) for r in second['rows']},set(COORDS))
+        third=self.c.collection_list_candidates(COORDS,9,known_rows=second['rows'],max_regions=1)
+        self.assertEqual(third['regions_loaded'],0)
+        empty=self.c.collection_list_candidates(((200,50),),9,max_regions=1)
+        again=self.c.collection_list_candidates(((200,50),),9,skip_regions=empty['regions_checked'],max_regions=1)
+        self.assertEqual(empty['regions_loaded'],1);self.assertEqual(again['regions_loaded'],0)
+
     def test_cancel_after_first_response_restores_area_and_skips_remaining_regions(self):
         """Stopping a loaded lookup still cleans up the view, without starting any further discovery query."""
         cancelled=[False]

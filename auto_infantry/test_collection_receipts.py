@@ -1,5 +1,6 @@
 """Check that collection accepts only the requested server response and never retries uncertainty."""
 import unittest
+import json
 from unittest.mock import Mock, patch
 
 from connection import Connection
@@ -57,8 +58,8 @@ class DispatchTransportTests(unittest.TestCase):
         connection.response_log.wait_collection.return_value = dict(hero_id=303, target_id=2792, army_id=123)
         connection.collection_call = Mock(side_effect=lambda op,*args: {'stages':[dict(
             army_id=123,hero_id=303,target_id=2792,aim=1,state=2)]} if op=='collect_schedule' else 'sent')
-        connection.refresh_heroes = Mock(side_effect=lambda:hero_roster(hero_state(
-            remaining_ms=0,busy=bool(connection.collection_call.call_count),hero_state=1 if connection.collection_call.call_count else 0)))
+        connection.hero_call=Mock(return_value=hero_roster(hero_state(remaining_ms=0)))
+        connection.refresh_heroes=Mock(return_value=hero_roster(hero_state(remaining_ms=0,busy=True,hero_state=1)))
         target = dict(target_id=2792, kind=3, level=2, detail_seq=1, available_seq=1, scope_radius=20, x=101, y=191)
         receipt, roster = connection.dispatch_collection({'target': target}, 303, 9)
         self.assertEqual(receipt['army_id'], 123)
@@ -90,7 +91,8 @@ class DispatchTransportTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 c=Connection();c.response_log=Mock()
                 c.response_log.wait_collection.return_value=dict(hero_id=303,target_id=2792,army_id=123)
-                c.refresh_heroes=Mock(side_effect=[hero_roster(hero_state(remaining_ms=0)),hero_roster(hero_state(busy=True,hero_state=1))])
+                c.hero_call=Mock(return_value=hero_roster(hero_state(remaining_ms=0)))
+                c.refresh_heroes=Mock(return_value=hero_roster(hero_state(busy=True,hero_state=1)))
                 row={**dict(army_id=123,hero_id=303,target_id=2792,aim=1,state=2),**changes}
                 c.collection_call=Mock(side_effect=lambda op,*args: {'stages':[row]} if op=='collect_schedule' else 'sent')
                 target=dict(target_id=2792,kind=3,level=2,detail_seq=1,available_seq=1,scope_radius=20,x=101,y=191)
@@ -104,11 +106,62 @@ class DispatchTransportTests(unittest.TestCase):
         for busy in (True,False):
             with self.subTest(busy=busy):
                 c=Connection();c.response_log=Mock()
-                c.refresh_heroes=Mock(return_value=hero_roster(hero_state(busy=busy,remaining_ms=0)))
+                c.hero_call=Mock(return_value=hero_roster(hero_state(busy=busy,remaining_ms=0)))
+                c.refresh_heroes=Mock()
                 c.collection_call=Mock(return_value='collection_replan:stale')
                 with self.assertRaises(CollectionReplan):c.dispatch_collection({'target':target},303,9)
                 self.assertEqual(c.collection_call.call_count,0 if busy else 1)
                 c.response_log.wait_collection.assert_not_called()
+
+    def test_final_send_does_not_expire_fresh_target_with_refresh_or_log_read(self):
+        """Exercise the real Lua guard: final selection sends before any slow refresh or ADB log read."""
+        from test_collection_runtime import CollectionLuaTests
+        fixture=CollectionLuaTests();fixture.setUp();fixture.prepare()
+        c=Connection();c.response_log=Mock();order=[]
+        c.response_log.drain.side_effect=AssertionError('late log read would expire the target')
+        c.hero_call=Mock(side_effect=lambda *args:json.loads(fixture.lua.execute('return REA_AUTO_INFANTRY.hero_list()')))
+        def refresh():
+            """Model a slow post-receipt refresh, which is safe only after the native sender ran."""
+            order.append('refresh');fixture.lua.execute('Game.time=Game.time+3001')
+            return hero_roster(hero_state(busy=True,hero_state=1))
+        c.refresh_heroes=Mock(side_effect=refresh)
+        def call(op,args=(),*extra):
+            """Keep the production Lua send guard and isolate only the accepted army confirmation."""
+            if op=='collect_schedule':return {'stages':[dict(army_id=123,hero_id=303,target_id=2792,aim=1,state=2)]}
+            order.append('send')
+            return fixture.lua.execute('return REA_AUTO_INFANTRY.'+op+'('+','.join(map(str,args))+')')
+        c.collection_call=call
+        c.response_log.wait_collection.return_value=dict(hero_id=303,target_id=2792,army_id=123)
+        target=dict(target_id=2792,kind=3,level=2,detail_seq=1,available_seq=1,scope_radius=20,x=101,y=191)
+        c.dispatch_collection({'target':target},303,9)
+        self.assertEqual(order,['send','refresh'])
+        self.assertEqual(len(fixture.lua.globals().Game.trips),1)
+        c.response_log.drain.assert_not_called()
+
+    def test_slow_query_log_drain_precedes_hero_refresh_and_does_not_expire_capacity(self):
+        """Replay a4s log read with production query/Lua: activity must be refreshed after that delay."""
+        from test_collection_runtime import CollectionLuaTests
+        fixture=CollectionLuaTests();fixture.setUp();fixture.prepare()
+        c=Connection();c.response_log=Mock();order=[]
+        def drain():
+            """Simulate the measured pre-query log overhead without contacting ADB or a server."""
+            order.append('drain');fixture.lua.execute('Game.time=Game.time+4000')
+        def refresh():
+            """Refresh native snapshot generations after the historical log read completes."""
+            order.append('refresh')
+            fixture.lua.execute('REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_list()')
+            return json.loads(fixture.lua.execute('return REA_AUTO_INFANTRY.hero_list()'))
+        def call(op,args=(),*extra):
+            """Use real Lua response generations and freshness decisions for the target query."""
+            if op=='collect_query':order.append('query')
+            result=fixture.lua.execute('return REA_AUTO_INFANTRY.'+op+'('+','.join(map(str,args))+')')
+            return json.loads(result) if op in ('collect_status','collect_metrics') else result
+        c.response_log.drain.side_effect=drain;c.refresh_heroes=refresh;c.collection_call=call
+        metrics,roster=c.query_collection_candidate(2792)
+        self.assertEqual(order,['drain','refresh','query'])
+        self.assertTrue(roster['fresh']);self.assertTrue(metrics['target']['queue_free'])
+        self.assertTrue(fixture.dispatch(detail=2,available=2)[0])
+        self.assertEqual(len(fixture.lua.globals().Game.trips),1)
 
 
 if __name__ == '__main__':
