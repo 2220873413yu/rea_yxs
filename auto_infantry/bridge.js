@@ -61,7 +61,8 @@ function execute(state, task) {
     }
     const oldTop = getTop(state);
     try {
-        const checkedSource = (sessionBound ? 'assert(REA_HELPER_SESSION_VALID and REA_HELPER_SESSION_VALID(), "Account session changed; reconnect the helper");\n' : '') + task.source;
+        // Keep the fence on line one so callers can distinguish an unsent action from an unknown result.
+        const checkedSource = (sessionBound ? 'local valid,reason; if REA_HELPER_SESSION_VALID then valid,reason=REA_HELPER_SESSION_VALID() end; assert(valid,"Account session changed; reconnect the helper ("..(reason or "unbound")..")");\n' : '') + task.source;
         const source = Memory.allocUtf8String(checkedSource);
         const chunk = Memory.allocUtf8String('@rea-auto-infantry');
         const size = unescape(encodeURIComponent(checkedSource)).length;

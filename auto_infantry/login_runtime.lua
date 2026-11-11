@@ -19,6 +19,15 @@ elseif operation=='qr' then
  callback({})
  return 'qr_requested'
 elseif operation=='bind' then
+ -- Validate and bind in the same game update so a role change cannot slip between them.
+ if recoveryKey then
+  if not REA_HUNT_RECONNECT then return 'unverified' end
+  local reason=REA_HUNT_RECONNECT.recovery_status(recoveryKey)
+  if reason~='ready' then return reason end
+  local tickets=package.loaded.TicketsProtocol and package.loaded.TicketsProtocol.__instanceDict._instance
+  local info=tickets and tickets:getLoginInfo()
+  if stage=='LoginStage' or stage=='MainHallSceneStage' or not info or not info:isLogined() then return 'pending' end
+ end
  local manager=CSLTypes.ModelManager.sharedInstance()
  local main=manager:getModel(CSLTypes.MainModel)
  local world=manager:getModel(CSLTypes.SLGMainModel)
@@ -35,8 +44,13 @@ elseif operation=='bind' then
   local live=current:getModel(CSLTypes.MainModel)
   local wm=current:getModel(CSLTypes.SLGMainModel)
   local u=live.myUserId
-  return live==main and wm==world and live.mTLoginRsp==response and wm.mTSLGLoginMapRsp==map and wm.mIsMapLoaded==true
-   and u and u[1]==id[1] and u[2]==id[2] and u[3]==id[3] and u[4]==id[4]
+  if not u then return false,'account_unavailable' end
+  for i=1,4 do if u[i]~=id[i] then return false,'account_identity_changed' end end
+  if REA_HUNT_RECONNECT and REA_HUNT_RECONNECT.paused() then return false,'native_reconnect' end
+  if not wm or wm.mIsMapLoaded~=true then return false,'map_not_loaded' end
+  if live~=main or live.mTLoginRsp~=response then return false,'login_data_replaced' end
+  if wm~=world or wm.mTSLGLoginMapRsp~=map then return false,'map_data_replaced' end
+  return true
  end
  return 'session_bound'
 end

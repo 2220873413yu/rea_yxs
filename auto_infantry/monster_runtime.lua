@@ -479,6 +479,18 @@ function api.hunt_ack(id,heroId,armyId)
  return 'hunt_departure_confirmed'
 end
 
+-- Restore a freshly confirmed original army without sending a server request or replaying a departure.
+function api.hunt_resume(id,heroId,armyId,skipped)
+ world();local s=api.read_hero_state(heroId)
+ assert(s.fresh and s.army_known and s.found,'Fresh own hero and army response required')
+ local a=main:getMyArmyInfoByHeroGroupId(heroId)
+ assert(a and a[1]==armyId and a[5]==3 and a[6]==id,'Reconnect hunt army identity changed')
+ assert(not active[armyId] and not submitted,'Reconnect army already owned or submission unresolved')
+ active[armyId]={hero_id=heroId,target_id=id,army_id=armyId}
+ skipSent[armyId]=skipped==1
+ return 'hunt_army_restored'
+end
+
 -- End only a verified returned helper army; do not release an uncertain submission for another attempt.
 function api.hunt_release(armyId)
  world();local a=active[armyId];assert(a,'Untracked hunt army')

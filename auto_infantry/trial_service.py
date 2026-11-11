@@ -1,6 +1,7 @@
 """One serial event-driven trial run, with no fixed server polling and no automatic retries or revival."""
 import time
 from trial_receipts import TrialRejected
+from hunt_reconnect import connection_lost
 
 MUTATIONS = {'select', 'challenge', 'skip', 'return_after_win'}
 
@@ -161,11 +162,9 @@ class TrialService:
         except InterruptedError:
             return True
         except Exception as error:
-            if 'Account session changed' in str(error):
-                self.stop_with('账号已变化，自动爬塔关闭', self.uncertain)
-                self.reconnect_requested = True
-                self.owner.publish(account_changed=True)
-            elif not self.enabled:
+            if connection_lost(error):
+                raise
+            if not self.enabled:
                 if any(message in str(error) for message in ('switched off', 'Trial switch changed')):
                     return True
                 self.reconnect_requested = True

@@ -19,6 +19,7 @@ from trial_service import TrialService
 from report_service import ReportService
 from map_index_service import MapIndexService
 from league_export import LeagueExportService
+from hunt_reconnect import connection_lost, recovery_plan
 
 
 def owned_soldiers(state):
@@ -108,6 +109,7 @@ class Worker(threading.Thread):
         self.hero_enabled = False
         self.hero_epoch = 0
         self.hero_due = 0
+        self.hero_uncertain = False
         self.hero_selected = ()
         self.hero_cursor = 0
         self.hero_refresh_requested = threading.Event()
@@ -130,6 +132,7 @@ class Worker(threading.Thread):
         self.player_busy = False
         self.map_index = MapIndexService(self)
         self.league_export = LeagueExportService(self)
+        self.reconnect_plan = None
 
     def request_league_export(self, league_id, path):
         """Queue one explicit alliance export, mutually exclusive with searches and manual profile queries."""
@@ -295,6 +298,8 @@ class Worker(threading.Thread):
         """Freeze an explicit hero selection and revoke all operations from the previous run."""
         with self.guard:
             if enabled:
+                if self.hero_uncertain:
+                    raise RuntimeError('上次恢复结果不明，请核对游戏并重新连接助手')
                 heroes = checked_heroes(selected if selected is not None else self.hero_selected)
                 if not heroes:
                     raise ValueError('请至少勾选一个英雄')
@@ -310,6 +315,8 @@ class Worker(threading.Thread):
         normal = self.hero_selected if self.hero_enabled else ()
         demand = self.collection.recovery_hero
         selected = checked_heroes(tuple(normal) + ((demand,) if demand else ()))
+        if self.hero_uncertain:
+            selected = ()
         if self.connection is not None and selected != self.recovery_authorized:
             self.connection.set_hero_enabled(bool(selected), selected)
             self.recovery_authorized = selected
@@ -318,6 +325,8 @@ class Worker(threading.Thread):
 
     def switch_collection(self, enabled, options=None):
         """Control only collection and its own recovery demand, preserving normal recovery selections."""
+        if enabled and (self.hero_uncertain or self.collection.uncertain):
+            raise RuntimeError('上次采集或恢复结果不明，请核对游戏并重新连接助手')
         self.collection.switch(enabled, options)
 
     def switch_hunt(self, enabled, options=None):
@@ -335,7 +344,7 @@ class Worker(threading.Thread):
         self.hero_refresh_requested.set()
 
     def hero_tick(self, connection):
-        """Merge recovery sources and confirm one eligible hero item before allowing the next serial action."""
+        """Merge recovery sources and settle one item before another shared action."""
         with self.guard:
             if (not self.hero_enabled and not self.collection.recovery_hero) or self.closing.is_set() or time.monotonic() < self.hero_due:
                 return
@@ -362,8 +371,10 @@ class Worker(threading.Thread):
                 if state is None:
                     return
                 self.hero_cursor = next_cursor
+            self.hero_uncertain = True
             after = connection.recover_hero(state, generation)
             verify_recovery(state, after)
+            self.hero_uncertain = False
             self.publish(action='hero_speed', hero=state['hero_id'], hero_state=after,
                          hero_status=f"{state.get('name', state['hero_id'])}恢复进度已确认，继续监控",
                          recovery_for_collection=self.collection.recovery_hero is not None)
@@ -381,19 +392,69 @@ class Worker(threading.Thread):
             with self.guard:
                 if epoch != (self.hero_epoch, self.collection.epoch):
                     return
+                if connection_lost(error):
+                    raise
                 self.collection.switch(False)
                 self.switch_hero(False)
             self.publish(hero_enabled=False, collect_enabled=False, error=str(error), hero_status='自动恢复已停止：' + str(error),
                          collection_status='共用恢复结果异常，采集已停止')
+
+    def restore_tasks(self, connection, plan):
+        """Read fresh ownership before restoring each independently safe task."""
+        self.collection.uncertain = plan['collection_blocked']
+        self.hunt.uncertain = plan['hunt_blocked']
+        if self.collection.uncertain:
+            self.publish(collection_status='采集继续暂停：上次操作结果不明', action='collection_reconnect_blocked')
+        if self.hunt.uncertain:
+            self.publish(hunt_status='打野继续暂停：上次出征或跳过战斗结果不明', action='hunt_reconnect_blocked')
+        if plan['collection'] is None and plan['hunt'] is None:
+            return
+        roster = connection.refresh_heroes()
+        if not roster.get('fresh') or not roster.get('queue_known'):
+            raise RuntimeError('重连后英雄或部队状态未确认')
+        self.publish(hero_roster=roster)
+        if plan['hunt'] is not None:
+            try:
+                schedule = connection.hunt_call('hunt_schedule')
+                self.hunt.restore_reconnect(connection, plan['hunt'], roster, schedule)
+            except Exception as error:
+                if connection_lost(error) or self.closing.is_set():
+                    raise
+                self.hunt.switch(False)
+                self.allow_scheduled_hunt = False
+                self.publish(hunt_enabled=False, hunt_status='打野继续暂停：' + str(error).splitlines()[0],
+                             action='hunt_reconnect_blocked')
+        if plan['collection'] is not None:
+            try:
+                queue = connection.collection_call('collect_status')
+                if not queue.get('queue_known'):
+                    raise RuntimeError('采集队伍额度未确认')
+                connection.collection_call('collect_schedule')
+                with self.guard:
+                    if self.closing.is_set():
+                        raise InterruptedError('重连恢复已取消')
+                    self.collection.switch(True, plan['collection'])
+                self.publish(collect_enabled=True, collection_status='已核对当前采集队伍，恢复原采集计划',
+                             action='collection_reconnect_resumed')
+            except Exception as error:
+                if connection_lost(error) or self.closing.is_set():
+                    raise
+                self.collection.switch(False)
+                self.publish(collect_enabled=False, collection_status='采集继续暂停：' + str(error).splitlines()[0],
+                             action='collection_reconnect_blocked')
 
     def run(self):
         """Serialize hunting, troop runs, collection and shared recovery over one owned game connection."""
         connection = Connection()
         run = None
         run_epoch = None
+        pending_recovery = None
         try:
-            state = connection.open(on_status=lambda message: self.publish(ready=False, status=message), cancel=self.closing,
-                                    on_account=lambda account: self.publish(account=account))
+            arguments = {'on_status': lambda message: self.publish(ready=False, status=message), 'cancel': self.closing,
+                         'on_account': lambda account: self.publish(account=account)}
+            if self.reconnect_plan is not None:
+                arguments['hunt_resume'] = self.reconnect_plan
+            state = connection.open(**arguments)
             self.connection = connection
             try:
                 self.map_index.load(connection)
@@ -403,7 +464,13 @@ class Worker(threading.Thread):
                 self.publish(state=connection.call('status', unit))
             self.league.tick(connection)
             self.beacon.tick(connection)
-            self.publish(ready=True, status='已连接，自动造兵关闭')
+            if self.reconnect_plan is not None:
+                self.restore_tasks(connection, self.reconnect_plan)
+                self.reconnect_plan = None
+                self.publish(ready=True, status='已重新连接并核对原账号、区服和地图',
+                             action='helper_reconnect_completed')
+            else:
+                self.publish(ready=True, status='已连接，自动造兵关闭')
             while not self.closing.is_set():
                 if self.trial.tick(connection):
                     run = None
@@ -543,6 +610,10 @@ class Worker(threading.Thread):
                     self.publish(action=action, unit=unit, state=state, status='运行中')
                 self.closing.wait(self.step_delay)
         except Exception as error:
+            with self.guard:
+                if self.connection is not None and not self.closing.is_set() and self.reconnect_plan is None:
+                    pending_recovery = recovery_plan(self, connection, error)
+                    connection.preserve_reconnect = pending_recovery is not None
             was_enabled = self.enabled
             try:
                 self.report.switch(False)
@@ -558,7 +629,7 @@ class Worker(threading.Thread):
             if not self.closing.is_set():
                 self.publish(enabled=False, hero_enabled=False, collect_enabled=False, hunt_enabled=False, league_enabled=False,
                              beacon_enabled=False, trial_enabled=False, report_enabled=False, report_next_ms=None, ready=False, error=str(error),
-                             account_changed='Account session changed' in str(error),
+                             action='helper_reconnect_failed' if self.reconnect_plan is not None else 'helper_connection_stopped',
                              hero_status='连接已停止，自动恢复关闭',
                              status=('已停止：' if was_enabled else '连接已停止：') + str(error))
         finally:
@@ -569,3 +640,6 @@ class Worker(threading.Thread):
             self.connection = None
             connection.close()
             self.publish(closed=True)
+            if pending_recovery is not None and not self.closing.is_set():
+                # Keep the in-memory plan out of the action log.
+                self.events.put({'delayed_reconnect': pending_recovery})

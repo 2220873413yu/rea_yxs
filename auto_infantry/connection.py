@@ -6,6 +6,7 @@ import contextlib
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import frida
@@ -18,6 +19,8 @@ from player_profile_cache import PlayerProfileCache
 from collection import CollectionReplan
 from monster import HuntReplan
 from region_conflict import RegionConflict,RegionRestoreConflict
+from hunt_reconnect import SessionUnsent, SessionAccepted, connection_lost, fence_rejected
+from bootstrap import ADB, adb
 
 ROOT = Path(__file__).resolve().parent
 
@@ -26,7 +29,6 @@ class BarrackUnavailable(RuntimeError):
     """Stop only troop automation when an upgrade or unknown building state prevents safe training."""
 
 
-ADB = r'E:\leidian\LDPlayer9\adb.exe'
 WORLD_READINESS_SOURCE = '''
 local mm=CSLTypes.ModelManager.sharedInstance()
 local main=mm:getModel(CSLTypes.SLGMainModel)
@@ -64,6 +66,9 @@ class Connection:
         self.league_query_installed = False
         self.map_index_installed = False
         self.profile_cache = PlayerProfileCache()
+        self.reconnect_key = None
+        self.preserve_reconnect = False
+        self.process_identity = None
 
     def clear_player_profile_cache(self):
         """Clear only current-map public profiles; resolving the scope never queries the server."""
@@ -92,7 +97,7 @@ class Connection:
             raise RuntimeError('已有一个造兵助手连接，请先关闭原窗口')
         self.mutex_handle = handle
 
-    def attach(self):
+    def attach(self, expected_process=None):
         """Own a default-off bridge without requiring a world map, for native login or normal startup."""
         self.acquire_owner()
         package = subprocess.check_output([ADB, '-s', 'emulator-5554', 'shell', 'dumpsys', 'package', 'com.qqgame.mic'],
@@ -100,10 +105,15 @@ class Connection:
                                           creationflags=subprocess.CREATE_NO_WINDOW)
         if 'versionCode=431000017 ' not in package:
             raise RuntimeError('Game version changed; this bridge requires 4.31.0 / 431000017')
+        identity = self.read_process_identity()
+        if expected_process is not None and identity != expected_process:
+            raise RuntimeError('游戏已关闭或重启，取消自动重连')
+        if identity is None:
+            raise RuntimeError('游戏未运行')
+        self.process_identity = identity
+        pid = identity[0]
         subprocess.run([ADB, '-s', 'emulator-5554', 'forward', 'tcp:27042', 'tcp:27042'],
                        capture_output=True, check=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
-        pid = int(subprocess.check_output([ADB, '-s', 'emulator-5554', 'shell', 'pidof', 'com.qqgame.mic'],
-                                         text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW).strip().split()[0])
         device = frida.get_device_manager().add_remote_device('127.0.0.1:27042')
         self.session = device.attach(pid, realm='emulated')
         try:
@@ -113,23 +123,48 @@ class Connection:
             self.close()
             raise
 
-    def login_call(self, operation='status'):
-        """Read masked role metadata or invoke one fixed native login action; credentials stay in the client."""
+    @staticmethod
+    def read_process_identity():
+        """Identify this Android boot and game process start, including when a PID has been reused."""
+        result = adb('shell', "su -c 'p=$(pidof com.qqgame.mic) && cat /proc/sys/kernel/random/boot_id && cat /proc/$p/stat'",
+                     check=False)
+        lines = result.stdout.splitlines()
+        if result.returncode or len(lines) != 2:
+            return None
+        pid, _, _ = lines[1].partition(' (')
+        _, _, stat = lines[1].rpartition(') ')
+        fields = stat.split()
+        if not pid.isdecimal() or len(fields) <= 19 or not fields[19].isdecimal():
+            return None
+        return int(pid), lines[0], int(fields[19])
+
+    def login_call(self, operation='status', recovery_key=None):
+        """Read role metadata or bind one verified recovery scope on the game's update thread."""
         if operation not in {'status', 'logout', 'qr', 'bind'}:
             raise ValueError('Unknown login operation')
-        source = 'local operation=' + json.dumps(operation) + '\n' + (ROOT / 'login_runtime.lua').read_text(encoding='utf-8')
+        source = ('local operation=' + json.dumps(operation) + '\nlocal recoveryKey=' +
+                  (json.dumps(recovery_key) if recovery_key is not None else 'nil') + '\n' +
+                  (ROOT / 'login_runtime.lua').read_text(encoding='utf-8'))
         with self.lock:
             value = self.script.exports_sync.query(source)
         return json.loads(value) if operation == 'status' else value
 
-    def open(self, on_status=None, cancel=None, on_account=None):
+    def open(self, on_status=None, cancel=None, on_account=None, hunt_resume=None):
         """Install fresh account APIs only after map readiness, with all spending gates closed."""
         try:
-            self.attach()
+            if hunt_resume is None:
+                self.attach()
+            else:
+                self.attach(expected_process=hunt_resume['process'])
+                self.verify_reconnect_scope(hunt_resume['key'], cancel)
             if on_account is not None:
                 on_account(self.login_call())
-            self.wait_world_ready(on_status, cancel)
-            self.login_call('bind')
+            if hunt_resume is None:
+                self.wait_world_ready(on_status, cancel)
+                self.login_call('bind')
+            self.reconnect_key = uuid.uuid4().hex
+            source = 'local reconnectKey=' + json.dumps(self.reconnect_key) + '\n' + (ROOT / 'hunt_reconnect_runtime.lua').read_text(encoding='utf-8')
+            self.script.exports_sync.query(source)
             self.script.exports_sync.bindsession(True)
             self.script.exports_sync.query('if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.beacon_close then REA_AUTO_INFANTRY.beacon_close() end;'
                                            'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.league_close then '
@@ -152,6 +187,17 @@ class Connection:
         except Exception:
             self.close()
             raise
+
+    def verify_reconnect_scope(self, key, cancel=None):
+        """Confirm the original role and loaded map once, before installing a new connection."""
+        if cancel is not None and cancel.is_set():
+            raise InterruptedError('重连恢复已取消')
+        reason = self.login_call('bind', recovery_key=key)
+        if reason != 'session_bound':
+            raise RuntimeError({
+                'account': '账号已变化，取消任务恢复', 'map': '区服或地图已变化，取消任务恢复',
+                'pending': '游戏登录或地图尚未就绪，取消任务恢复',
+            }.get(reason, '会话范围未确认，取消任务恢复'))
 
     def wait_world_ready(self, on_status=None, cancel=None):
         """Wait on local map readiness before binding account data; no game-server requests or auto entry."""
@@ -338,7 +384,7 @@ class Connection:
         """Gate numeric hunting operations and refresh once only for explicit pre-send stale guards."""
         readable = {'hunt_candidates', 'hunt_schedule', 'hunt_watch', 'hunt_status', 'hunt_metrics',
                     'hunt_scan_plan', 'hunt_region_state', 'hunt_region_read', 'hunt_refresh_clock'}
-        operations = readable | {'hunt_query', 'hunt_cancel_query', 'hunt_dispatch', 'hunt_ack', 'hunt_release',
+        operations = readable | {'hunt_query', 'hunt_cancel_query', 'hunt_dispatch', 'hunt_ack', 'hunt_resume', 'hunt_release',
                                  'hunt_skip', 'hunt_region_query'}
         if operation not in operations or any(type(v) is not int or not 0 <= v <= 100000000 for v in arguments):
             raise ValueError('Invalid hunting operation or arguments')
@@ -414,6 +460,7 @@ class Connection:
                     if isinstance(cleanup,(RegionConflict,TimeoutError)):
                         raise RegionRestoreConflict('恢复地图区域未确认：'+str(cleanup)) from cleanup
                     raise
+                # In particular, an unknown dispatch/skip must remain the primary error and cannot be retried.
 
     def query_hunt_region(self, region, radius, generation=None):
         """Retry only a conflicted read once; post-read restoration failures never replay a successful operation."""
@@ -473,14 +520,22 @@ class Connection:
             self.response_log = GameResponseLog(ADB)
         self.response_log.drain()
         hero_id, target_id = formation['hero_id'], target['target_id']
-        outcome=self.hunt_call('hunt_dispatch', (target_id, hero_id, formation['soldier_id'], formation['followers'],
-                                        target['detail_seq'], target['available_seq'], radius, target['x'], target['y']),
-                       generation, hero_id)
+        try:
+            outcome=self.hunt_call('hunt_dispatch', (target_id, hero_id, formation['soldier_id'], formation['followers'],
+                                            target['detail_seq'], target['available_seq'], radius, target['x'], target['y']),
+                           generation, hero_id)
+        except Exception as error:
+            if fence_rejected(error):raise SessionUnsent(str(error)) from error
+            raise
         if outcome in ('hunt_replan:hero','hunt_replan:stale','hunt_replan:action'):
             raise HuntReplan('打野英雄或资料已变化，原生确认尚未发送出征请求')
         receipt = self.response_log.wait_hunt(hero_id, target_id)
-        roster = self.refresh_heroes()
-        self.hunt_call('hunt_ack', (target_id, hero_id, receipt['army_id']))
+        try:
+            roster = self.refresh_heroes()
+            self.hunt_call('hunt_ack', (target_id, hero_id, receipt['army_id']))
+        except Exception as error:
+            if connection_lost(error):raise SessionAccepted(error, receipt) from error
+            raise
         return receipt, roster
 
     def skip_hunt(self, active, generation):
@@ -488,7 +543,11 @@ class Connection:
         if self.response_log is None:
             self.response_log = GameResponseLog(ADB)
         self.response_log.drain()
-        self.hunt_call('hunt_skip', (active['target_id'], active['hero_id'], active['army_id']), generation, active['hero_id'])
+        try:
+            self.hunt_call('hunt_skip', (active['target_id'], active['hero_id'], active['army_id']), generation, active['hero_id'])
+        except Exception as error:
+            if fence_rejected(error):raise SessionUnsent(str(error)) from error
+            raise
         return self.response_log.wait_hunt_skip(active['army_id'], active['target_id'])
 
     def set_league_enabled(self, enabled):
@@ -747,7 +806,12 @@ class Connection:
         target = metrics['target']
         if self.response_log is None:
             raise RuntimeError('采集响应日志尚未准备，未派出')
-        before = self.hero_call('hero_list')
+        try:
+            before = self.hero_call('hero_list')
+        except Exception as error:
+            if connection_lost(error):
+                raise SessionUnsent(error) from error
+            raise
         hero = next((row for row in before['heroes'] if row['hero_id'] == hero_id), None)
         if (hero is None or not hero.get('found') or not hero.get('fresh') or not hero.get('army_known') or
                 hero.get('busy') or hero.get('hero_state') != 0 or hero.get('remaining_ms',1)>0):
@@ -761,17 +825,27 @@ class Connection:
                      target['detail_seq'], target['available_seq'], target['scope_radius'], target['x'], target['y'])
         if target.get('balance_guard'):
             arguments += (1,)
-        outcome = self.collection_call('collect_dispatch', arguments, generation, hero_id)
+        try:
+            outcome = self.collection_call('collect_dispatch', arguments, generation, hero_id)
+        except Exception as error:
+            if fence_rejected(error):
+                raise SessionUnsent(error) from error
+            raise
         if outcome in ('collection_replan:hero_state','collection_replan:stale','collection_replan:selection'):
             reason=outcome.split(':',1)[1]
             label={'hero_state':'英雄或部队状态变化','stale':'资源或选将详情已过期','selection':'最快采集英雄已变化'}[reason]
             raise CollectionReplan(label+'，尚未发送出征请求',reason=reason)
         receipt = self.response_log.wait_collection(hero_id, target['target_id'])
-        roster = self.refresh_heroes()
+        try:
+            roster = self.refresh_heroes()
+            schedule = self.collection_call('collect_schedule')
+        except Exception as error:
+            if connection_lost(error):
+                raise SessionAccepted(error, receipt) from error
+            raise
         hero = next((row for row in roster['heroes'] if row['hero_id'] == hero_id), None)
         if hero is None or not hero['fresh'] or not hero['army_known'] or (not hero['busy'] and hero['hero_state'] == 0):
             raise RuntimeError('服务器已接受，但英雄出征状态未确认，已停止且不重复派出')
-        schedule = self.collection_call('collect_schedule')
         if not any(row.get('army_id') == receipt['army_id'] and row.get('hero_id') == hero_id and
                    row.get('aim') == 1 and row.get('target_id') == target['target_id'] and
                    row.get('state') in (2, 3, 6) for row in schedule['stages']):
@@ -1064,6 +1138,8 @@ class Connection:
                 self.set_trial_enabled(False)
                 self.set_report_enabled(False)
                 self.script.exports_sync.bindsession(False)
+                if not self.preserve_reconnect:
+                    self.script.exports_sync.query('if REA_HUNT_RECONNECT then REA_HUNT_RECONNECT.close();REA_HUNT_RECONNECT=nil end;return "reconnect_witness_closed"')
                 self.script.exports_sync.query('if REA_PLAYER_QUERY_UI then REA_PLAYER_QUERY_UI.close()end;REA_MAP_INDEX=nil;REA_LEAGUE_QUERY=nil;REA_PLAYER_QUERY=nil;REA_REPORT=nil;if REA_TRIAL then REA_TRIAL.close();REA_TRIAL=nil end;'
                                                'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.beacon_close then REA_AUTO_INFANTRY.beacon_close() end;'
                                                'if REA_AUTO_INFANTRY and REA_AUTO_INFANTRY.league_close then '

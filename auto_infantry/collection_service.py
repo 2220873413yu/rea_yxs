@@ -9,6 +9,7 @@ from collection_display import team_snapshot
 from game_log import ResourceMissing
 from resource_preferences import remove_coordinate
 from collection_balance import balanced_candidates
+from hunt_reconnect import connection_lost, SessionUnsent, SessionAccepted
 
 
 class CollectionService:
@@ -17,6 +18,7 @@ class CollectionService:
     def __init__(self, owner):
         self.owner = owner
         self.enabled = False
+        self.uncertain = False
         self.epoch = 0
         self.run = None
         self.due = 0
@@ -257,7 +259,13 @@ class CollectionService:
                     self.owner.publish(collection_status=f"正在派出{hero['name']}采{RESOURCE_NAMES[target['kind']]}（{target['x']},{target['y']}）")
                     target['scope_radius'] = 0 if run.options.mode == 'list' else run.options.radius
                     target['balance_guard'] = balance is not None
-                receipt, after = connection.dispatch_collection(metrics, hero['hero_id'], generation)
+                self.uncertain = True
+                try:
+                    receipt, after = connection.dispatch_collection(metrics, hero['hero_id'], generation)
+                except (CollectionReplan, SessionUnsent, SessionAccepted):
+                    self.uncertain = False
+                    raise
+                self.uncertain = False
                 self.owner.publish(action='collection_dispatch', receipt=receipt, hero_roster=after)
                 with self.owner.guard:
                     if not self.alive(run, epoch):
@@ -331,5 +339,7 @@ class CollectionService:
             with self.owner.guard:
                 if not self.alive(run, epoch):
                     return
+                if connection_lost(error):
+                    raise
                 self.switch(False)
             self.owner.publish(collect_enabled=False, error=str(error), collection_status='采集已停止：' + str(error))

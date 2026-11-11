@@ -133,17 +133,17 @@ package.loaded.TicketsProtocol={__instanceDict={_instance={getLoginInfo=function
         self.run_operation('bind')
         self.assertTrue(self.lua.eval('REA_HELPER_SESSION_VALID()'))
         self.lua.execute('Game.main={myUserId={11,"new",0,1},mTLoginRsp={0}}')
-        self.assertFalse(self.lua.eval('REA_HELPER_SESSION_VALID()'))
+        self.assertEqual(self.lua.eval('REA_HELPER_SESSION_VALID()'), (False, 'account_identity_changed'))
 
     def test_changed_identity_or_map_invalidates_bound_session(self):
         """Mutating the UID in place or replacing the world response invalidates the same fence."""
         self.run_operation('bind')
         self.lua.execute('Game.main.myUserId[4]=0')
-        self.assertFalse(self.lua.eval('REA_HELPER_SESSION_VALID()'))
+        self.assertEqual(self.lua.eval('REA_HELPER_SESSION_VALID()'), (False, 'account_identity_changed'))
         self.lua.execute('Game.main.myUserId[4]=1')
         self.run_operation('bind')
         self.lua.execute('Game.world.mTSLGLoginMapRsp={0}')
-        self.assertFalse(self.lua.eval('REA_HELPER_SESSION_VALID()'))
+        self.assertEqual(self.lua.eval('REA_HELPER_SESSION_VALID()'), (False, 'map_data_replaced'))
 
     def test_old_world_cache_cannot_initialize_a_newly_logged_in_account(self):
         """A loaded old map is insufficient when its player identity differs from the new login identity."""
@@ -161,6 +161,35 @@ package.loaded.TicketsProtocol={__instanceDict={_instance={getLoginInfo=function
 
 class AccountViewTests(unittest.TestCase):
     """Check real Tk account replacement, including queued stale automatic-start messages."""
+
+    def test_delayed_reconnect_runs_once_and_manual_cancellation_invalidates_callback(self):
+        """The window timer can neither run twice nor replace a newer manual session."""
+        loader = SourceFileLoader('reconnect_timer_ui_test', str(Path(__file__).with_name('app.pyw')))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        app = module.App.__new__(module.App)
+        app.closing = False
+        app.reconnect_timer = None
+        app.sessions = Mock(epoch=7)
+        app.root = Mock()
+        app.root.after.side_effect = ['first', 'second']
+        app.status = Mock()
+        app.request_session = Mock()
+        plan = {'deadline': 700, 'reason': 'test disconnect'}
+        with patch.object(module, 'log_reconnect'), patch.object(module.time, 'monotonic', return_value=100):
+            app.schedule_reconnect(plan)
+            delay, first = app.root.after.call_args.args
+            self.assertEqual(delay, 600000)
+            first()
+            first()
+            app.request_session.assert_called_once_with('hunt_reconnect', plan)
+            app.schedule_reconnect(plan)
+            _, second = app.root.after.call_args.args
+            app.cancel_reconnect('手动重新连接')
+            second()
+            app.root.after_cancel.assert_called_once_with('second')
+            app.request_session.assert_called_once()
 
     def test_old_snapshots_and_events_cannot_survive_account_reload(self):
         """Keep saved choices but erase role data, team timers, item choices and old scheduled starts."""

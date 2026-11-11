@@ -8,6 +8,7 @@ from controller import Worker
 from pathlib import Path
 from account_store import AccountStore
 from account_service import AccountService
+from hunt_reconnect import log_reconnect
 
 
 def account_label(state):
@@ -51,7 +52,7 @@ class LoginSession:
 
     def request(self, mode='connect', selection=None):
         """Cancel earlier work before serial login, default-off reconnection or local encrypted migration."""
-        if mode not in {'connect', 'ios_wechat', 'account_save', 'account_switch', 'account_qr',
+        if mode not in {'connect', 'hunt_reconnect', 'ios_wechat', 'account_save', 'account_switch', 'account_qr',
                         'account_export', 'account_import'}:
             raise ValueError('Unsupported session mode')
         with self.guard:
@@ -67,7 +68,7 @@ class LoginSession:
             self.job.start()
 
     def _replace(self, mode, epoch, cancel, previous, old_job, selection=None):
-        """Join old owners before any account job; migration returns without a bridge or replacement worker."""
+        """Join old owners before opening a session; a delayed reconnect uses the existing game process."""
         sink = SessionEvents(self.events, epoch)
         connection = None
         try:
@@ -97,10 +98,11 @@ class LoginSession:
                           'account_status': '当前游戏账号未切换；自动功能全部关闭',
                           'status': message + '。需要使用时请选择账号切换，票据失效请重新扫码。'})
                 return
-            ensure_server()
-            legacy = Path(__file__).resolve().parents[1] / 'analysis/evidence'
-            self.store.import_legacy([legacy / 'ios-wechat-ticket-test.dpapi', legacy / 'android-qq-ticket-test.dpapi'])
-            sink.put({'profiles': self.store.list()})
+            if mode != 'hunt_reconnect':
+                ensure_server()
+                legacy = Path(__file__).resolve().parents[1] / 'analysis/evidence'
+                self.store.import_legacy([legacy / 'ios-wechat-ticket-test.dpapi', legacy / 'android-qq-ticket-test.dpapi'])
+                sink.put({'profiles': self.store.list()})
             if mode == 'account_save':
                 record = self.accounts.save_current(cancel)
                 sink.put({'status': '已加密保存当前账号：' + record['name'], 'profiles': self.store.list()})
@@ -137,13 +139,18 @@ class LoginSession:
                     return
                 worker = Worker(sink)
                 worker.allow_scheduled_hunt = False
+                if mode == 'hunt_reconnect':
+                    worker.reconnect_plan = selection
                 self.worker = worker
-                worker.request_hero_refresh()
-                worker.request_collection_attributes()
+                if mode != 'hunt_reconnect':
+                    worker.request_hero_refresh()
+                    worker.request_collection_attributes()
                 worker.start()
         except InterruptedError:
             pass
         except Exception as error:
+            if mode == 'hunt_reconnect':
+                log_reconnect('helper_reconnect_failed', str(error).splitlines()[0])
             sink.put({'ready': False, 'status': '登录/连接未完成：' + str(error).splitlines()[0],
                       'account_status': '当前账号：尚未完成重新读取，自动功能关闭'})
         finally:

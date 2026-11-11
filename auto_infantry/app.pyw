@@ -1,6 +1,9 @@
 """Default-off controls for troops, shared recovery and resource-specific collection."""
 import queue
 import threading
+import time
+from datetime import datetime, timedelta
+from math import ceil
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog
@@ -24,6 +27,7 @@ from league_members_panel import LeagueMembersPanel
 from battle_chat import BattleChatSession
 from battle_chat_panel import BattleChatPanel
 from hall_profile import HallProfileSession
+from hunt_reconnect import log_reconnect
 
 
 class App:
@@ -42,6 +46,7 @@ class App:
         self.accounts_dialog = None
         self.worker = None
         self.closing = False
+        self.reconnect_timer = None
         self.ready = False
         self.trial_exclusive = False
         self.enabled = tk.BooleanVar(value=False)
@@ -192,6 +197,7 @@ class App:
         """Stop old automation before login, local migration or reconstruction; credentials never reach status text."""
         if self.closing:
             return
+        self.cancel_reconnect('手动操作或会话替换')
         self.clear_account_views()
         self.login_busy = True
         migrating = mode in {'account_export', 'account_import'}
@@ -201,6 +207,35 @@ class App:
         self.sessions.request(mode, selection)
         self.worker = None
         self.update_controls()
+
+    def cancel_reconnect(self, reason):
+        """Cancel the window-owned attempt before a manual action or shutdown takes ownership."""
+        if self.reconnect_timer is not None:
+            self.root.after_cancel(self.reconnect_timer)
+            self.reconnect_timer = None
+            log_reconnect('helper_reconnect_cancelled', reason)
+
+    def schedule_reconnect(self, plan):
+        """Hand off one monotonic deadline after the disconnected worker releases the bridge."""
+        if self.closing or self.reconnect_timer is not None:
+            return
+        epoch = self.sessions.epoch
+        delay = max(0, plan['deadline'] - time.monotonic())
+        due = datetime.now() + timedelta(seconds=delay)
+
+        def attempt():
+            """Consume the timer once, ignoring callbacks from a replaced or closed window session."""
+            if self.closing or self.sessions.epoch != epoch or self.reconnect_timer != timer:
+                return
+            self.reconnect_timer = None
+            log_reconnect('helper_reconnect_attempt', '等待时间已到，检查原游戏进程与会话')
+            self.request_session('hunt_reconnect', plan)
+
+        timer = self.root.after(ceil(delay * 1000), attempt)
+        self.reconnect_timer = timer
+        self.status.set(f'连接异常，预计 {due:%H:%M:%S} 自动重连一次')
+        log_reconnect('helper_reconnect_scheduled', '连接异常，保留采集与打野计划',
+                      due=due.isoformat(timespec='seconds'), disconnect_reason=plan['reason'])
 
     def update_controls(self):
         """Enable each independent master while connected and freeze the settings owned by an active run."""
@@ -492,8 +527,8 @@ class App:
                         self.trial_panel.apply_snapshot({**snapshot,'enabled':False,'phase':'off'})
                     self.trial_panel.status.set(message+'；已返回地图，重新读取账号，所有开关保持关闭')
                     continue
-                if event.get('account_changed'):
-                    self.request_session('connect')
+                if event.get('delayed_reconnect'):
+                    self.schedule_reconnect(event['delayed_reconnect'])
                     continue
                 if 'login_busy' in event:
                     self.login_busy = event['login_busy']
@@ -565,8 +600,8 @@ class App:
                     self.enabled.set(False)
                 if event.get('hero_enabled') is False:
                     self.hero_enabled.set(False)
-                if event.get('collect_enabled') is False:
-                    self.collect_enabled.set(False)
+                if 'collect_enabled' in event:
+                    self.collect_enabled.set(event['collect_enabled'])
                 if 'hunt_enabled' in event:
                     self.hunt_enabled.set(bool(event['hunt_enabled']))
                 if event.get('league_enabled') is False:
@@ -629,6 +664,7 @@ class App:
         if self.closing:
             return
         self.closing = True
+        self.cancel_reconnect('助手已退出')
         self.battle_chat.close()
         self.hall_profile.close()
         self.sessions.close()

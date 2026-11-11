@@ -7,6 +7,7 @@ from monster import HuntOptions, HuntReplan, default_formation, ordered_targets,
 from monster_discovery import MonsterDiscovery
 from monster_refresh import MonsterRefresh
 from region_conflict import RegionConflict,RegionRestoreConflict
+from hunt_reconnect import SessionUnsent, SessionAccepted, connection_lost
 
 
 class MonsterService:
@@ -37,6 +38,7 @@ class MonsterService:
         self.auto_suspended = False
         self.auto_block_notified = False
         self.auto_start_epoch = None
+        self.restored_schedule_options = None
         self.search_paused = False
 
     def switch(self, enabled, options=None):
@@ -57,6 +59,7 @@ class MonsterService:
             self.enabled = bool(enabled) and not self.owner.closing.is_set()
             self.epoch += 1
             self.auto_start_epoch = None
+            self.restored_schedule_options = None
             self.due = 0 if self.enabled else float('inf')
             self.wakeup = CollectionWakeup()
             self.candidates = None
@@ -114,6 +117,8 @@ class MonsterService:
                         self.owner.publish(hunt_auto_start_epoch=self.epoch, action='hunt_auto_start_due',
                                            hunt_status='已到地图刷新时刻，等待按当前面板范围自动开启打野')
         except Exception as error:
+            if connection_lost(error):
+                raise
             self.auto_suspended = True
             self.auto_start_epoch = None
             self.auto_due = float('inf')
@@ -126,7 +131,7 @@ class MonsterService:
                     self.owner.closing.is_set() or self.auto_suspended or
                     self.owner.connection is None or self.automatic_start_blocked()):
                 return False
-            self.switch(True, options)
+            self.switch(True, self.restored_schedule_options or options)
             self.refresh.pending = True
             self.owner.publish(hunt_enabled=True, action='hunt_auto_start', radius=self.options.radius,
                                hunt_status='已按地图刷新时刻自动开启打野，正在确认服务器队伍与实际目标')
@@ -303,11 +308,53 @@ class MonsterService:
         """Stop session/spending failures independently of recoverable read conflicts, preserving unknown-result latches."""
         with self.owner.guard:
             if not self.alive(epoch):return
+            if connection_lost(error):
+                # Preserve settled intent until the worker captures its default-off replacement checkpoint.
+                raise error
             self.switch(False)
         note = ('；请求结果不明，不会定时恢复' if self.automatic_start_blocked() else
                 '；定时开启已暂停，请检查连接' if self.auto_suspended else
                 '；下个地图刷新时刻将尝试自动开启')
         self.publish('打野已停止：' + str(error).splitlines()[0] + note, hunt_enabled=False, error=str(error))
+
+    def restore_reconnect(self, connection, plan, roster, schedule):
+        """Re-adopt only confirmed native armies, preserving exclusions without submitting new departures here."""
+        from hunt_reconnect import reconcile
+        active, completed = reconcile(plan, roster, schedule)
+        with self.owner.guard:
+            if self.owner.closing.is_set():
+                raise InterruptedError('重连恢复已取消')
+            for row in active.values():
+                connection.hunt_call('hunt_resume', (row['target_id'], row['hero_id'], row['army_id'], int(row['skipped'])))
+            self.options = plan['options']
+            self.active, self.completed = active, completed
+            self.ignored = set(plan['ignored'])
+            self.home = plan['home']
+            self.refresh_round = plan['refresh_round']
+            self.epoch += 1
+            self.enabled = plan['enabled']
+            self.uncertain = False
+            self.due = 0
+            self.poll_due = 0
+            self.candidates = None
+            self.discovery = MonsterDiscovery()
+            self.waiting.clear()
+            self.wakeup = CollectionWakeup()
+            self.search_paused = plan['search_paused']
+            self.refresh = plan['refresh']
+            self.auto_refresh = plan['auto_refresh']
+            self.restored_schedule_options = self.options if plan['scheduled'] and not self.enabled else None
+            if plan['auto_start_pending']:
+                # The old UI request was invalidated by disconnect. Reissue its one refresh hint.
+                self.auto_refresh.pending = False
+                self.auto_refresh.next_ms = 0
+            self.auto_due = 0
+            connection.set_hunt_enabled(self.enabled)
+            self.owner.allow_scheduled_hunt = plan['scheduled']
+            self.publish('同账号、同区服、同地图已核对部队，已恢复本轮打野' if self.enabled else
+                         '同账号、同区服、同地图已核对部队，已恢复原打野刷新计划',
+                         hunt_enabled=self.enabled, action='hunt_reconnect_resumed')
+            self.publish_snapshot(schedule)
 
     def attack_with_region_recheck(self,connection,candidate,schedule,epoch,generation):
         """Repeat only an unsent target read once; restored-map failures and unknown actions never replay a departure."""
@@ -351,9 +398,19 @@ class MonsterService:
             self.uncertain = True
         try:
             receipt, after = connection.dispatch_hunt(t, plan, self.options.radius, generation)
-        except HuntReplan:
+        except (HuntReplan, SessionUnsent):
             # Only a typed native pre-send result can clear the action latch; RPC/receipt failures cannot.
             with self.owner.guard:self.uncertain = False
+            raise
+        except SessionAccepted as error:
+            # A matched server success remains authoritative even if the following roster read disconnects.
+            receipt = error.receipt
+            with self.owner.guard:
+                self.active[receipt['army_id']] = {**receipt, 'name': plan['name'], 'x': t['x'], 'y': t['y'],
+                    'followers': plan['followers'], 'skipped': False, 'skip_attempted': False,
+                    'refresh_round': self.refresh_round}
+                self.uncertain = False
+                self.owner.publish(action='hunt_dispatch', receipt=receipt)
             raise
         with self.owner.guard:
             self.active[receipt['army_id']] = {**receipt, 'name': plan['name'], 'x': t['x'], 'y': t['y'],
@@ -424,7 +481,11 @@ class MonsterService:
                 if not self.alive(epoch):
                     return True
                 active['skip_attempted'] = True
-            result = connection.skip_hunt(active, generation)
+            try:
+                result = connection.skip_hunt(active, generation)
+            except SessionUnsent:
+                active['skip_attempted'] = False
+                raise
             active['skipped'] = True
             self.owner.publish(action='hunt_skip', receipt=result)
             if not result['won']:

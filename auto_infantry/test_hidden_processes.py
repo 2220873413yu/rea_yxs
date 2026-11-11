@@ -23,14 +23,18 @@ class HiddenProcessTests(unittest.TestCase):
         connection = Connection()
         connection.acquire_owner = Mock()
         script = Mock()
-        script.exports_sync.query.side_effect = ['{"ready":true,"stage":"World"}', 'session_bound', 'cleared', 'troop_api_installed', 'hero', 'collection', 'hunt', 'league', 'beacon','beacon_actions','trial_api_installed','report_api_installed']
+        script.exports_sync.query.side_effect = ['{"ready":true,"stage":"World"}', 'session_bound', 'witness', 'cleared', 'troop_api_installed', 'hero', 'collection', 'hunt', 'league', 'beacon','beacon_actions','trial_api_installed','report_api_installed']
         connection.initialize_barracks = Mock(return_value={})
         device = Mock()
         device.attach.return_value.create_script.return_value = script
-        with patch('connection.subprocess.check_output', side_effect=['versionCode=431000017 ', '123']) as output, \
+        stat = '123 (com.qqgame.mic) S ' + '0 ' * 18 + '456'
+        process = subprocess.CompletedProcess([], 0, stdout='test-boot\n' + stat)
+        with patch('connection.subprocess.check_output', return_value='versionCode=431000017 ') as output, \
                 patch('connection.subprocess.run') as run, \
                 patch('connection.frida.get_device_manager') as manager:
+            run.side_effect = [process, subprocess.CompletedProcess([], 0)]
             manager.return_value.add_remote_device.return_value = device
             self.assertEqual(connection.open(), {})
+        self.assertEqual(connection.process_identity, (123, 'test-boot', 456))
         for call in output.call_args_list + run.call_args_list:
             self.assertEqual(call.kwargs.get('creationflags'), subprocess.CREATE_NO_WINDOW)

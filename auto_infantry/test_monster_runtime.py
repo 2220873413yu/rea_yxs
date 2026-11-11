@@ -343,6 +343,26 @@ class MonsterLuaTests(unittest.TestCase):
         self.lua.execute(f"Game.ownArmy={{[1]=10,[4]={state},[5]=3,[6]=2792,[15]={{[1]=303}}}};"
                          "Game.busy=true;REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_list();REA_AUTO_INFANTRY.hunt_ack(2792,303,10)")
 
+    def test_reconnect_adopts_existing_army_without_departure_and_keeps_skip_latch(self):
+        """The new adapter may own one acknowledged original army, but cannot replay an acknowledged skip."""
+        self.prepare()
+        self.lua.execute('Game.ownArmy={[1]=10,[4]=3,[5]=3,[6]=2792,[15]={[1]=303}};'
+                         'REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_list()')
+        self.lua.execute('REA_AUTO_INFANTRY.hunt_resume(2792,303,10,1)')
+        self.assertEqual(len(self.lua.globals().Game.trips), 0)
+        self.assertFalse(self.lua.execute('return pcall(REA_AUTO_INFANTRY.hunt_skip,2792,303,10)')[0])
+        self.assertEqual(self.lua.globals().Game.skipCalls, 0)
+
+    def test_reconnect_cannot_adopt_foreign_target_or_stale_army(self):
+        """A matching numeric army ID alone never authorizes later automatic battle actions."""
+        self.prepare()
+        self.lua.execute('Game.ownArmy={[1]=10,[4]=3,[5]=3,[6]=9999,[15]={[1]=303}};'
+                         'REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_list()')
+        self.assertFalse(self.lua.execute('return pcall(REA_AUTO_INFANTRY.hunt_resume,2792,303,10,0)')[0])
+        self.lua.execute('Game.ownArmy[6]=2792;Game.time=Game.time+5000')
+        self.assertFalse(self.lua.execute('return pcall(REA_AUTO_INFANTRY.hunt_resume,2792,303,10,0)')[0])
+        self.assertEqual(len(self.lua.globals().Game.trips), 0)
+
     def test_skip_requires_tracked_arrival_and_is_once_only(self):
         """Only a confirmed arrived helper army can execute the native skip callback, exactly once."""
         self.prepare();self.bind_army()

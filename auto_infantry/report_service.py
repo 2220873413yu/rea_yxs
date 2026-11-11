@@ -76,6 +76,8 @@ class ReportService:
         except InterruptedError:
             pass
         except Exception as error:
+            if 'Account session changed' in str(error):
+                raise
             if self.alive(epoch):
                 self.switch(False);self.owner.publish(report_status='自动领取军报已停止：'+str(error).splitlines()[0],
                     account_changed='Account session changed'in str(error))
