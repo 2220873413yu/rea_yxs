@@ -811,7 +811,7 @@ class Connection:
         raise TimeoutError('采集目标或选将数据查询超时，未派出')
 
     def dispatch_collection(self, metrics, hero_id, generation):
-        """Check the just-refreshed roster locally and send without aging resource detail through more network I/O."""
+        """Check the local roster and send with the same recovery setting used to rank heroes."""
         checked_heroes((hero_id,))
         target = metrics['target']
         if self.response_log is None:
@@ -832,9 +832,8 @@ class Connection:
         # query_collection drained before its reads. Keep that cursor: a competing dispatch must be detected,
         # not erased, and another ADB drain here could expire both resource and hero evidence.
         arguments = (target['target_id'], hero_id, target['kind'], target['level'],
-                     target['detail_seq'], target['available_seq'], target['scope_radius'], target['x'], target['y'])
-        if target.get('balance_guard'):
-            arguments += (1,)
+                     target['detail_seq'], target['available_seq'], target['scope_radius'], target['x'], target['y'],
+                     int(bool(target.get('balance_guard'))), int(target.get('use_hero_recovery') is True))
         try:
             outcome = self.collection_call('collect_dispatch', arguments, generation, hero_id)
         except Exception as error:

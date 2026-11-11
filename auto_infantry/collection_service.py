@@ -126,7 +126,7 @@ class CollectionService:
         self.owner.publish(collection_status='采集参考属性已刷新（未派出）')
 
     def tick(self, connection):
-        """Balance resources on existing wakeups and select a hero under the run's recovery setting."""
+        """Balance resources and pass the run's hero recovery setting through to the final send check."""
         with self.owner.guard:
             if not self.enabled or self.owner.closing.is_set():
                 return
@@ -261,6 +261,7 @@ class CollectionService:
                     self.owner.publish(collection_status=f"正在派出{hero['name']}采{RESOURCE_NAMES[target['kind']]}（{target['x']},{target['y']}）")
                     target['scope_radius'] = 0 if run.options.mode == 'list' else run.options.radius
                     target['balance_guard'] = balance is not None
+                    target['use_hero_recovery'] = run.options.use_hero_recovery
                 self.uncertain = True
                 try:
                     receipt, after = connection.dispatch_collection(metrics, hero['hero_id'], generation)

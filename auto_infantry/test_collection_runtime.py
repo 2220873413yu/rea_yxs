@@ -241,10 +241,15 @@ class CollectionLuaTests(unittest.TestCase):
         self.lua.execute('Game.time=Game.time+3001')
         self.assertFalse(self.dispatch()[0])
 
-    def test_new_faster_cooling_hero_cannot_be_skipped_at_final_send(self):
-        """If the fastest candidate changed, a slower hero must not be silently dispatched instead."""
-        self.prepare('Game.finish=0;Game.extra={{id=305,state=0,finish=1660000,speed=400}}')
-        self.assertFalse(self.dispatch()[0])
+    def test_faster_hero_blocks_final_send_if_eligible_under_recovery_setting(self):
+        """Keep the rank guard for ready heroes and for cooling heroes when recovery is enabled."""
+        for finish, use_recovery in ((0, 0), (1660000, 1)):
+            with self.subTest(finish=finish, use_recovery=use_recovery):
+                self.setUp()
+                self.prepare(f'Game.finish=0;Game.extra={{{{id=305,state=0,finish={finish},speed=400}}}}')
+                result = self.lua.execute(f'return REA_AUTO_INFANTRY.collect_dispatch(2792,303,3,2,1,1,20,101,191,0,{use_recovery})')
+                self.assertEqual(result, 'collection_replan:selection')
+                self.assertEqual(len(self.lua.globals().Game.trips), 0)
 
     def test_queue_boolean_and_observer_cleanup(self):
         """The native limit check is inverted correctly and temporary observers are removed on close."""

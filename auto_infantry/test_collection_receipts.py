@@ -64,7 +64,7 @@ class DispatchTransportTests(unittest.TestCase):
         receipt, roster = connection.dispatch_collection({'target': target}, 303, 9)
         self.assertEqual(receipt['army_id'], 123)
         self.assertEqual(connection.collection_call.call_args_list[0].args,
-                         ('collect_dispatch', (2792, 303, 3, 2, 1, 1, 20, 101, 191), 9, 303))
+                         ('collect_dispatch', (2792, 303, 3, 2, 1, 1, 20, 101, 191, 0, 0), 9, 303))
         self.assertEqual(connection.collection_call.call_args_list[1].args,('collect_schedule',))
         connection.response_log.wait_collection.side_effect = TimeoutError('uncertain')
         connection.collection_call.reset_mock()
@@ -114,9 +114,10 @@ class DispatchTransportTests(unittest.TestCase):
                 c.response_log.wait_collection.assert_not_called()
 
     def test_final_send_does_not_expire_fresh_target_with_refresh_or_log_read(self):
-        """Exercise the real Lua guard: final selection sends before any slow refresh or ADB log read."""
+        """With recovery off, the real Lua guard sends the ready hero before any slow refresh or log read."""
         from test_collection_runtime import CollectionLuaTests
-        fixture=CollectionLuaTests();fixture.setUp();fixture.prepare()
+        fixture=CollectionLuaTests();fixture.setUp()
+        fixture.prepare('Game.finish=0;Game.extra={{id=305,state=0,finish=1660000,speed=400}}')
         c=Connection();c.response_log=Mock();order=[]
         c.response_log.drain.side_effect=AssertionError('late log read would expire the target')
         c.hero_call=Mock(side_effect=lambda *args:json.loads(fixture.lua.execute('return REA_AUTO_INFANTRY.hero_list()')))
@@ -136,6 +137,7 @@ class DispatchTransportTests(unittest.TestCase):
         c.dispatch_collection({'target':target},303,9)
         self.assertEqual(order,['send','refresh'])
         self.assertEqual(len(fixture.lua.globals().Game.trips),1)
+        self.assertEqual(fixture.lua.globals().Game.trips[1][1][1],303)
         c.response_log.drain.assert_not_called()
 
     def test_slow_query_log_drain_precedes_hero_refresh_and_does_not_expire_capacity(self):

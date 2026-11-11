@@ -371,8 +371,8 @@ local function checkBalanceLimit(kind)
  assert(count<cap,'Collection same-resource limit reached')
 end
 
--- Submit one native follower formation with fresh target, own-action and optional diversity checks.
-function api.collect_dispatch(target,heroId,kind,level,expectedDetail,expectedAvailable,radius,expectedX,expectedY,balanceGuard)
+-- Recheck one formation using the same cooldown eligibility as the Python planner.
+function api.collect_dispatch(target,heroId,kind,level,expectedDetail,expectedAvailable,radius,expectedX,expectedY,balanceGuard,useHeroRecovery)
  assert(not observerFailed,'Collection observer state is uncertain')
  local chosenSoldier=methods('SLGChosenSoldier')
  local collectLogic=methods('SLGChooseHeroLogicCollectResource')
@@ -409,8 +409,9 @@ function api.collect_dispatch(target,heroId,kind,level,expectedDetail,expectedAv
   local id=h[1][1][3]
   local state=api.read_hero_state(id)
   local action=methods('SLGChooseHeroItem').getActionState(h)
+  local eligibleAction=(action==0 and state.remaining_ms==0) or (useHeroRecovery==1 and (action==0 or action==5))
   if state.found and state.fresh and state.army_known and not state.busy and state.hero_state==0 and
-   (action==0 or action==5) and h[6]>0 then
+   eligibleAction and h[6]>0 then
    if not best or h[6]>best[6] or (h[6]==best[6] and (h[5]>best[5] or
     (h[5]==best[5] and (h[3]<best[3] or (h[3]==best[3] and id<best[1][1][3]))))) then best=h end
   end
