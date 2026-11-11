@@ -71,7 +71,8 @@ class GameResponseLog:
             self.cursor = 4
             return
         offset = max(0, (size - 524288) // 4096) * 4096
-        blob = self.read('exec-out', 'dd', 'if=' + self.path, 'bs=4096',
+        # LDPlayer14's bare dd entry reports "no such tool"; select the available Toybox applet explicitly.
+        blob = self.read('exec-out', 'toybox', 'dd', 'if=' + self.path, 'bs=4096',
                          'skip=' + str(offset // 4096), 'count=129')
         for match in re.finditer(rb'[sr]_\d+_\w+', blob):
             at = match.start()

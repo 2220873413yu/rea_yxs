@@ -154,11 +154,12 @@ class CollectionStrategyTests(unittest.TestCase):
         """Recover the fastest idle hero, but never recover one who is marching or otherwise busy."""
         roster = hero_roster(hero_state(remaining_ms=600000), hero_state(hero_id=305, remaining_ms=0))
         metrics = dict(heroes=[metric(303, 300, action_state=5), metric(305, 200)])
-        self.assertEqual(best_collector(metrics, roster)['hero_id'], 303)
-        roster['heroes'][0]['busy'] = True
         self.assertEqual(best_collector(metrics, roster)['hero_id'], 305)
+        self.assertEqual(best_collector(metrics, roster, use_hero_recovery=True)['hero_id'], 303)
+        roster['heroes'][0]['busy'] = True
+        self.assertEqual(best_collector(metrics, roster, use_hero_recovery=True)['hero_id'], 305)
         roster['heroes'][1]['fresh'] = False
-        self.assertIsNone(best_collector(metrics, roster))
+        self.assertIsNone(best_collector(metrics, roster, use_hero_recovery=True))
 
     def test_list_scope_accepts_mixed_levels_and_requires_live_stock_checks(self):
         """Only listed positions within range qualify; stale cached stock/occupation never bypass a live query."""
@@ -206,12 +207,30 @@ class SharedRecoveryTests(unittest.TestCase):
         self.clock = clock.start()
         self.addCleanup(clock.stop)
 
-    def start(self, normal=True):
-        """Start the known iron target and optionally the same hero's ordinary recovery switch."""
+    def start(self, normal=True, *, use_hero_recovery=False):
+        """Start the iron target with independent controls for the two sources of recovery."""
         if normal:
             self.worker.switch_hero(True, (303,))
-        self.worker.switch_collection(True, CollectionOptions())
+        self.worker.switch_collection(True, CollectionOptions(use_hero_recovery=use_hero_recovery))
         self.worker.collection.tick(self.game)
+
+    def test_default_skips_cooling_top_hero_without_authorizing_recovery(self):
+        """Unselected item use dispatches the next ready hero and grants no recovery permission."""
+        self.start(normal=False)
+        self.worker.hero_tick(self.game)
+        self.assertEqual(self.game.departures, [305])
+        self.assertEqual(self.game.items, 30)
+        self.assertEqual(self.worker.recovery_authorized, ())
+
+    def test_default_waits_when_all_eligible_heroes_are_cooling(self):
+        """Keep collection enabled without spending items when no ready hero is available."""
+        self.game.states[305]['remaining_ms'] = 600000
+        self.start(normal=False)
+        self.worker.hero_tick(self.game)
+        self.assertTrue(self.worker.collection.enabled)
+        self.assertEqual(self.game.departures, [])
+        self.assertEqual(self.game.recoveries, [])
+        self.assertEqual(self.worker.recovery_authorized, ())
 
     def test_unsent_busy_hero_replans_to_next_hero_without_closing(self):
         """A hero occupied after selection causes one bounded recheck and a new eligible selection."""
@@ -264,7 +283,7 @@ class SharedRecoveryTests(unittest.TestCase):
 
     def test_overlapping_sources_charge_only_once_per_confirmed_item(self):
         """Two sources for303 produce two needed items, not two parallel two-item sequences."""
-        self.start()
+        self.start(use_hero_recovery=True)
         self.assertEqual(self.worker.recovery_authorized, (303,))
         self.assertEqual(self.game.gates, [(303,)])
         self.assertTrue(self.worker.hero_tick(self.game))
@@ -279,7 +298,7 @@ class SharedRecoveryTests(unittest.TestCase):
 
     def test_stopping_collection_preserves_normal_authorization(self):
         """Removing collection's demand does not remove a still-enabled explicit recovery choice."""
-        self.start()
+        self.start(use_hero_recovery=True)
         self.worker.switch_collection(False)
         self.assertEqual(self.worker.recovery_authorized, (303,))
         self.worker.hero_tick(self.game)
@@ -288,7 +307,7 @@ class SharedRecoveryTests(unittest.TestCase):
 
     def test_stopping_normal_recovery_preserves_collection_demand(self):
         """The normal switch may be off while collection's explicitly approved recovery finishes."""
-        self.start()
+        self.start(use_hero_recovery=True)
         self.worker.switch_hero(False)
         self.assertEqual(self.worker.recovery_authorized, (303,))
         self.worker.hero_tick(self.game)
@@ -301,12 +320,12 @@ class SharedRecoveryTests(unittest.TestCase):
 
     def test_stopping_both_or_a_full_queue_cancels_collection_only_recovery(self):
         """No remaining demand or queue capacity means no more collection-funded recovery items."""
-        self.start(normal=False)
+        self.start(normal=False, use_hero_recovery=True)
         self.worker.switch_collection(False)
         self.worker.hero_tick(self.game)
         self.assertEqual(self.game.recoveries, [])
         self.assertEqual(self.worker.recovery_authorized, ())
-        self.start(normal=False)
+        self.start(normal=False, use_hero_recovery=True)
         self.game.queue_free = False
         self.worker.hero_tick(self.game)
         self.assertEqual(self.game.recoveries, [])
@@ -315,7 +334,7 @@ class SharedRecoveryTests(unittest.TestCase):
     def test_busy_top_hero_uses_next_without_any_recovery(self):
         """Being busy is not fixed by recovery items, so second place is used directly."""
         self.game.states[303].update(busy=True, hero_state=4)
-        self.start(normal=False)
+        self.start(normal=False, use_hero_recovery=True)
         self.assertEqual(self.game.departures, [305])
         self.assertEqual(self.game.recoveries, [])
 
@@ -341,7 +360,7 @@ class SharedRecoveryTests(unittest.TestCase):
             result['target'].update(occupants=1, capacity=2, own_present=True)
             return result
         self.game.query_collection = own_query
-        self.start(normal=False)
+        self.start(normal=False, use_hero_recovery=True)
         self.worker.hero_tick(self.game)
         self.assertEqual(self.game.departures, [])
         self.assertEqual(self.game.recoveries, [])
@@ -350,7 +369,7 @@ class SharedRecoveryTests(unittest.TestCase):
     def test_user_off_during_query_never_authorizes_or_dispatches(self):
         """A late response from a disabled run cannot open either spending gate."""
         self.game.query_hook = lambda: self.worker.switch_collection(False)
-        self.start(normal=False)
+        self.start(normal=False, use_hero_recovery=True)
         self.assertEqual(self.game.departures, [])
         self.assertEqual(self.game.recoveries, [])
         self.assertEqual(self.game.allowed, set())

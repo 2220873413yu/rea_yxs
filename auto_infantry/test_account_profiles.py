@@ -19,7 +19,7 @@ from lupa import LuaRuntime
 
 from account_store import AccountStore, AccountError, TicketExpired, crypt_profile, profile_key, validate_profile, AUTH_KEYS
 from account_transport import AccountTransport, SDK_DB, SDK_PREF, GAME_SETTING, merge_wal
-from account_service import AccountService
+from account_service import AccountService, SOURCE
 from login_session import LoginSession
 from account_lock import account_operation, ensure_account_available
 
@@ -246,6 +246,8 @@ class AccountLoginTests(unittest.TestCase):
 
     def setUp(self):
         self.service = AccountService(Mock(), Mock())
+        self.service.call = Mock(return_value=dict(has_token=True, sdk_platform=1, auth_ret=0,
+                                                   auth_sent=True, identity_matched=True))
         self.connection = Mock()
         self.cancel = threading.Event()
 
@@ -309,6 +311,39 @@ class AccountLoginTests(unittest.TestCase):
         self.service.identity = Mock(return_value=dict(server_matches=True, openid='alice', zone=1))
         self.assertEqual(self.service._authenticated(self.connection, self.cancel, Mock(), profile(), 1, 0), role)
 
+    def test_explicit_server_refusal_stops_before_waiting_and_never_saves(self):
+        """A valid SDK token does not justify waiting/retrying after the game returned a rejection."""
+        self.connection.login_call.return_value = dict(logged_in=False)
+        self.service.call.return_value = dict(has_token=True, sdk_platform=1, auth_ret=2,
+                                              auth_sent=True, identity_matched=True)
+        with patch.object(self.cancel, 'wait') as wait:
+            with self.assertRaisesRegex(AccountError, '身份校验失败.*2'):
+                self.service._authenticated(self.connection, self.cancel, Mock(), None, 1, 0)
+        wait.assert_not_called()
+        self.service.store.save.assert_not_called()
+        self.service.store.mark_scan_required.assert_not_called()
+
+    def test_cached_success_cannot_bypass_this_attempts_identity_check(self):
+        """Old role state cannot be accepted before this guard observed a matched request and response."""
+        self.connection.login_call.return_value = profile()['role']
+        self.service.call.return_value = dict(has_token=True, sdk_platform=1, auth_ret=-999,
+                                              auth_sent=False, identity_matched=False)
+        with self.assertRaisesRegex(AccountError, '本次登录'):
+            self.service._authenticated(self.connection, self.cancel, Mock(), None, 1, 0)
+
+    def test_rejected_scan_never_captures_or_overwrites_a_saved_ticket(self):
+        """Use the real refusal observer through the save boundary, rather than mocking the failing method."""
+        self.service._agreement = Mock()
+        self.service.call.side_effect = lambda c, op, *args: (
+            dict(has_token=True, sdk_platform=1, auth_ret=2) if op == 'watch' else 'qr_requested')
+        self.connection.login_call.return_value = dict(logged_in=False)
+        self.service.capture = Mock()
+        with self.assertRaisesRegex(AccountError, '身份校验失败'):
+            self.service._finish_login(self.connection, self.cancel, Mock(), None, 1, 0, 0)
+        self.service.capture.assert_not_called()
+        self.service.store.save.assert_not_called()
+        self.assertEqual([c.args[1] for c in self.service.call.call_args_list], ['qr', 'watch'])
+
     def test_snapshot_prunes_other_accounts_without_modifying_live_sdk_database(self):
         """The stored profile must contain only the authenticated identity even when SDK history has several records."""
         live = sdk_db(qq=('qq-other',), wx=('alice', 'wx-other'))
@@ -360,7 +395,7 @@ class AccountLoginTests(unittest.TestCase):
         self.service._authenticated=Mock(side_effect=lambda *args:order.append('confirmed') or profile()['role'])
         self.service.capture=Mock(return_value=profile())
         self.service._finish_login(self.connection,self.cancel,Mock(),None,0,1,0)
-        self.assertEqual(order,['qr','confirmed','resume'])
+        self.assertEqual(order,['qr','confirmed','auth_cleanup','resume'])
         self.service.store.save.assert_called_once()
 
     def test_failed_qr_stops_native_auth_without_erasing_or_marking_saved_profiles(self):
@@ -404,7 +439,20 @@ CSLTypes={Setting={sharedInstance=function()return setting end},ApolloLoginContr
  TicketsProtocol={getInstance=function()return tickets end},MainModel='main',ModelManager={sharedInstance=function()return {getModel=function()return {myUserId={1,'private-id',0,1},mTLoginRsp=Game.response}end}end},
  QQGameSystem={getSystemInstance=function()return {getCurZoneID=function()return 1 end}end}}
 ''')
-        self.source = Path(__file__).with_name('account_runtime.lua').read_text(encoding='utf-8')
+        self.lua.execute('''
+local T_ID={E_SVR_MSG_ID_LOGIN=2}
+package.loaded.LoginManager={__instanceDict={initialize=function()return T_ID.E_SVR_MSG_ID_LOGIN end}}
+local handlers={}
+function handlers:get_Count()return #self end
+function handlers:get_Item(i)return self[i+1]end
+function handlers:Remove(v)for i,h in ipairs(self)do if h==v then table.remove(self,i);return end end end
+CSLTypes.ProtoController={recvSwitch={get=function()return handlers end},
+ addRecvCallback=function(id,fn)handlers[#handlers+1]={callback=fn}end}
+CSLTypes.MsgManager={sendData=function()end}
+package.loaded.MsgManager=CSLTypes.MsgManager
+CSLNewfunc=function(self,fn)return function(...)return fn(self,...)end end
+''')
+        self.source = SOURCE
 
     def operation(self, name, mobile=1, platform=0):
         """Run one fixed native operation in an isolated Lua environment; no real SDK or server is present."""
@@ -419,6 +467,7 @@ CSLTypes={Setting={sharedInstance=function()return setting end},ApolloLoginContr
         self.assertEqual(self.lua.globals().Game.qr, 0)
         with self.assertRaises(Exception):self.operation('restore')
         self.assertEqual(self.lua.globals().Game.auth, 1)
+        self.operation('auth_cleanup')
         self.lua.execute('REA_ACCOUNT_AUTH_ATTEMPT=nil;Game.sdk.platform=2')
         self.operation('restore', 0, 1)
         self.assertEqual(self.lua.globals().Game.mobile, 0)
@@ -556,6 +605,8 @@ class AccountDialogTests(unittest.TestCase):
         app.root = Mock();app.status = Mock();app.sessions = Mock()
         app.battle_chat = Mock();app.battle_chat.pending_shutdown.return_value=False
         app.hall_profile = Mock();app.hall_profile.pending_shutdown.return_value=False
+        app.guild_invite = Mock();app.guild_invite.pending_shutdown.return_value=False
+        app.guild_web_relay = Mock();app.guild_web_relay.pending_shutdown.return_value=False
         app.sessions.pending_shutdown.side_effect = [True, False]
         app.finish_close()
         app.root.destroy.assert_not_called()

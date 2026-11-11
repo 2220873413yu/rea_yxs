@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from lupa import LuaRuntime
 from login_session import LoginSession, SessionEvents, account_label
+from account_store import AccountError
 
 SOURCE = Path(__file__).with_name('login_runtime.lua').read_text(encoding='utf-8')
 ROLE = dict(logged_in=True, stage='MainHallSceneStage', agreement=True, ret=0,
@@ -28,35 +29,34 @@ class LoginLifecycleTests(unittest.TestCase):
         self.cancel = threading.Event()
         self.bridge = Mock()
         self.worker = Mock()
+        self.session.accounts = Mock()
 
-    def replace(self, states, previous=None):
-        """Run the actual replacement sequence with predetermined local login cache observations."""
-        def call(op='status'):
-            if op == 'status':
-                return next(states)
-            return op + '_requested'
-        self.bridge.login_call.side_effect = call
+    def replace(self, previous=None, error=None):
+        """Isolate the account-service transport while testing real session ownership and worker creation."""
+        self.session.accounts.login.return_value = (ROLE, {'name': '旅行'})
+        self.session.accounts.login.side_effect = error
         with patch('login_session.ensure_server'), patch('login_session.Connection', return_value=self.bridge), \
                 patch('login_session.Worker', return_value=self.worker) as factory:
             self.session._replace('ios_wechat', 0, self.cancel, previous, None)
             return factory
 
     def test_missing_agreement_never_requests_qr_or_creates_worker(self):
-        """The user, rather than the helper, must accept the native authentication agreement."""
-        factory = self.replace(iter([dict(stage='LoginStage', agreement=False)]))
-        self.assertEqual(self.bridge.login_call.call_count, 1)
+        """An account-service agreement failure cannot fall back to the old unguarded QR path."""
+        factory = self.replace(error=AccountError('等待本人确认协议'))
+        self.bridge.login_call.assert_not_called()
         factory.assert_not_called()
-        self.bridge.close.assert_called_once()
+        self.session.accounts.login.assert_called_once()
 
     def test_success_closes_old_owner_and_uses_one_qr_before_new_default_off_worker(self):
         """A successful scan cannot resume old automation, heroes, map caches or scheduled hunting."""
         previous = Mock()
         previous.is_alive.return_value = False
-        factory = self.replace(iter([dict(stage='LoginStage', agreement=True), ROLE]), previous)
+        factory = self.replace(previous)
         previous.stop.assert_called_once()
         previous.join.assert_called_once()
-        self.assertEqual([c.args for c in self.bridge.login_call.call_args_list], [(), ('qr',), ()])
-        self.bridge.close.assert_called_once()
+        self.bridge.login_call.assert_not_called()
+        self.session.accounts.login.assert_called_once()
+        self.assertEqual(self.session.accounts.login.call_args.kwargs, {'profile_id': None, 'qr_context': (1, 0)})
         factory.assert_called_once()
         self.assertIs(self.session.worker, self.worker)
         self.assertFalse(self.worker.allow_scheduled_hunt)
@@ -67,8 +67,9 @@ class LoginLifecycleTests(unittest.TestCase):
         """Never acquire a second bridge while a stopped worker may still own game operations."""
         previous = Mock()
         previous.is_alive.return_value = True
-        factory = self.replace(iter([]), previous)
+        factory = self.replace(previous)
         self.bridge.attach.assert_not_called()
+        self.session.accounts.login.assert_not_called()
         factory.assert_not_called()
 
     def test_cancelled_or_timed_out_wait_never_retries_authentication(self):

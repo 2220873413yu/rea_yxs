@@ -24,7 +24,8 @@ class GameLogCursorTests(unittest.TestCase):
             if args[:3]==('shell','ls','-t'):
                 return b'2026_11_07' if args[3].endswith('/net') else b'20_50_42'
             if args[:2]==('shell','stat'):return str(size).encode()
-            if args[:2]==('exec-out','dd'):return b'junk'+frame+frame[:8]
+            if args[:2]==('exec-out','dd'):return b'dd: no such tool\n'
+            if args[:3]==('exec-out','toybox','dd'):return b'junk'+frame+frame[:8]
             if args[:2]==('exec-out','tail'):return frame
             raise AssertionError(args)
 

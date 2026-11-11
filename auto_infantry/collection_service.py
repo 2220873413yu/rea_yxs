@@ -126,7 +126,7 @@ class CollectionService:
         self.owner.publish(collection_status='采集参考属性已刷新（未派出）')
 
     def tick(self, connection):
-        """On existing wakeups, balance projected stock within type caps, then confirm one eligible departure."""
+        """Balance resources on existing wakeups and select a hero under the run's recovery setting."""
         with self.owner.guard:
             if not self.enabled or self.owner.closing.is_set():
                 return
@@ -210,6 +210,7 @@ class CollectionService:
                                                active_resource_targets(schedule))
                 candidates = balanced_candidates(candidates, balance)
             low_stock = 0
+            no_eligible_hero = False
             for candidate in candidates:
                 with self.owner.guard:
                     if not self.alive(run, epoch):
@@ -246,8 +247,9 @@ class CollectionService:
                         low_stock += 1
                         run.blocked[candidate['target_id']] = time.monotonic() + 30
                         continue
-                    hero = best_collector(metrics, roster)
+                    hero = best_collector(metrics, roster, use_hero_recovery=run.options.use_hero_recovery)
                     if hero is None:
+                        no_eligible_hero = True
                         continue
                     state = next(row for row in roster['heroes'] if row['hero_id'] == hero['hero_id'])
                     run.reserve(target, hero, state)
@@ -303,7 +305,8 @@ class CollectionService:
                             located_points=len(run.located),collection_status='区域已确认，自动继续核对并补队，无需点击立即检查')
                         return
                 loaded = {(row['x'], row['y']) for row in rows} & set(run.options.coordinates)
-                message = f'清单{len(run.options.coordinates)}点，本次已定位{len(loaded)}点；暂无合格可采点'
+                message = f'清单{len(run.options.coordinates)}点，本次已定位{len(loaded)}点'
+                message += '；暂无可出征英雄' if no_eligible_hero else '；暂无合格可采点'
                 if balance:
                     capped = [RESOURCE_NAMES[k] for k, count in balance['counts'].items()
                               if count >= balance['same_kind_limit']]
@@ -311,10 +314,9 @@ class CollectionService:
                         message += '；' + '、'.join(capped) + f"已达同类{balance['same_kind_limit']}队上限"
                 if low_stock:
                     message += f'，本次跳过{low_stock}个高等级余量不足4万的点'
-                message += '；' + self.schedule_status()
             else:
-                message = '暂无符合条件的可采点；' + self.schedule_status()
-            self.owner.publish(collection_status=message)
+                message = '暂无可出征英雄' if no_eligible_hero else '暂无符合条件的可采点'
+            self.owner.publish(collection_status=message + '；' + self.schedule_status())
         except CollectionReplan as error:
             # Only a typed, definitely-unsent result reaches here; transport/receipt errors still stop below.
             with self.owner.guard:

@@ -14,7 +14,8 @@ from account_store import AccountError, TicketExpired, AUTH_KEYS, decode_sdk, va
 from account_transport import AccountTransport, SDK_PREF, cancelled
 from account_lock import account_operation
 
-SOURCE = Path(__file__).with_name('account_runtime.lua').read_text(encoding='utf-8')
+SOURCE = (Path(__file__).with_name('account_auth_guard.lua').read_text(encoding='utf-8') + '\n' +
+          Path(__file__).with_name('account_runtime.lua').read_text(encoding='utf-8'))
 
 
 class AccountService:
@@ -28,7 +29,7 @@ class AccountService:
     @staticmethod
     def call(connection, operation, mobile=0, open_platform=0, resume_auto=0):
         """Submit only fixed operations and integer platform enums; no UI-supplied Lua or token interpolation."""
-        if operation not in {'ready', 'pause', 'identity', 'watch', 'restore', 'qr', 'cancel_auth', 'resume'}:
+        if operation not in {'ready', 'pause', 'identity', 'watch', 'restore', 'qr', 'cancel_auth', 'resume', 'auth_cleanup'}:
             raise AccountError('未知账号操作')
         if any(type(v) is not int or v not in (0, 1) for v in (mobile, open_platform, resume_auto)):
             raise AccountError('登录平台参数无效')
@@ -154,19 +155,27 @@ class AccountService:
                 raise AccountError('等待协议期间登录界面已变化，请重新读取当前账号')
 
     def _authenticated(self, connection, cancel, publish, profile=None, mobile=0, open_platform=0):
-        """Observe one authentication result; refusal or timeout never triggers another SDK login request."""
+        """Stop at the first native refusal or identity mismatch; saved tickets and retry policy stay unchanged."""
         deadline, invalid_since = time.monotonic() + (60 if profile is not None else 180), None
         while time.monotonic() < deadline:
             cancelled(cancel)
             state = connection.login_call()
+            watch = self.call(connection, 'watch')
+            if watch.get('auth_error'):
+                raise AccountError('登录身份上下文不一致，已停止；未重试认证，也未覆盖原票据')
+            ret = watch.get('auth_ret', -999)
+            if ret not in (-999, 0):
+                reason = '身份校验失败' if ret == 2 else '登录被拒绝'
+                raise AccountError(f'游戏服务器{reason}（错误码：{ret}），已停止；未自动重试，原票据保留')
             if state['logged_in'] and state['ret'] == 0:
+                if not watch.get('auth_sent') or not watch.get('identity_matched') or ret != 0:
+                    raise AccountError('本次登录的身份或服务器响应尚未确认，未保存票据')
                 identity = self.identity(connection)
                 if (state['mobile_platform'] != mobile or state['open_platform'] != open_platform or
                         not identity['server_matches'] or (profile and (identity['openid'] != profile['openid'] or
                         identity['zone'] != profile.get('zone', 1)))):
                     raise AccountError('服务器返回的账号或平台与选中记录不一致，自动功能保持关闭')
                 return state
-            watch = self.call(connection, 'watch')
             if not watch['has_token'] or watch['sdk_platform'] not in (1, 2):
                 invalid_since = invalid_since or time.monotonic()
                 if time.monotonic() - invalid_since >= 5 and profile is not None:
@@ -241,6 +250,7 @@ class AccountService:
             raise TicketExpired('SDK未接受本地票据，请重新扫码登录')
         publish(status='票据已提交，正在等待服务器确认…' if profile else '二维码已请求，请扫码并在手机确认授权…')
         state = self._authenticated(connection, cancel, publish, profile, mobile, open_platform)
+        self.call(connection, 'auth_cleanup')
         if profile is None:
             self.call(connection, 'resume', mobile, open_platform, original_auto)
         self.paused_auto = None

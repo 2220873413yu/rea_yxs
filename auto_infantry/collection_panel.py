@@ -13,6 +13,7 @@ class CollectionPanel(ttk.LabelFrame):
     def __init__(self, parent, enabled, on_switch, on_check=None):
         super().__init__(parent, text='自动采集', padding=10)
         self.enabled = enabled
+        self.use_hero_recovery = tk.BooleanVar(master=self, value=False)
         self.ready = False
         self.queue_snapshot = None
         self.queue_text = tk.StringVar(value='已出征 / 上限：待读取')
@@ -29,6 +30,8 @@ class CollectionPanel(ttk.LabelFrame):
         switch_bar.pack(fill='x', pady=(0, 8))
         self.toggle = ttk.Checkbutton(switch_bar, text='自动采集', variable=enabled, command=on_switch, state='disabled')
         self.toggle.pack(side='left')
+        self.recovery_toggle = ttk.Checkbutton(switch_bar, text='使用英雄恢复道具', variable=self.use_hero_recovery)
+        self.recovery_toggle.pack(side='left', padx=(10, 0))
         ttk.Label(switch_bar, textvariable=self.queue_text).pack(side='right')
         row = ttk.Frame(self)
         row.pack(fill='x')
@@ -73,16 +76,18 @@ class CollectionPanel(ttk.LabelFrame):
         self.list_summary.set(f'已保存{len(self.coordinates)}个坐标')
 
     def options(self):
-        """Freeze the saved list only; no hidden resource, level or radius controls constrain it."""
+        """Freeze the saved list and optional hero item use when collection starts."""
         if not self.coordinates:
             raise ValueError('请先点击“编辑资源清单”录入并保存坐标')
-        return CollectionOptions(mode='list', coordinates=self.coordinates)
+        return CollectionOptions(mode='list', coordinates=self.coordinates,
+                                 use_hero_recovery=self.use_hero_recovery.get())
 
     def update_controls(self, ready):
-        """Allow immediate stop while connected, and freeze the editor for an active run."""
+        """Allow immediate stop while connected and freeze run options while collecting."""
         self.ready = ready
         self.toggle.state(['!disabled'] if ready else ['disabled'])
         self.list_button.state(['disabled'] if self.enabled.get() else ['!disabled'])
+        self.recovery_toggle.state(['disabled'] if self.enabled.get() else ['!disabled'])
         self.check_button.state(['!disabled'] if ready and self.enabled.get() else ['disabled'])
         self.render_queue()
 
@@ -103,11 +108,12 @@ class CollectionPanel(ttk.LabelFrame):
         self.queue_text.set(f"{prefix}：{used if state.get('queue_known') and used >= 0 else '—'} / {limit if limit >= 0 else '—'} 队")
 
     def apply_metrics(self, metrics):
-        """Label reference recommendations by resource, leaving actual selection to fresh target queries."""
+        """Reflect the item setting in reference recommendations and recheck eligibility before departure."""
         kind = RESOURCE_NAMES.get(metrics['target']['kind'], '资源')
+        eligible_actions = (0, 5) if self.use_hero_recovery.get() else (0,)
         rows = [hero for hero in metrics['heroes'] if hero.get('found') and hero.get('fresh') and
                 hero.get('army_known') and not hero.get('busy') and hero.get('hero_state') == 0 and
-                hero.get('action_state') in (0, 5) and hero.get('speed', 0) > 0]
+                hero.get('action_state') in eligible_actions and hero.get('speed', 0) > 0]
         if rows:
             first = min(rows, key=lambda hero: (-hero['speed'], -hero['load'], hero['travel_seconds'], hero['hero_id']))
             self.recommendation.set(f"{kind}参考首选：{first['name']}，{first['speed']}/分。实际出征前重查。")

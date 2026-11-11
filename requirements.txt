@@ -1,2 +1,2 @@
-frida==17.25.2
+frida==17.26.2
 cryptography==50.0.2

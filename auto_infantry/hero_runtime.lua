@@ -253,4 +253,15 @@ function api.hero_speed(heroId)
  controller:sendTSLGBuildSpeedupReq(3,500,state.hero_id,vec)
  return 'hero_speed_sent'
 end
+
+-- A burst step still checks native state on UnityMain; a completed cooldown never consumes another item.
+function api.hero_speed_step(heroId)
+ local state=snapshot(heroId)
+ assert(state.found and state.fresh and state.army_known,'Hero state unknown or stale')
+ if state.hero_state~=0 or state.busy then return encode({sent=false,reason='busy'}) end
+ if state.remaining_ms<=0 then return encode({sent=false,reason='complete'}) end
+ if state.items<=0 then return encode({sent=false,reason='items'}) end
+ api.hero_speed(heroId)
+ return encode({sent=true})
+end
 return 'hero_api_installed'

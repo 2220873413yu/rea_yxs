@@ -36,6 +36,7 @@ def recovery_plan(worker, connection, error):
         'reason': str(error).splitlines()[0],
         'collection': collection.run.options if collection.enabled and not collection_blocked else None,
         'collection_blocked': collection_blocked,
+        'recovery_mode': worker.recovery_mode,
         'hunt_blocked': blocked,
         'hunt': {
             'options': hunt.options, 'active': deepcopy(hunt.active),

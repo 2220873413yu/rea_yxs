@@ -16,11 +16,12 @@ from hero_preferences import checked_heroes
 from game_log import GameResponseLog, ResourceMissing, BeaconCapacityUnavailable
 from account_lock import ensure_account_available
 from player_profile_cache import PlayerProfileCache
+from fast_recovery import FastRecovery
 from collection import CollectionReplan
 from monster import HuntReplan
 from region_conflict import RegionConflict,RegionRestoreConflict
 from hunt_reconnect import SessionUnsent, SessionAccepted, connection_lost, fence_rejected
-from bootstrap import ADB, adb
+from bootstrap import ADB, ensure_client_version, root_command
 
 ROOT = Path(__file__).resolve().parent
 
@@ -66,6 +67,7 @@ class Connection:
         self.league_query_installed = False
         self.map_index_installed = False
         self.profile_cache = PlayerProfileCache()
+        self.fast_recovery = FastRecovery()
         self.reconnect_key = None
         self.preserve_reconnect = False
         self.process_identity = None
@@ -99,6 +101,7 @@ class Connection:
 
     def attach(self, expected_process=None):
         """Own a default-off bridge without requiring a world map, for native login or normal startup."""
+        ensure_client_version()
         self.acquire_owner()
         package = subprocess.check_output([ADB, '-s', 'emulator-5554', 'shell', 'dumpsys', 'package', 'com.qqgame.mic'],
                                           text=True, timeout=8, encoding='utf-8', errors='replace',
@@ -126,8 +129,8 @@ class Connection:
     @staticmethod
     def read_process_identity():
         """Identify this Android boot and game process start, including when a PID has been reused."""
-        result = adb('shell', "su -c 'p=$(pidof com.qqgame.mic) && cat /proc/sys/kernel/random/boot_id && cat /proc/$p/stat'",
-                     check=False)
+        result = root_command('p=$(pidof com.qqgame.mic) && cat /proc/sys/kernel/random/boot_id && cat /proc/$p/stat',
+                              check=False)
         lines = result.stdout.splitlines()
         if result.returncode or len(lines) != 2:
             return None
@@ -261,15 +264,15 @@ class Connection:
 
     def hero_call(self, operation, generation=None, hero_id=303):
         """Dispatch fixed operations for one validated identifier, with no arbitrary UI-supplied Lua."""
-        if operation not in {'hero_status', 'hero_list', 'hero_refresh', 'hero_speed', 'hero_view'}:
+        if operation not in {'hero_status', 'hero_list', 'hero_refresh', 'hero_speed', 'hero_speed_step', 'hero_view'}:
             raise ValueError('Unknown hero operation')
         checked_heroes((hero_id,))
-        argument = str(hero_id) if operation in {'hero_status', 'hero_speed'} else ''
+        argument = str(hero_id) if operation in {'hero_status', 'hero_speed', 'hero_speed_step'} else ''
         with self.lock:
             result = self.script.exports_sync.query(f'return REA_AUTO_INFANTRY.{operation}({argument})',
-                                                    'hero' if operation == 'hero_speed' else False, hero_id,
+                                                    'hero' if operation in {'hero_speed','hero_speed_step'} else False, hero_id,
                                                     generation)
-            return json.loads(result) if operation in {'hero_status', 'hero_list', 'hero_view'} else result
+            return json.loads(result) if operation in {'hero_status', 'hero_list', 'hero_view','hero_speed_step'} else result
 
     def hero_view(self):
         """Read existing response/push changes locally; this operation never sends a game request."""
@@ -299,6 +302,8 @@ class Connection:
 
     def recover_hero(self, before, generation, timeout=6):
         """Consume one recovery item and verify the response type/target before authoritative refresh."""
+        if self.fast_recovery.uncertain:
+            raise RuntimeError('上批快速恢复结果不明，请核对游戏并重新连接助手')
         hero_id = before['hero_id']
         checked_heroes((hero_id,))
         self.hero_call('hero_speed', generation, hero_id=hero_id)
@@ -312,6 +317,11 @@ class Connection:
                 return self.refresh_hero(hero_id=hero_id)
             time.sleep(0.15)
         raise TimeoutError('英雄恢复结果不明，已停止且不会自动重发')
+
+    def recover_hero_fast(self,before,generation,cancelled):
+        """Use one shared receipt cursor for a bounded burst, keeping unknown results latched across modes."""
+        if self.response_log is None:self.response_log=GameResponseLog(ADB)
+        return self.fast_recovery.recover(self,before,generation,cancelled,self.response_log)
 
     def set_collection_enabled(self, enabled):
         """Revoke queued departures immediately without touching the shared recovery or troop gates."""

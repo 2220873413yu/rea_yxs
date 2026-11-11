@@ -27,7 +27,7 @@ def collection_queue_reason(state):
 
 @dataclass(frozen=True)
 class CollectionOptions:
-    """Freeze one run's resource scope; fixed coordinates use the game's display coordinate system."""
+    """Freeze the resource scope and item authorization for one run."""
     kind: int = 3
     level: int = 2
     radius: int = 20
@@ -35,6 +35,7 @@ class CollectionOptions:
     x: int = 101
     y: int = 191
     coordinates: tuple = ()
+    use_hero_recovery: bool = False
 
     def __post_init__(self):
         """Reject malformed options before any query, recovery authorization or departure."""
@@ -44,6 +45,8 @@ class CollectionOptions:
                 self.mode not in {'coordinate', 'nearby', 'list'} or type(self.x) is not int or
                 type(self.y) is not int or not 0 <= self.x <= 10000 or not 0 <= self.y <= 10000):
             raise ValueError('采集类型、等级、范围或坐标无效')
+        if type(self.use_hero_recovery) is not bool:
+            raise ValueError('采集恢复道具选项无效')
         object.__setattr__(self, 'coordinates', checked_coordinates(self.coordinates))
         if self.mode == 'list' and not self.coordinates:
             raise ValueError('请先录入并保存资源清单')
@@ -88,16 +91,18 @@ def candidate_targets(rows, options, blocked, now, active_targets=()):
                   key=lambda row: (row['distance'], row['x'], row['y'], row['target_id']))
 
 
-def best_collector(metrics, roster):
-    """Rank target-specific speeds, allowing idle-but-cooling heroes while excluding busy/unknown heroes."""
+def best_collector(metrics, roster, *, use_hero_recovery=False):
+    """Rank available heroes by target speed, including cooling heroes only with item authorization."""
     states = {state['hero_id']: state for state in roster['heroes']}
+    eligible_actions = (0, 5) if use_hero_recovery else (0,)
     eligible = []
     for row in metrics['heroes']:
         state = states.get(row['hero_id'])
         if (state and state.get('found') and state.get('fresh') and state.get('army_known') and
                 not state.get('busy') and state.get('hero_state') == 0 and row.get('fresh') and
                 row.get('army_known') and not row.get('busy') and row.get('hero_state') == 0 and
-                row.get('action_state') in (0, 5) and row.get('speed', 0) > 0):
+                row.get('action_state') in eligible_actions and row.get('speed', 0) > 0 and
+                (use_hero_recovery or state.get('remaining_ms') == 0)):
             eligible.append(row)
     if not eligible:
         return None
@@ -118,8 +123,8 @@ class CollectionRun:
 
     @property
     def recovery_hero(self):
-        """Expose at most one hero demand; no separate recovery queue or sender exists here."""
-        return self.plan['hero_id'] if self.plan and self.needs_recovery else None
+        """Expose one hero to the shared recovery queue only when the run opted in."""
+        return self.plan['hero_id'] if self.options.use_hero_recovery and self.plan and self.needs_recovery else None
 
     def observe(self, roster):
         """Drop a plan that became busy/unknown, or release its recovery demand when cooldown reaches zero."""
@@ -131,9 +136,9 @@ class CollectionRun:
             self.plan = None
             self.needs_recovery = False
         else:
-            self.needs_recovery = state['remaining_ms'] > 0
+            self.needs_recovery = self.options.use_hero_recovery and state['remaining_ms'] > 0
 
     def reserve(self, target, hero, state):
-        """Reserve the fastest non-busy hero for this target, including a shared recovery demand if needed."""
+        """Reserve the selected hero and request shared recovery only for opted-in runs."""
         self.plan = {'target_id': target['target_id'], 'hero_id': hero['hero_id'], 'name': hero['name']}
-        self.needs_recovery = state['remaining_ms'] > 0
+        self.needs_recovery = self.options.use_hero_recovery and state['remaining_ms'] > 0

@@ -27,6 +27,9 @@ from league_members_panel import LeagueMembersPanel
 from battle_chat import BattleChatSession
 from battle_chat_panel import BattleChatPanel
 from hall_profile import HallProfileSession
+from guild_invite import GuildInviteSession
+from guild_invite_panel import GuildInvitePanel
+from guild_web_relay import GuildWebRelay
 from hunt_reconnect import log_reconnect
 
 
@@ -41,6 +44,8 @@ class App:
         self.events = queue.Queue()
         self.battle_chat = BattleChatSession(self.events)
         self.hall_profile = HallProfileSession(self.events)
+        self.guild_invite = GuildInviteSession(self.events)
+        self.guild_web_relay = GuildWebRelay(self.guild_invite, self.events)
         self.sessions = LoginSession(self.events)
         self.login_busy = False
         self.accounts_dialog = None
@@ -124,6 +129,8 @@ class App:
         self.feature_tabs.add(self.league_members_panel,text='联盟成员')
         self.battle_chat_panel = BattleChatPanel(self.feature_tabs,self.send_battle_chat)
         self.feature_tabs.add(self.battle_chat_panel,text='战斗聊天')
+        self.guild_invite_panel = GuildInvitePanel(self.feature_tabs, self.guild_invite, self.guild_web_relay)
+        self.feature_tabs.add(self.guild_invite_panel, text='公会邀请')
         self.hero_status = self.hero_panel.status
         ttk.Separator(panel).pack(fill='x', pady=9)
         ttk.Label(panel, textvariable=self.status, wraplength=960).pack(anchor='w')
@@ -147,6 +154,9 @@ class App:
         self.league_members_panel.clear()
         self.battle_chat.cancel_pending();self.battle_chat_panel.clear()
         self.hall_profile.cancel_pending()
+        self.guild_web_relay.stop()
+        self.guild_invite.cancel_pending()
+        self.guild_invite_panel.clear()
         for variable in (self.enabled, self.hero_enabled, self.collect_enabled, self.hunt_enabled,
                          self.league_enabled, self.beacon_enabled, self.training_speed, self.trial_enabled,self.report_enabled):
             variable.set(False)
@@ -154,12 +164,14 @@ class App:
             count.set('正在读取…')
         self.stock.set('五分钟训练加速：正在读取…')
         hero = self.hero_panel
+        hero.mode.set('普通')
         hero.roster.clear(); hero.speeds.clear(); hero.loads.clear(); hero.references.clear()
         hero.tree.delete(*hero.tree.get_children())
         hero.stock.set('五分钟英雄恢复加速：正在读取…')
         hero.reference_text.set('采集速度：等待当前账号数据…')
         hero.status.set('自动恢复关闭，等待当前账号名单…')
         collection = self.collection_panel
+        collection.use_hero_recovery.set(False)
         collection.queue_snapshot = None
         collection.queue_text.set('已出征 / 上限：待读取')
         collection.recommendation.set('等待当前账号的采集属性…')
@@ -248,6 +260,7 @@ class App:
         self.player_panel.update_controls(not self.login_busy and not self.closing)
         self.league_members_panel.update_controls(world_ready)
         self.battle_chat_panel.update_controls(not self.login_busy and not self.closing)
+        self.guild_invite_panel.update_controls(not self.login_busy and not self.closing)
         self.beacon_panel.update_controls(world_ready)
         self.trial_panel.update_controls(self.ready)
         self.report_panel.update_controls(world_ready)
@@ -265,11 +278,12 @@ class App:
         self.battle_chat.submit(message)
 
     def switch_hero(self):
-        """Freeze the user's persisted hero choices without changing the troop master."""
+        """Freeze hero choices and the explicit shared recovery mode without changing troop automation."""
         if self.worker is None:
             self.hero_enabled.set(False)
             return
         try:
+            if self.hero_enabled.get():self.worker.set_recovery_mode(self.hero_panel.recovery_mode())
             self.worker.switch_hero(self.hero_enabled.get(), self.hero_panel.selected())
             self.hero_status.set('正在刷新所选英雄与部队状态…' if self.hero_enabled.get() else '已关闭，不再发送恢复请求')
         except Exception as error:
@@ -291,11 +305,12 @@ class App:
             self.worker.request_collection_attributes()
 
     def switch_collection(self):
-        """Freeze the visible resource scope and control departures plus their shared recovery demand."""
+        """Freeze collection scope and the same recovery mode used by the ordinary hero master."""
         if self.worker is None:
             self.collect_enabled.set(False)
             return
         try:
+            if self.collect_enabled.get():self.worker.set_recovery_mode(self.hero_panel.recovery_mode())
             options = self.collection_panel.options() if self.collect_enabled.get() else None
             self.worker.switch_collection(self.collect_enabled.get(), options)
             self.collection_panel.status.set('正在核对采集目标与英雄…' if self.collect_enabled.get() else '采集关闭，不再派出；已有行动不会取消')
@@ -507,6 +522,17 @@ class App:
                     continue
                 if event.get('hall_profile_generation',self.hall_profile.generation)!=self.hall_profile.generation:
                     continue
+                if ('guild_invite_generation' in event and
+                        event['guild_invite_generation'] != self.guild_invite.generation):
+                    continue
+                if 'guild_web_status' in event:
+                    self.guild_invite_panel.apply_web_status(event['guild_web_status'])
+                if 'guild_web_received' in event:
+                    self.guild_invite_panel.mark_web_received(event['guild_web_received'])
+                if event.get('guild_invite_sending'):
+                    self.guild_invite_panel.mark_sending()
+                if 'guild_invite_result' in event:
+                    self.guild_invite_panel.apply_result(event['guild_invite_result'])
                 if 'battle_chat_result'in event:
                     self.battle_chat_panel.apply_result(event['battle_chat_result'])
                 if 'hall_profile_snapshot'in event or 'hall_profile_error'in event:
@@ -600,6 +626,8 @@ class App:
                     self.enabled.set(False)
                 if event.get('hero_enabled') is False:
                     self.hero_enabled.set(False)
+                if 'collect_use_hero_recovery' in event:
+                    self.collection_panel.use_hero_recovery.set(event['collect_use_hero_recovery'])
                 if 'collect_enabled' in event:
                     self.collect_enabled.set(event['collect_enabled'])
                 if 'hunt_enabled' in event:
@@ -667,6 +695,8 @@ class App:
         self.cancel_reconnect('助手已退出')
         self.battle_chat.close()
         self.hall_profile.close()
+        self.guild_web_relay.stop()
+        self.guild_invite.close()
         self.sessions.close()
         self.enabled.set(False)
         self.hero_enabled.set(False)
@@ -685,7 +715,9 @@ class App:
 
     def finish_close(self):
         """Wait without blocking Tk so daemon shutdown cannot interrupt a two-file SDK restore transaction."""
-        if self.sessions.pending_shutdown()or self.battle_chat.pending_shutdown()or self.hall_profile.pending_shutdown():
+        if (self.sessions.pending_shutdown() or self.battle_chat.pending_shutdown() or
+                self.hall_profile.pending_shutdown() or self.guild_invite.pending_shutdown() or
+                self.guild_web_relay.pending_shutdown()):
             self.status.set('正在安全退出账号操作，请稍候；自动功能全部关闭…')
             self.root.after(100, self.finish_close)
         else:

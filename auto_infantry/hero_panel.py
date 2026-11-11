@@ -47,6 +47,10 @@ class HeroPanel(ttk.LabelFrame):
         bar.pack(fill='x')
         self.toggle = ttk.Checkbutton(bar, text='自动恢复英雄', variable=enabled, command=on_switch, state='disabled')
         self.toggle.pack(side='left')
+        self.mode=tk.StringVar(value='普通')
+        ttk.Label(bar,text='恢复模式').pack(side='left',padx=(12,4))
+        self.mode_box=ttk.Combobox(bar,textvariable=self.mode,values=('普通','快速'),state='disabled',width=7)
+        self.mode_box.pack(side='left')
         self.refresh_button = ttk.Button(bar, text='刷新英雄名单', command=on_refresh, state='disabled')
         self.refresh_button.pack(side='right')
         self.attributes_button = ttk.Button(bar, text='刷新采集属性', command=on_attributes or (lambda: None), state='disabled')
@@ -77,19 +81,28 @@ class HeroPanel(ttk.LabelFrame):
         ttk.Label(self, textvariable=self.note, wraplength=590, foreground='#666666').pack(anchor='w')
         ttk.Label(self, textvariable=self.stock).pack(anchor='w', pady=(5, 0))
         ttk.Label(self, textvariable=self.status, wraplength=590).pack(anchor='w')
+        ttk.Label(self,text='普通：逐个确认；快速：每秒最多3次、最多3个/批，核对成功后继续。采集恢复共用；切换前关闭恢复和采集。',
+                  foreground='#666666',wraplength=950).pack(anchor='w')
+
+    def recovery_mode(self):
+        """Map explicit UI choices to validated worker modes; do not persist a fast default across restart."""
+        value=self.mode.get()
+        if value not in ('普通','快速'):raise ValueError('请选择普通或快速恢复模式')
+        return 'fast' if value=='快速' else 'normal'
 
     def selected(self):
         """Return a validated stable ID list, independent of card position and roster sort order."""
         return checked_heroes(self.selection)
 
     def update_controls(self, ready, collection_active=None):
-        """Lock recovery choices during recovery and metric refresh during collection, preserving master-off."""
+        """Freeze the shared mode during recovery/collection and keep the master stop available."""
         self.ready = ready
         if collection_active is not None:
             self.collection_active = collection_active
         self.toggle.state(['!disabled'] if ready and (self.enabled.get() or (self.roster and self.selection)) else ['disabled'])
         self.refresh_button.state(['!disabled'] if ready and not self.enabled.get() else ['disabled'])
         self.attributes_button.state(['!disabled'] if ready and not self.collection_active else ['disabled'])
+        self.mode_box.configure(state='readonly' if ready and not self.enabled.get() and not self.collection_active else 'disabled')
 
     def render(self):
         """Preserve scroll position and user choices; missing selected heroes remain visibly unavailable."""

@@ -91,6 +91,7 @@ class HuntReconnectTests(unittest.TestCase):
         self.owner.hunt = self.hunt
         self.owner.collection = SimpleNamespace(enabled=False, uncertain=False)
         self.owner.hero_uncertain = self.owner.allow_scheduled_hunt = False
+        self.owner.recovery_mode = 'normal'
         self.roster = {'fresh': True, 'queue_known': True,
                        'heroes': [dict(hero_id=3, fresh=True, army_known=True, busy=True)]}
         self.schedule = {'queue_known': True, 'queue_used': 1, 'queue_limit': 4, 'server_now_ms': 100,
@@ -189,7 +190,7 @@ class ReconnectLifecycleTests(unittest.TestCase):
         old.hunt.options = HuntOptions(60)
         old.hunt.auto_refresh.observe(1794340800000, '03:00:00|06:00:00')
         refresh_ms = old.hunt.auto_refresh.next_ms
-        old.switch_collection(True, CollectionOptions())
+        old.switch_collection(True, CollectionOptions(use_hero_recovery=True))
         connection = Mock(reconnect_key='owner', process_identity=(10, 'boot', 20))
         old.hunt.tick = Mock(side_effect=RuntimeError('Account session changed'))
         with patch('controller.Connection', return_value=connection):
@@ -207,6 +208,8 @@ class ReconnectLifecycleTests(unittest.TestCase):
         connection.hunt_call.side_effect = [schedule, clock]
         new.restore_tasks(connection, plan)
         self.assertTrue(new.collection.enabled)
+        self.assertTrue(new.collection.run.options.use_hero_recovery)
+        self.assertTrue(any(r.get('collect_use_hero_recovery') for r in self.events(new)))
         self.assertFalse(new.hunt.enabled)
         new.hunt.scheduled_start_tick(connection, 100)
         new.hunt.scheduled_start_tick(connection, 100)
@@ -232,7 +235,7 @@ class ReconnectLifecycleTests(unittest.TestCase):
     def test_same_pid_with_different_process_start_never_attaches(self):
         """PID reuse must terminate the attempt before attaching to the restarted game."""
         connection = Connection()
-        with patch.object(connection, 'acquire_owner'), \
+        with patch.object(connection, 'acquire_owner'), patch('connection.ensure_client_version'), \
              patch('connection.subprocess.check_output', return_value='versionCode=431000017 '), \
              patch.object(connection, 'read_process_identity', return_value=(10, 'boot', 21)), \
              patch('connection.frida.get_device_manager') as frida_manager:

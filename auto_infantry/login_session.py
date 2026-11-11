@@ -68,7 +68,7 @@ class LoginSession:
             self.job.start()
 
     def _replace(self, mode, epoch, cancel, previous, old_job, selection=None):
-        """Join old owners before opening a session; a delayed reconnect uses the existing game process."""
+        """Join old owners and route every UI login through the guarded one-attempt account service."""
         sink = SessionEvents(self.events, epoch)
         connection = None
         try:
@@ -106,34 +106,13 @@ class LoginSession:
             if mode == 'account_save':
                 record = self.accounts.save_current(cancel)
                 sink.put({'status': '已加密保存当前账号：' + record['name'], 'profiles': self.store.list()})
-            elif mode in {'account_switch', 'account_qr'}:
+            elif mode in {'account_switch', 'account_qr', 'ios_wechat'}:
+                qr_context = (1, 0) if mode == 'ios_wechat' else selection if mode == 'account_qr' else None
                 state, record = self.accounts.login(cancel, lambda **event: sink.put(event),
                     profile_id=selection if mode == 'account_switch' else None,
-                    qr_context=selection if mode == 'account_qr' else None)
+                    qr_context=qr_context)
                 sink.put({'account': state, 'profiles': self.store.list(),
                           'status': '已登录并更新票据：' + record['name'] + '；自动功能全部关闭，请进入西游幻境'})
-            if mode == 'ios_wechat':
-                connection = Connection()
-                connection.attach()
-                state = connection.login_call()
-                if state['stage'] != 'LoginStage':
-                    connection.login_call('logout')
-                    state = self._wait(connection, cancel, lambda s: s['stage'] == 'LoginStage', 20)
-                if not state['agreement']:
-                    sink.put({'status': '请本人勾选模拟器登录页的用户协议，再点击「iOS 微信扫码登录」',
-                              'account_status': '当前账号：未登录；等待确认协议'})
-                    return
-                if cancel.is_set():
-                    return
-                connection.login_call('qr')
-                sink.put({'status': '请用苹果角色对应的微信扫码并在手机上授权；完成后请进入西游幻境',
-                          'account_status': 'iOS 微信二维码已请求，等待你扫码授权…'})
-                state = self._wait(connection, cancel, lambda s: s['logged_in'], 180)
-                if state['open_platform'] != 0 or state['mobile_platform'] != 1:
-                    raise RuntimeError('登录完成但不是 iOS 微信身份，保持自动功能关闭')
-                sink.put({'account_status': account_label(state)})
-                connection.close()
-                connection = None
             with self.guard:
                 if cancel.is_set() or self.closed or epoch != self.epoch:
                     return

@@ -109,6 +109,8 @@ class Worker(threading.Thread):
         self.hero_enabled = False
         self.hero_epoch = 0
         self.hero_due = 0
+        self.recovery_mode = 'normal'
+        self.hero_fast_busy = False
         self.hero_uncertain = False
         self.hero_selected = ()
         self.hero_cursor = 0
@@ -299,7 +301,7 @@ class Worker(threading.Thread):
         with self.guard:
             if enabled:
                 if self.hero_uncertain:
-                    raise RuntimeError('上次恢复结果不明，请核对游戏并重新连接助手')
+                    raise RuntimeError('上批快速恢复结果不明，请核对游戏并重新连接助手')
                 heroes = checked_heroes(selected if selected is not None else self.hero_selected)
                 if not heroes:
                     raise ValueError('请至少勾选一个英雄')
@@ -310,13 +312,23 @@ class Worker(threading.Thread):
             self.hero_due = 0
             self.sync_recovery_gate()
 
+    def set_recovery_mode(self,mode):
+        """Freeze one shared mode while recovery or collection is active; startup always uses normal mode."""
+        if mode not in ('normal','fast'):raise ValueError('恢复模式无效')
+        with self.guard:
+            if mode==self.recovery_mode:return
+            if self.hero_enabled or self.collection.enabled or self.hero_fast_busy:
+                raise RuntimeError('请先关闭自动恢复和自动采集，等待当前恢复核对结束后再切换模式')
+            if self.hero_uncertain:
+                raise RuntimeError('上批快速恢复结果不明，请核对游戏并重新连接助手')
+            self.recovery_mode=mode
+
     def sync_recovery_gate(self):
         """Authorize the deduplicated union of normal recovery and the single active collection demand."""
         normal = self.hero_selected if self.hero_enabled else ()
         demand = self.collection.recovery_hero
         selected = checked_heroes(tuple(normal) + ((demand,) if demand else ()))
-        if self.hero_uncertain:
-            selected = ()
+        if self.hero_uncertain and not self.hero_fast_busy:selected=()
         if self.connection is not None and selected != self.recovery_authorized:
             self.connection.set_hero_enabled(bool(selected), selected)
             self.recovery_authorized = selected
@@ -344,7 +356,7 @@ class Worker(threading.Thread):
         self.hero_refresh_requested.set()
 
     def hero_tick(self, connection):
-        """Merge recovery sources and settle one item before another shared action."""
+        """Merge recovery sources and settle one normal item or bounded fast batch before another shared action."""
         with self.guard:
             if (not self.hero_enabled and not self.collection.recovery_hero) or self.closing.is_set() or time.monotonic() < self.hero_due:
                 return
@@ -371,12 +383,28 @@ class Worker(threading.Thread):
                 if state is None:
                     return
                 self.hero_cursor = next_cursor
-            self.hero_uncertain = True
-            after = connection.recover_hero(state, generation)
-            verify_recovery(state, after)
-            self.hero_uncertain = False
+            if self.recovery_mode=='fast':
+                with self.guard:
+                    self.hero_fast_busy=True
+                    self.hero_uncertain=True
+                self.publish(hero_status=f"正在快速恢复{state.get('name',state['hero_id'])}：最多3个/批，每秒最多3次，批后核对")
+                try:
+                    after=connection.recover_hero_fast(state,generation,
+                        lambda:self.closing.is_set() or epoch!=(self.hero_epoch,self.collection.epoch))
+                finally:
+                    with self.guard:self.hero_fast_busy=False
+                with self.guard:self.hero_uncertain=False
+                if not after['recovery_count']:
+                    with self.guard:self.hero_due=time.monotonic()+3
+                    return False
+            else:
+                self.hero_uncertain = True
+                after = connection.recover_hero(state, generation)
+                verify_recovery(state, after)
+                self.hero_uncertain = False
             self.publish(action='hero_speed', hero=state['hero_id'], hero_state=after,
-                         hero_status=f"{state.get('name', state['hero_id'])}恢复进度已确认，继续监控",
+                         recovery_mode=self.recovery_mode,recovery_count=after.get('recovery_count',1),
+                         hero_status=f"{state.get('name', state['hero_id'])}恢复已确认：本次{after.get('recovery_count',1)}个，继续监控",
                          recovery_for_collection=self.collection.recovery_hero is not None)
             with self.guard:
                 self.collection.observe({'heroes': [after]} if self.collection.recovery_hero == after['hero_id'] else roster)
@@ -400,7 +428,7 @@ class Worker(threading.Thread):
                          collection_status='共用恢复结果异常，采集已停止')
 
     def restore_tasks(self, connection, plan):
-        """Read fresh ownership before restoring each independently safe task."""
+        """Verify ownership before resuming safe tasks with their previous run options."""
         self.collection.uncertain = plan['collection_blocked']
         self.hunt.uncertain = plan['hunt_blocked']
         if self.collection.uncertain:
@@ -433,8 +461,10 @@ class Worker(threading.Thread):
                 with self.guard:
                     if self.closing.is_set():
                         raise InterruptedError('重连恢复已取消')
+                    self.recovery_mode = plan['recovery_mode']
                     self.collection.switch(True, plan['collection'])
-                self.publish(collect_enabled=True, collection_status='已核对当前采集队伍，恢复原采集计划',
+                self.publish(collect_enabled=True, collect_use_hero_recovery=plan['collection'].use_hero_recovery,
+                             collection_status='已核对当前采集队伍，恢复原采集计划',
                              action='collection_reconnect_resumed')
             except Exception as error:
                 if connection_lost(error) or self.closing.is_set():

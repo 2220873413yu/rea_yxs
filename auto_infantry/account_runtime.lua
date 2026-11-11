@@ -11,9 +11,14 @@ if operation=='pause' then
  return tostring(previous)
 elseif operation=='cancel_auth' then
  -- Stop native reconnect/hello/login callbacks too; do not revoke the SDK authorization or erase saved files.
+ if REA_ACCOUNT_LOGIN_GUARD then REA_ACCOUNT_LOGIN_GUARD.stop() end
  settings:setGlobalSettingInt('mNoAutoLogin',1)
  CSLTypes.LoginManager.sharedInstance():loginOut(true,false)
+ if REA_ACCOUNT_LOGIN_GUARD then REA_ACCOUNT_LOGIN_GUARD.close() end
  return 'authentication_stopped'
+elseif operation=='auth_cleanup' then
+ if REA_ACCOUNT_LOGIN_GUARD then REA_ACCOUNT_LOGIN_GUARD.close() end
+ return 'authentication_guard_removed'
 elseif operation=='resume' then
  -- QR authorization must finish before restoring startup auto-login; never resume on a failed scan.
  local main=CSLTypes.ModelManager.sharedInstance():getModel(CSLTypes.MainModel)
@@ -35,8 +40,10 @@ if operation=='identity' then
   sdk and tonumber(sdk.platform) or -1,hex(sdk and sdk.open_id),hex(sdk and sdk:GetAccessToken()),
   CSLTypes.QQGameSystem.getSystemInstance():getCurZoneID(),tostring(not not matches),settings:getGlobalSettingInt('mNoAutoLogin',0))
 elseif operation=='watch' then
- return string.format('{"sdk_platform":%d,"sdk_flag":%d,"has_token":%s}',sdk and tonumber(sdk.platform) or -1,
-  sdk and tonumber(sdk.flag) or -999,tostring(not not (sdk and sdk:GetAccessToken() and sdk:GetAccessToken()~='')))
+ local g=REA_ACCOUNT_LOGIN_GUARD and REA_ACCOUNT_LOGIN_GUARD.status() or {sent=false,ret=-999,error='',matched=false}
+ return string.format('{"sdk_platform":%d,"sdk_flag":%d,"has_token":%s,"auth_sent":%s,"auth_ret":%d,"auth_error":"%s","identity_matched":%s}',sdk and tonumber(sdk.platform) or -1,
+  sdk and tonumber(sdk.flag) or -999,tostring(not not (sdk and sdk:GetAccessToken() and sdk:GetAccessToken()~='')),
+  tostring(g.sent),g.ret,tostring(g.error):gsub('[^%w_]',''),tostring(g.matched))
 end
 assert(operation=='restore' or operation=='qr','Unsupported account operation')
 assert(mobile==0 or mobile==1,'Invalid mobile platform')
@@ -53,6 +60,7 @@ if operation=='qr' then
  local callbacks={ [0]={[0]='onBtnAndroidWechatClicked',[1]='onBtnAndroidQQClicked'},
                   [1]={[0]='onBtnIosWechatClicked',[1]='onBtnIosQQClicked'} }
  local callback=assert(d[callbacks[mobile][open_platform]],'Native QR entry unavailable')
+ REA_ACCOUNT_LOGIN_GUARD.install(open_platform==0 and 1 or 2)
  REA_ACCOUNT_AUTH_ATTEMPT='qr'
  settings:setGlobalSettingInt('mNoAutoLogin',1)
  callback({})
@@ -65,6 +73,7 @@ for i=1,10 do local name,v=debug.getupvalue(d.onBtnIosWechatClicked,i);if not na
  if name=='setPlatformInfoForCloudMatrix' then setter=v elseif name=='T_TYPE' then types=v end
 end
 assert(setter and types and types.E_MOBILE_PLAT_TYPE_IOS==1,'Native platform selector changed')
+REA_ACCOUNT_LOGIN_GUARD.install(expected_sdk)
 setter({},mobile)
 CSLTypes.TicketsProtocol.getInstance():setCloudMatrixIos(mobile==1)
 settings:setGlobalSettingInt('mNoAutoLogin',resume_auto)

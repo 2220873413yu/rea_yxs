@@ -25,9 +25,9 @@
 ## 本机运行环境
 
 - Windows，Python 3.12（Tkinter 随官方 Windows Python 安装提供）。
-- 雷电模拟器 `emulator-5554`，ADB 当前路径为 `E:\leidian\LDPlayer9\adb.exe`。
+- 雷电模拟器 `emulator-5554`，优先使用 `E:\leidian\LDPlayer14\adb.exe`，未安装时兼容原 `LDPlayer9` 路径；可用环境变量 `REA_ADB` 指定其他安装位置。
 - 游戏包名 `com.qqgame.mic`，当前只接受4.31.0／versionCode 431000017。
-- 已有的模拟器 root 环境及匹配的 Frida 服务17.25.2；服务文件位置见 `auto_infantry/bootstrap.py`。
+- 已有的模拟器 root 环境及电脑端、模拟器端一致的 Frida 17.26.2；支持新版雷电 Android14 的 Houdini ARM 转译连接。服务文件位置见 `auto_infantry/bootstrap.py`。
 - 当前入口使用 `.analysis-tools/pyenv/Scripts/pythonw.exe`。换电脑后需核对 ADB、设备及服务二进制位置，这些设置尚未做成通用配置。
 
 在项目根目录准备 Python 环境：
@@ -37,7 +37,9 @@ py -3.12 -m venv .analysis-tools/pyenv
 .analysis-tools/pyenv/Scripts/python.exe -m pip install -r requirements.txt
 ```
 
-匹配的 Android x86_64 Frida 服务文件需自行放入 `.analysis-tools/frida-server-17.25.2-android-x86_64`，或已部署到模拟器的对应路径。仓库不包含这些二进制。
+匹配的 Android x86_64 Frida 服务文件需自行放入 `.analysis-tools/frida-server-17.26.2-android-x86_64`，或已部署到模拟器的对应路径。仓库不包含这些二进制。启动时校验客户端版本、实际服务进程路径、服务版本和监听端口；确认新版文件正确后才停止本助手的旧17.25.2服务，其他未知进程不自动终止。此过程不会重启游戏或切换账号。
+
+Android14日志尾部读取显式使用`toybox dd`，兼容新版系统裸`dd`入口返回`no such tool`的情况；仍只读取有界尾部并保留未完成帧，不改为整份日志读取或增加游戏请求。
 
 保持模拟器及已登录游戏运行，进入西游幻境并等地图加载完成，再双击 `Start-AutoInfantry.vbs`。重启时先关闭旧助手窗口，再打开此入口，不要同时启动两个助手。
 

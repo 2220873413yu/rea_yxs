@@ -111,6 +111,28 @@ class HeroLuaTests(unittest.TestCase):
         self.run_lua('Game.finish=Game.time+1000;REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_status();REA_AUTO_INFANTRY.hero_speed(303)')
         self.assertEqual(len(self.lua.globals().Game.sends), 1)
 
+    def test_fast_step_stops_at_completion_without_an_extra_item(self):
+        """Even a queued batch step consults current native cooldown rather than a precomputed Python budget."""
+        self.run_lua('Game.finish=Game.time+1000;REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_status()')
+        first=json.loads(self.run_lua('return REA_AUTO_INFANTRY.hero_speed_step(303)'))
+        self.assertTrue(first['sent'])
+        self.run_lua('Game.finish=0;REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_status()')
+        second=json.loads(self.run_lua('return REA_AUTO_INFANTRY.hero_speed_step(303)'))
+        self.assertEqual(second,{'sent':False,'reason':'complete'})
+        self.assertEqual(len(self.lua.globals().Game.sends),1)
+
+    def test_fast_step_does_not_spend_for_busy_missing_or_stale_hero(self):
+        """Fast mode cannot bypass the normal runtime freshness, ownership and activity guards."""
+        for change in ('Game.busy=true','Game.unknown=true','Game.state=20','Game.stock=0'):
+            with self.subTest(change=change):
+                self.setUp()
+                self.run_lua(change+';REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_status()')
+                self.run_lua('pcall(REA_AUTO_INFANTRY.hero_speed_step,303)')
+                self.assertEqual(len(self.lua.globals().Game.sends),0)
+        self.setUp()
+        self.run_lua('REA_AUTO_INFANTRY.hero_refresh();REA_AUTO_INFANTRY.hero_status();Game.time=Game.time+3001')
+        self.assertFalse(self.run_lua('return pcall(REA_AUTO_INFANTRY.hero_speed_step,303)')[0])
+
     def test_dynamic_roster_and_targeted_non_xishi_recovery(self):
         """Roster IDs, escaped names and per-hero recovery targets come from actual Lua snapshots."""
         self.run_lua('Game.extra={{id=305,state=0,finish=1660000},{id=315,state=20,finish=1660000}};'
