@@ -54,13 +54,21 @@ elseif operation=='bind' then
  end
  return 'session_bound'
 end
-assert(operation=='status','Unsupported login operation')
 local main=CSLTypes.ModelManager.sharedInstance():getModel(CSLTypes.MainModel)
 local r=main.mTLoginRsp
 local uid=main.myUserId or {}
 local tickets=package.loaded.TicketsProtocol.__instanceDict._instance
 local info=tickets and tickets:getLoginInfo()
 local logged=info and info:isLogined() and type(r)=='table' and r[1]==0 and stage~='LoginStage'
+if operation=='identity_key' then
+ -- Python hashes this local identity before publishing role metadata to either tab.
+ local identity=logged and type(uid[2])=='string' and uid[2] or ''
+ local hex=identity:gsub('.',function(c) return string.format('%02x',string.byte(c)) end)
+ local zone=logged and CSLTypes.QQGameSystem.getSystemInstance():getCurZoneID() or 0
+ return string.format('{"identity_hex":"%s","identity_zone":%d,"open_platform":%d,"mobile_platform":%d}',
+  hex,tonumber(zone) or 0,tonumber(uid[3]) or -1,tonumber(uid[4]) or -1)
+end
+assert(operation=='status','Unsupported login operation')
 local name=type(r)=='table' and tostring(r[6] or '') or ''
 local hex=name:gsub('.',function(c) return string.format('%02x',string.byte(c)) end)
 return string.format('{"stage":"%s","agreement":%s,"logged_in":%s,"ret":%d,"nickname_hex":"%s","level":%d,"open_platform":%d,"mobile_platform":%d}',

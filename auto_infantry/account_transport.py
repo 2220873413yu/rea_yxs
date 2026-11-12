@@ -7,7 +7,8 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from bootstrap import ADB
+from bootstrap import ADB, verify_device
+from instance_config import DEVICE
 from account_store import AccountError, AUTH_KEYS, MAX_DATABASE, decode_sdk, validate_profile
 
 SDK_DB = '/data/data/com.qqgame.mic/databases/WEGAMEDB2'
@@ -78,7 +79,7 @@ class AccountTransport:
     def run(self, command, timeout=15):
         """Never put credential values in command arguments or propagate captured SDK output into errors."""
         try:
-            result = subprocess.run([ADB, '-s', 'emulator-5554', 'exec-out', command], capture_output=True,
+            result = subprocess.run([ADB, '-s', DEVICE, 'exec-out', command], capture_output=True,
                                     timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW)
         except (OSError, subprocess.SubprocessError):
             raise AccountError('模拟器操作超时或连接中断，未自动重试登录') from None
@@ -145,6 +146,7 @@ class AccountTransport:
 
     def _sync_write(self, path, data):
         """Send bytes from memory over the local ADB sync service, not shell stdin or Windows temp files."""
+        verify_device()
         if path != '/data/local/tmp/rea-account-transfer':
             raise AccountError('拒绝写入非账号传输文件')
         try:
@@ -159,7 +161,7 @@ class AccountTransport:
                         chunks.append(part)
                         size -= len(part)
                     return b''.join(chunks)
-                for request in (b'host:transport:emulator-5554', b'sync:'):
+                for request in (f'host:transport:{DEVICE}'.encode('ascii'), b'sync:'):
                     stream.sendall(f'{len(request):04x}'.encode() + request)
                     if receive(4) != b'OKAY':
                         raise OSError()
@@ -201,6 +203,7 @@ class AccountTransport:
 
     def restart(self, cancel, profile=None):
         """Restore both SDK files as one stopped-process transaction; roll back on failure before launching."""
+        verify_device()
         data = validate_profile(profile) if profile is not None else None
         cancelled(cancel)
         setting = self.read(GAME_SETTING)

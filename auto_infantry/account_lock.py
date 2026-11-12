@@ -1,8 +1,9 @@
 """Cross-process account transaction ownership, retained while the game bridge is detached for restart."""
 from contextlib import contextmanager
 import ctypes
+from instance_config import DEVICE
 
-NAME = r'Local\REA_ACCOUNT_OPERATION_emulator_5554'
+NAME = r'Local\REA_ACCOUNT_OPERATION_' + DEVICE.replace('-', '_')
 
 
 def _kernel():
@@ -51,4 +52,24 @@ def account_operation():
     finally:
         if acquired:
             kernel.ReleaseMutex(handle)
+        kernel.CloseHandle(handle)
+
+
+def acquire_role(profile_id):
+    """Reserve one confirmed game identity across both helper processes until its session ends."""
+    kernel = _kernel()
+    handle = kernel.CreateMutexW(None, False, r'Local\REA_HELPER_ROLE_' + profile_id)
+    if not handle:
+        raise RuntimeError('无法确认账号使用状态')
+    if kernel.WaitForSingleObject(handle, 0) in (0, 0x80):
+        return handle
+    kernel.CloseHandle(handle)
+    raise RuntimeError('该账号正在另一台雷电使用，请选择其他账号')
+
+
+def release_role(handle):
+    """Release an identity on the owning thread after the game connection or login finishes."""
+    if handle is not None:
+        kernel = _kernel()
+        kernel.ReleaseMutex(handle)
         kernel.CloseHandle(handle)

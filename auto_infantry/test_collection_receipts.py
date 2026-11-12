@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 from connection import Connection
 from collection import CollectionReplan
-from game_log import GameResponseLog
+from game_log import CollectionRejected, GameResponseLog
 from test_hero_recovery import hero_state, hero_roster
 
 
@@ -35,9 +35,14 @@ class ReceiptTests(unittest.TestCase):
         """A matching hero/aim/target succeeds; foreign requests or responses stop instead of being accepted."""
         self.assertEqual(self.make_log(request(), response()).wait_collection(303, 2792)['army_id'], 123)
         for sent, received in ((request(hero=305), response()), (request(), response(hero=305)),
-                               (request(), response(target=2791)), (request(), response(ret=6012))):
-            with self.subTest(sent=sent, received=received), self.assertRaises(RuntimeError):
-                self.make_log(sent, received).wait_collection(303, 2792)
+                               (request(), response(target=2791)), (request(), b'\x06\x01x')):
+            with self.subTest(sent=sent, received=received):
+                with self.assertRaises(RuntimeError) as failure:
+                    self.make_log(sent, received).wait_collection(303, 2792)
+                self.assertNotIsInstance(failure.exception, CollectionRejected)
+        with self.assertRaises(CollectionRejected) as rejection:
+            self.make_log(request(), response(ret=6089)).wait_collection(303, 2792)
+        self.assertEqual(rejection.exception.ret, 6089)
 
     def test_uncertain_receipt_has_no_resubmit_path(self):
         """An elapsed receive deadline returns uncertainty rather than granting another departure."""

@@ -394,7 +394,8 @@ function api.collect_dispatch(target,heroId,kind,level,expectedDetail,expectedAv
   'Resource is outside the selected range')
  local config=search:searchTNewPlay_Resource_Map(point[2])
  assert(config[3]==kind and config[2]==level and point[6]>0,'Resource kind, level or stock changed')
- assert(level<4 or point[6]>=40000,'Resource remaining quantity is below40000 for level4 or higher')
+ -- Check the same minimum as the planner against live stock immediately before departure.
+ assert(level==1 or point[6]>=math.min(level,4)*10000,'Resource remaining quantity is below the minimum for its level')
  local slotsKnown,capacity,occupied,own=resourceSlots(detail,config)
  assert(slotsKnown,'Resource slot state is unknown')
  assert(not own,'An own army is already collecting at this resource')

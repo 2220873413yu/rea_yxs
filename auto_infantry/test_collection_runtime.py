@@ -197,8 +197,9 @@ class CollectionLuaTests(unittest.TestCase):
 
     def test_final_native_guard_enforces_live_quantity_threshold(self):
         """The Lua sender cannot bypass the level4 threshold even if Python supplied an accepted plan."""
-        for level, quantity, expected in ((3, 1, True), (4, 39999, False), (4, 40000, True),
-                                          (7, 39999, False), (7, 40000, True), (3, 0, False)):
+        for level, quantity, expected in ((1, 0, False), (1, 1, True), (2, 19999, False), (2, 20000, True),
+                                          (3, 29999, False), (3, 30000, True), (4, 39999, False), (4, 40000, True),
+                                          (7, 39999, False), (7, 40000, True)):
             with self.subTest(level=level, quantity=quantity):
                 self.setUp()
                 self.prepare(f'Game.finish=0;Game.resourceLevel={level};Game.quantity={quantity}')

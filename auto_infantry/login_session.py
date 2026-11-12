@@ -2,13 +2,14 @@
 import threading
 import time
 
-from bootstrap import ensure_server
+from bootstrap import adb, ensure_server
 from connection import Connection
 from controller import Worker
 from pathlib import Path
 from account_store import AccountStore
 from account_service import AccountService
 from hunt_reconnect import log_reconnect
+from instance_config import INSTANCE_DIRECTORY
 
 
 def account_label(state):
@@ -47,7 +48,7 @@ class LoginSession:
         self.guard = threading.RLock()
         self.job = None
         self.closed = False
-        self.store = AccountStore()
+        self.store = AccountStore(INSTANCE_DIRECTORY / 'accounts') if INSTANCE_DIRECTORY is not None else AccountStore()
         self.accounts = AccountService(self.store)
 
     def request(self, mode='connect', selection=None):
@@ -99,9 +100,12 @@ class LoginSession:
                           'status': message + '。需要使用时请选择账号切换，票据失效请重新扫码。'})
                 return
             if mode != 'hunt_reconnect':
+                if INSTANCE_DIRECTORY is not None and not adb('shell', 'pidof', 'com.qqgame.mic', check=False).stdout.strip():
+                    raise RuntimeError('请在第二台雷电打开游戏并登录，再点「重新读取」')
                 ensure_server()
-                legacy = Path(__file__).resolve().parents[1] / 'analysis/evidence'
-                self.store.import_legacy([legacy / 'ios-wechat-ticket-test.dpapi', legacy / 'android-qq-ticket-test.dpapi'])
+                if INSTANCE_DIRECTORY is None:
+                    legacy = Path(__file__).resolve().parents[1] / 'analysis/evidence'
+                    self.store.import_legacy([legacy / 'ios-wechat-ticket-test.dpapi', legacy / 'android-qq-ticket-test.dpapi'])
                 sink.put({'profiles': self.store.list()})
             if mode == 'account_save':
                 record = self.accounts.save_current(cancel)

@@ -4,6 +4,7 @@ import subprocess
 import time
 
 from game_protocol import JceReader, read_records
+from instance_config import DEVICE
 
 
 def tags(fields):
@@ -33,6 +34,13 @@ class ResourceMissing(RuntimeError):
         super().__init__(f'服务器确认资源田不存在：{target_id}（6001）')
 
 
+class CollectionRejected(RuntimeError):
+    """Carry a server refusal attributed to the current ordinary collection request."""
+    def __init__(self, ret):
+        self.ret = ret
+        super().__init__(f'服务器拒绝采集：{ret}')
+
+
 class HuntRejected(RuntimeError):
     """Carry a definitive ordinary hunting rejection without treating it as permission to retry."""
 
@@ -56,7 +64,7 @@ class BeaconCapacityUnavailable(RuntimeError):
 class GameResponseLog:
     """Bind one current log stream and match a single ordinary collection request and its response."""
 
-    def __init__(self, adb, device='emulator-5554'):
+    def __init__(self, adb, device=DEVICE):
         """Skip historical traffic using a bounded tail, retaining any incomplete frame for later drains."""
         self.adb = adb
         self.device = device
@@ -179,7 +187,7 @@ class GameResponseLog:
         raise TimeoutError('侦察结果不明，已停止且不自动重发')
 
     def wait_collection(self, hero_id, target_id, timeout=6):
-        """Require this request's hero/target and a successful corresponding army response; never resubmit."""
+        """Separate an attributed refusal or acceptance from an unmatched or missing departure receipt."""
         deadline = time.monotonic() + timeout
         sent = False
         while time.monotonic() < deadline:
@@ -194,8 +202,11 @@ class GameResponseLog:
                     if not sent:
                         raise RuntimeError('收到不属于当前采集请求的响应，已停止')
                     data = tags(JceReader(record['body']).fields())
-                    if data[0] != 0:
-                        raise RuntimeError(f'服务器拒绝采集：{data[0]}')
+                    ret = data.get(0)
+                    if type(ret) is not int:
+                        raise RuntimeError('采集响应缺少有效返回码，结果未确认')
+                    if ret != 0:
+                        raise CollectionRejected(ret)
                     army = tags(tags(data[1])[0])
                     identity = tags(army[15])
                     if identity[0] != hero_id or army[5] != 1 or army[6] != target_id:

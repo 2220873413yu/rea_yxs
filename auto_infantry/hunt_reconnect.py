@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 
 import frida
+from instance_config import INSTANCE_DIRECTORY
 
 RECONNECT_DELAY = 600
 
@@ -51,7 +52,8 @@ def recovery_plan(worker, connection, error):
 def log_reconnect(action, reason, **fields):
     """Append a UI-owned reconnect event without serializing its private recovery plan."""
     try:
-        with Path(__file__).with_name('actions.jsonl').open('a', encoding='utf-8') as log:
+        path = INSTANCE_DIRECTORY / 'actions.jsonl' if INSTANCE_DIRECTORY is not None else Path(__file__).with_name('actions.jsonl')
+        with path.open('a', encoding='utf-8') as log:
             log.write(json.dumps({'time': datetime.now().isoformat(), 'action': action,
                                   'reason': reason, **fields}, ensure_ascii=False) + '\n')
     except OSError:

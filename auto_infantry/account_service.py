@@ -12,7 +12,7 @@ import frida
 from connection import Connection
 from account_store import AccountError, TicketExpired, AUTH_KEYS, decode_sdk, validate_profile
 from account_transport import AccountTransport, SDK_PREF, cancelled
-from account_lock import account_operation
+from account_lock import account_operation, acquire_role, release_role
 
 SOURCE = (Path(__file__).with_name('account_auth_guard.lua').read_text(encoding='utf-8') + '\n' +
           Path(__file__).with_name('account_runtime.lua').read_text(encoding='utf-8'))
@@ -190,7 +190,11 @@ class AccountService:
     def login(self, cancel, publish, profile_id=None, qr_context=None):
         """Restart once, restore the selected platform, authenticate once and save only a server-confirmed identity."""
         with account_operation():
-            return self._login(cancel, publish, profile_id, qr_context)
+            handle = acquire_role(profile_id) if profile_id else None
+            try:
+                return self._login(cancel, publish, profile_id, qr_context)
+            finally:
+                release_role(handle)
 
     def _login(self, cancel, publish, profile_id, qr_context):
         """Restart with exclusive ownership; reuse a persisted pause without depending on a broken old Lua realm."""

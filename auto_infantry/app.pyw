@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from math import ceil
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 
 from bootstrap import ensure_server
 from controller import Worker, owned_soldiers
@@ -31,6 +31,7 @@ from guild_invite import GuildInviteSession
 from guild_invite_panel import GuildInvitePanel
 from guild_web_relay import GuildWebRelay
 from hunt_reconnect import log_reconnect
+from secondary_page import SecondaryPage, discover_devices
 
 
 class App:
@@ -51,6 +52,9 @@ class App:
         self.accounts_dialog = None
         self.worker = None
         self.closing = False
+        self.secondary = None
+        self.device_picker_open = False
+        self.primary_profile_id = None
         self.reconnect_timer = None
         self.ready = False
         self.trial_exclusive = False
@@ -71,8 +75,13 @@ class App:
         style.configure('Title.TLabel', font=('Microsoft YaHei UI', 15, 'bold'))
         style.configure('TLabel', font=('Microsoft YaHei UI', 10))
         style.configure('Switch.TCheckbutton', font=('Microsoft YaHei UI', 13))
-        panel = ttk.Frame(self.root, padding=16)
-        panel.pack(fill='both', expand=True)
+        self.workspace = ttk.Notebook(self.root)
+        self.workspace.pack(fill='both', expand=True)
+        panel = self.primary_page = ttk.Frame(self.workspace, padding=(16, 3))
+        self.workspace.add(panel, text='雷电 0')
+        self.add_device_page = ttk.Frame(self.workspace)
+        self.workspace.add(self.add_device_page, text='＋ 添加雷电')
+        self.workspace.bind('<<NotebookTabChanged>>', self.workspace_changed)
         header = ttk.Frame(panel)
         header.pack(fill='x')
         ttk.Label(header, text='世界模式助手', style='Title.TLabel').pack(side='left')
@@ -141,6 +150,88 @@ class App:
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.connect()
         self.root.after(100, self.poll)
+
+    def workspace_changed(self, _event):
+        """Open the instance selector from the add tab without disturbing the primary task view."""
+        if self.closing or self.device_picker_open or self.secondary is not None:
+            return
+        if self.workspace.select() != str(self.add_device_page):
+            return
+        self.workspace.select(self.primary_page)
+        self.device_picker_open = True
+        result = queue.Queue()
+
+        def find():
+            """Query ADB off the Tk thread so the first tab stays responsive."""
+            try:
+                result.put(discover_devices())
+            except Exception:
+                result.put(None)
+
+        def show():
+            """Display one explicit selection of an online emulator other than the first."""
+            if self.closing:
+                return
+            try:
+                devices = result.get_nowait()
+            except queue.Empty:
+                self.root.after(80, show)
+                return
+            if not devices:
+                self.device_picker_open = False
+                messagebox.showinfo('添加雷电', '未读取到第二台在线雷电，请启动第二台模拟器并确认 ADB 已连接。', parent=self.root)
+                return
+            dialog = tk.Toplevel(self.root)
+            dialog.title('添加雷电实例')
+            dialog.transient(self.root)
+            body = ttk.Frame(dialog, padding=14)
+            body.pack(fill='both', expand=True)
+            ttk.Label(body, text='选择要添加到第二个标签页的雷电设备。').pack(anchor='w')
+            devices_box = ttk.Combobox(body, values=devices, state='readonly', width=24)
+            devices_box.current(0)
+            devices_box.pack(fill='x', pady=8)
+
+            def finish():
+                """Release the picker so it can be opened again after cancel or close."""
+                self.device_picker_open = False
+                dialog.destroy()
+
+            def add():
+                """Bind the new tab only to the explicitly selected serial."""
+                device = devices_box.get()
+                finish()
+                self.workspace.forget(self.add_device_page)
+                self.secondary = SecondaryPage(self.workspace, device, self.close_secondary, lambda: self.primary_profile_id)
+                self.workspace.add(self.secondary, text='雷电 1')
+                self.workspace.select(self.secondary)
+
+            ttk.Button(body, text='连接所选设备', command=add).pack(side='right')
+            ttk.Button(body, text='取消', command=finish).pack(side='right', padx=6)
+            dialog.protocol('WM_DELETE_WINDOW', finish)
+
+        threading.Thread(target=find, daemon=True).start()
+        self.root.after(80, show)
+
+    def close_secondary(self):
+        """Close the second tab while its process releases resources without blocking the first tab."""
+        page = self.secondary
+        if page is None or page.closing:
+            return
+        page.close()
+        self.workspace.select(self.primary_page)
+        self.workspace.forget(page)
+
+        def release():
+            """Expose the add tab again only after the old emulator owner has exited."""
+            if page.process.thread.is_alive():
+                self.root.after(100, release)
+                return
+            page.destroy()
+            self.secondary = None
+            if not self.closing:
+                self.workspace.add(self.add_device_page, text='＋ 添加雷电')
+
+        self.root.after(100, release)
 
     def connect(self):
         """Start a fresh default-off session without blocking Tk on game readiness."""
@@ -559,7 +650,11 @@ class App:
                 if 'login_busy' in event:
                     self.login_busy = event['login_busy']
                 if 'account' in event:
-                    self.account_status.set(account_label(event['account']))
+                    label = account_label(event['account'])
+                    self.account_status.set(label)
+                    self.primary_profile_id = event['account'].get('profile_id')
+                    name = label.removeprefix('当前角色：').split(' · ', 1)[0]
+                    self.workspace.tab(self.primary_page, text='雷电 0 · ' + name if event['account'].get('logged_in') else '雷电 0')
                 if 'account_status' in event:
                     self.account_status.set(event['account_status'])
                 if 'profiles' in event and self.accounts_dialog is not None and self.accounts_dialog.winfo_exists():
@@ -692,6 +787,7 @@ class App:
         if self.closing:
             return
         self.closing = True
+        self.close_secondary()
         self.cancel_reconnect('助手已退出')
         self.battle_chat.close()
         self.hall_profile.close()
@@ -715,7 +811,9 @@ class App:
 
     def finish_close(self):
         """Wait without blocking Tk so daemon shutdown cannot interrupt a two-file SDK restore transaction."""
-        if (self.sessions.pending_shutdown() or self.battle_chat.pending_shutdown() or
+        secondary = getattr(self, 'secondary', None)
+        if ((secondary is not None and secondary.process.thread.is_alive()) or
+                self.sessions.pending_shutdown() or self.battle_chat.pending_shutdown() or
                 self.hall_profile.pending_shutdown() or self.guild_invite.pending_shutdown() or
                 self.guild_web_relay.pending_shutdown()):
             self.status.set('正在安全退出账号操作，请稍候；自动功能全部关闭…')

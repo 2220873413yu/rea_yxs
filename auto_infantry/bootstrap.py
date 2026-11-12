@@ -5,6 +5,7 @@ import shlex
 import time
 from pathlib import Path
 import frida
+from instance_config import DEVICE, DEVICE_ID, SECONDARY
 
 ROOT = Path(__file__).resolve().parent.parent
 FRIDA_VERSION = '17.26.2'
@@ -38,10 +39,16 @@ def ensure_client_version():
 
 
 def adb(*arguments, timeout=10, check=True):
-    """Run one bounded ADB command without creating a console window."""
-    return subprocess.run([ADB, '-s', 'emulator-5554', *arguments], capture_output=True,
+    """Run a bounded ADB command against this process's selected emulator."""
+    return subprocess.run([ADB, '-s', DEVICE, *arguments], capture_output=True,
                           text=True, encoding='utf-8', errors='replace', timeout=timeout,
                           check=check, creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def verify_device():
+    """Catch a replaced secondary emulator before attaching or writing account files."""
+    if SECONDARY and adb('shell', 'settings', 'get', 'secure', 'android_id').stdout.strip().lower() != DEVICE_ID:
+        raise RuntimeError('雷电设备身份已变化，请关闭此标签页后重新选择实例')
 
 
 def root_command(command, check=True):
@@ -72,6 +79,7 @@ def verify_running(pid):
 def ensure_server():
     """Deploy the pinned service and migrate only our verified old helper; never restart the game or change root."""
     ensure_client_version()
+    verify_device()
     adb('get-state')
     root = adb('shell', 'su', '-c', 'id')
     if 'uid=0' not in root.stdout:

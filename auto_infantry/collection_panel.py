@@ -3,14 +3,15 @@ import tkinter as tk
 from tkinter import ttk
 
 from collection import CollectionOptions, RESOURCE_NAMES
-from resource_preferences import load_coordinates
+from resource_preferences import PREFERENCES_PATH, load_coordinates
 from resource_list_dialog import ResourceListDialog
 
 
 class CollectionPanel(ttk.LabelFrame):
     """Collect only saved coordinates, without separate resource, level or radius filters."""
 
-    def __init__(self, parent, enabled, on_switch, on_check=None):
+    def __init__(self, parent, enabled, on_switch, on_check=None, *, preferences=PREFERENCES_PATH):
+        """Build collection controls with an optional role/map-specific resource list."""
         super().__init__(parent, text='自动采集', padding=10)
         self.enabled = enabled
         self.use_hero_recovery = tk.BooleanVar(master=self, value=False)
@@ -18,12 +19,9 @@ class CollectionPanel(ttk.LabelFrame):
         self.queue_snapshot = None
         self.queue_text = tk.StringVar(value='已出征 / 上限：待读取')
         self.status = tk.StringVar(value='采集关闭；录入并保存资源清单后开启。')
-        try:
-            self.coordinates = load_coordinates()
-        except (ValueError, OSError) as error:
-            self.coordinates = ()
-            self.status.set('资源清单读取失败，请编辑检查并保存：' + str(error))
-        self.list_summary = tk.StringVar(value=f'已保存{len(self.coordinates)}个坐标')
+        self.editor = None
+        self.list_summary = tk.StringVar()
+        self.set_preferences(preferences)
         self.recommendation = tk.StringVar(value='按实际目标选择采集最快的可用英雄。')
         self.balance_text = tk.StringVar(value='粮木铁按1:1:1补缺；存量及预计入库将在分配时读取。')
         switch_bar = ttk.Frame(self)
@@ -43,7 +41,7 @@ class CollectionPanel(ttk.LabelFrame):
         ttk.Label(self, text='直接采集清单中的点，粮木铁按1:1:1补缺。\n按存量加预计入库优先补少的，同类再选近点。',
                   wraplength=520).pack(anchor='w', pady=(8, 4))
         ttk.Label(self, textvariable=self.balance_text, wraplength=520).pack(anchor='w', pady=(0, 4))
-        ttk.Label(self, text='4级及以上至少剩4万，1～3级有余量即可。\n按服务器阶段时间检查，不按采集速度自行估算。\n每队带2个适配兵；无固定轮询，保留被动状态通知。\n清单未缓存坐标会自动加载区域，无需滑动地图。',
+        ttk.Label(self, text='1级有余量即可，2级至少2万，3级至少3万，4级及以上至少4万。\n按服务器阶段时间检查，不按采集速度自行估算。\n每队带2个适配兵；无固定轮询，保留被动状态通知。\n清单未缓存坐标会自动加载区域，无需滑动地图。',
                   foreground='#666666', wraplength=520).pack(anchor='w', pady=(0, 4))
         ttk.Label(self, textvariable=self.recommendation, wraplength=520).pack(anchor='w')
         ttk.Label(self, textvariable=self.status, wraplength=520).pack(anchor='w', pady=(5, 0))
@@ -51,8 +49,20 @@ class CollectionPanel(ttk.LabelFrame):
 
     def edit_list(self):
         """Open the editor only while collection is off; existing saved coordinates remain unchanged."""
-        if not self.enabled.get():
-            ResourceListDialog(self, self.coordinates, self.list_saved)
+        if not self.enabled.get() and self.preferences is not None:
+            self.editor = ResourceListDialog(self, self.coordinates, self.list_saved, preferences=self.preferences)
+
+    def set_preferences(self, path):
+        """Close an old role's editor before reading the new role's resource list."""
+        if self.editor is not None and self.editor.winfo_exists():
+            self.editor.destroy()
+        self.preferences = path
+        try:
+            coordinates = load_coordinates(path) if path is not None else ()
+        except (ValueError, OSError) as error:
+            coordinates = ()
+            self.status.set('资源清单读取失败，请编辑检查并保存：' + str(error))
+        self.apply_resource_coordinates(coordinates)
 
     def list_saved(self, coordinates):
         """Apply an atomically saved list to the next run without enabling collection."""
@@ -86,7 +96,7 @@ class CollectionPanel(ttk.LabelFrame):
         """Allow immediate stop while connected and freeze run options while collecting."""
         self.ready = ready
         self.toggle.state(['!disabled'] if ready else ['disabled'])
-        self.list_button.state(['disabled'] if self.enabled.get() else ['!disabled'])
+        self.list_button.state(['disabled'] if self.enabled.get() or self.preferences is None else ['!disabled'])
         self.recovery_toggle.state(['disabled'] if self.enabled.get() else ['!disabled'])
         self.check_button.state(['!disabled'] if ready and self.enabled.get() else ['disabled'])
         self.render_queue()

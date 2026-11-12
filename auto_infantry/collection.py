@@ -53,9 +53,10 @@ class CollectionOptions:
 
 
 def quantity_allowed(level, quantity):
-    """Require40000 for levels4+, and any positive remaining quantity for lower levels."""
+    """Require 20,000 at level 2, 30,000 at level 3, and 40,000 at level 4 or higher."""
     return (type(level) is int and 1 <= level <= 10 and
-            type(quantity) in (int, float) and quantity > 0 and (level < 4 or quantity >= 40000))
+            type(quantity) in (int, float) and quantity > 0 and
+            (level == 1 or quantity >= min(level, 4) * 10000))
 
 
 def collection_slot_available(target):

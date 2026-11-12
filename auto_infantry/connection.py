@@ -14,14 +14,16 @@ from collection_balance import resource_balance
 from units import UNIT_NAMES, checked_units
 from hero_preferences import checked_heroes
 from game_log import GameResponseLog, ResourceMissing, BeaconCapacityUnavailable
-from account_lock import ensure_account_available
+from account_lock import acquire_role, ensure_account_available, release_role
+from account_store import profile_key
 from player_profile_cache import PlayerProfileCache
 from fast_recovery import FastRecovery
 from collection import CollectionReplan
 from monster import HuntReplan
 from region_conflict import RegionConflict,RegionRestoreConflict
 from hunt_reconnect import SessionUnsent, SessionAccepted, connection_lost, fence_rejected
-from bootstrap import ADB, ensure_client_version, root_command
+from bootstrap import ADB, adb, ensure_client_version, root_command, verify_device
+from instance_config import DEVICE, SECONDARY
 
 ROOT = Path(__file__).resolve().parent
 
@@ -56,6 +58,9 @@ class Connection:
         self.script = None
         self.lock = threading.RLock()
         self.mutex_handle = None
+        self.role_handle = None
+        self.forward_port = None
+        self.role_id = None
         self.hero_generation = 0
         self.collect_generation = 0
         self.hunt_generation = 0
@@ -90,7 +95,7 @@ class Connection:
         kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
         kernel.CreateMutexW.restype = ctypes.c_void_p
         ctypes.set_last_error(0)
-        handle = kernel.CreateMutexW(None, True, r'Local\REA_AUTO_INFANTRY_emulator_5554')
+        handle = kernel.CreateMutexW(None, True, r'Local\REA_AUTO_INFANTRY_' + DEVICE.replace('-', '_'))
         if not handle:
             raise OSError(ctypes.get_last_error(), 'Cannot acquire helper ownership')
         if ctypes.get_last_error() == 183:
@@ -102,8 +107,9 @@ class Connection:
     def attach(self, expected_process=None):
         """Own a default-off bridge without requiring a world map, for native login or normal startup."""
         ensure_client_version()
+        verify_device()
         self.acquire_owner()
-        package = subprocess.check_output([ADB, '-s', 'emulator-5554', 'shell', 'dumpsys', 'package', 'com.qqgame.mic'],
+        package = subprocess.check_output([ADB, '-s', DEVICE, 'shell', 'dumpsys', 'package', 'com.qqgame.mic'],
                                           text=True, timeout=8, encoding='utf-8', errors='replace',
                                           creationflags=subprocess.CREATE_NO_WINDOW)
         if 'versionCode=431000017 ' not in package:
@@ -115,11 +121,15 @@ class Connection:
             raise RuntimeError('游戏未运行')
         self.process_identity = identity
         pid = identity[0]
-        subprocess.run([ADB, '-s', 'emulator-5554', 'forward', 'tcp:27042', 'tcp:27042'],
-                       capture_output=True, check=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
-        device = frida.get_device_manager().add_remote_device('127.0.0.1:27042')
-        self.session = device.attach(pid, realm='emulated')
         try:
+            port = 27042
+            if SECONDARY:
+                port = int(adb('forward', 'tcp:0', 'tcp:27042', timeout=5).stdout.strip())
+                self.forward_port = port
+            else:
+                adb('forward', 'tcp:27042', 'tcp:27042', timeout=5)
+            device = frida.get_device_manager().add_remote_device(f'127.0.0.1:{port}')
+            self.session = device.attach(pid, realm='emulated')
             self.script = self.session.create_script((ROOT / 'bridge.js').read_text(encoding='utf-8'))
             self.script.load()
         except Exception:
@@ -143,14 +153,22 @@ class Connection:
 
     def login_call(self, operation='status', recovery_key=None):
         """Read role metadata or bind one verified recovery scope on the game's update thread."""
-        if operation not in {'status', 'logout', 'qr', 'bind'}:
+        if operation not in {'status', 'logout', 'qr', 'bind', 'identity_key'}:
             raise ValueError('Unknown login operation')
         source = ('local operation=' + json.dumps(operation) + '\nlocal recoveryKey=' +
                   (json.dumps(recovery_key) if recovery_key is not None else 'nil') + '\n' +
                   (ROOT / 'login_runtime.lua').read_text(encoding='utf-8'))
         with self.lock:
             value = self.script.exports_sync.query(source)
-        return json.loads(value) if operation == 'status' else value
+        if operation == 'status':
+            return json.loads(value)
+        if operation == 'identity_key':
+            state = json.loads(value)
+            identity = state['identity_hex']
+            if identity and state['open_platform'] in (0, 1) and state['mobile_platform'] in (0, 1):
+                return profile_key(dict(openid=bytes.fromhex(identity).decode('utf-8'), role=state, zone=state['identity_zone']))
+            return None
+        return value
 
     def open(self, on_status=None, cancel=None, on_account=None, hunt_resume=None):
         """Install fresh account APIs only after map readiness, with all spending gates closed."""
@@ -161,10 +179,19 @@ class Connection:
                 self.attach(expected_process=hunt_resume['process'])
                 self.verify_reconnect_scope(hunt_resume['key'], cancel)
             if on_account is not None:
-                on_account(self.login_call())
+                account = self.login_call()
+                if account.get('logged_in'):
+                    self.update_role_owner()
+                on_account({**account, 'profile_id': self.role_id})
             if hunt_resume is None:
                 self.wait_world_ready(on_status, cancel)
                 self.login_call('bind')
+            if on_account is not None or SECONDARY:
+                self.update_role_owner()
+            if SECONDARY and not self.role_id:
+                raise RuntimeError('无法核对第二台雷电的当前账号')
+            if on_account is not None:
+                on_account({**self.login_call(), 'profile_id': self.role_id})
             self.reconnect_key = uuid.uuid4().hex
             source = 'local reconnectKey=' + json.dumps(self.reconnect_key) + '\n' + (ROOT / 'hunt_reconnect_runtime.lua').read_text(encoding='utf-8')
             self.script.exports_sync.query(source)
@@ -182,14 +209,31 @@ class Connection:
             self.script.exports_sync.query((ROOT / 'collection_runtime.lua').read_text(encoding='utf-8'))
             self.script.exports_sync.query((ROOT / 'monster_runtime.lua').read_text(encoding='utf-8'))
             self.script.exports_sync.query((ROOT / 'league_runtime.lua').read_text(encoding='utf-8'))
+            if not SECONDARY:
+                self.script.exports_sync.query((ROOT / 'trial_runtime.lua').read_text(encoding='utf-8'))
             self.script.exports_sync.query((ROOT / 'beacon_runtime.lua').read_text(encoding='utf-8'))
             self.script.exports_sync.query((ROOT / 'beacon_actions.lua').read_text(encoding='utf-8'))
-            self.script.exports_sync.query((ROOT / 'trial_runtime.lua').read_text(encoding='utf-8'))
             self.script.exports_sync.query((ROOT / 'report_runtime.lua').read_text(encoding='utf-8'))
             return initial
         except Exception:
             self.close()
             raise
+
+    def update_role_owner(self):
+        """Reserve the current account while it is active, including before the world loads."""
+        role_id = self.login_call('identity_key')
+        if role_id != self.role_id:
+            handle = acquire_role(role_id) if role_id else None
+            release_role(self.role_handle)
+            self.role_handle, self.role_id = handle, role_id
+
+    def current_map_scope(self):
+        """Read the already-bound role's world identity for local preference storage."""
+        source = ('local main=CSLTypes.ModelManager.sharedInstance():getModel(CSLTypes.SLGMainModel);'
+                  'assert(REA_HELPER_SESSION_VALID());local scope=main:getTMapGameDataID();'
+                  'return string.format("[%d,%d]",scope[2],scope[1])')
+        with self.lock:
+            return json.loads(self.script.exports_sync.query(source))
 
     def verify_reconnect_scope(self, key, cancel=None):
         """Confirm the original role and loaded map once, before installing a new connection."""
@@ -1169,6 +1213,15 @@ class Connection:
             with contextlib.suppress(Exception):
                 self.session.detach()
             self.session = None
+        if self.forward_port is not None:
+            port, self.forward_port = self.forward_port, None
+            with contextlib.suppress(Exception):
+                frida.get_device_manager().remove_remote_device(f'127.0.0.1:{port}')
+            with contextlib.suppress(Exception):
+                adb('forward', '--remove', f'tcp:{port}', timeout=5)
+        release_role(self.role_handle)
+        self.role_handle = None
+        self.role_id = None
         if self.mutex_handle is not None:
             kernel = ctypes.WinDLL('kernel32', use_last_error=True)
             kernel.ReleaseMutex.argtypes = [ctypes.c_void_p]

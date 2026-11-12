@@ -3,7 +3,7 @@ import queue
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from collection import CollectionOptions, CollectionReplan, candidate_targets, best_collector, quantity_allowed, collection_slot_available, active_resource_targets
 from controller import Worker
@@ -175,9 +175,10 @@ class CollectionStrategyTests(unittest.TestCase):
         self.assertEqual(frozen.coordinates, ((97, 192),))
 
     def test_quantity_threshold_has_exact_level_and_amount_boundaries(self):
-        """Three-star scraps qualify, four-star39999 does not, and exactly40000 qualifies."""
-        for level, quantity, expected in ((3, 1, True), (3, 0, False), (4, 39999, False),
-                                          (4, 40000, True), (7, 39999, False), (7, 40001, True)):
+        """Each level accepts its exact floor and skips points with one unit less."""
+        for level, quantity, expected in ((1, 0, False), (1, 1, True), (2, 19999, False), (2, 20000, True),
+                                          (3, 29999, False), (3, 30000, True), (4, 39999, False), (4, 40000, True),
+                                          (7, 39999, False), (7, 40000, True)):
             with self.subTest(level=level, quantity=quantity):
                 self.assertEqual(quantity_allowed(level, quantity), expected)
 
@@ -262,6 +263,67 @@ class SharedRecoveryTests(unittest.TestCase):
         self.assertTrue(self.worker.collection.enabled)
         self.assertEqual(self.game.dispatch_collection.call_count,2)
         self.assertEqual(self.game.departures,[])
+
+    def test_rejected_collection_stays_enabled_and_waits_for_recheck(self):
+        """An attributed refusal clears uncertainty and leaves the rejected target for explicit recheck."""
+        from test_collection_receipts import ReceiptTests, request, response
+
+        log = ReceiptTests().make_log(request(hero=305), response(ret=6089))
+        dispatch = self.game.dispatch_collection
+        self.game.dispatch_collection = Mock(side_effect=lambda *_: log.wait_collection(305, 2792))
+        self.game.collection_call = Mock(wraps=self.game.collection_call)
+        self.start(normal=False)
+        self.assertTrue(self.worker.collection.enabled)
+        self.assertFalse(self.worker.collection.uncertain)
+        self.assertEqual(self.game.collection_call.call_args_list.count(call('collect_schedule')), 2)
+        self.game.dispatch_collection.side_effect = dispatch
+        self.game.push_seq += 1
+        self.clock.return_value = 101
+        self.worker.collection.tick(self.game)
+        self.game.dispatch_collection.assert_called_once()
+        self.worker.collection.request_check()
+        self.clock.return_value = 102
+        self.worker.collection.tick(self.game)
+        self.assertEqual(self.game.departures, [305])
+
+    def test_read_timeout_rechecks_once_then_waits_for_push(self):
+        """Two pre-dispatch timeouts keep the switch on, with the next query driven by a new push."""
+        query = self.game.query_collection
+        self.game.query_collection = Mock(side_effect=[TimeoutError('first read'), TimeoutError('second read')])
+        self.start(normal=False)
+        self.clock.return_value = 101
+        self.worker.collection.tick(self.game)
+        self.clock.return_value = 120
+        self.worker.collection.tick(self.game)
+        self.assertTrue(self.worker.collection.enabled)
+        self.assertFalse(self.worker.collection.uncertain)
+        self.assertEqual(self.game.query_collection.call_count, 2)
+        self.assertEqual(self.game.departures, [])
+        self.game.query_collection.side_effect = query
+        self.game.push_seq += 1
+        self.clock.return_value = 121
+        self.worker.collection.tick(self.game)
+        self.assertEqual(self.game.departures, [305])
+
+    def test_read_timeouts_keep_an_existing_server_deadline(self):
+        """An early roster timeout preserves a known return deadline even after the one recheck fails."""
+        self.game.queue_free = False
+        self.game.schedule['stages'] = [{'army_id': 123, 'state': 9, 'end_ms': 1010000}]
+        self.start(normal=False)
+        refresh = self.game.refresh_heroes
+        self.game.refresh_heroes = Mock(side_effect=[TimeoutError(), TimeoutError()])
+        self.game.push_seq += 1
+        for now in (101, 102, 110):
+            self.clock.return_value = now
+            self.worker.collection.tick(self.game)
+        self.assertEqual(self.game.refresh_heroes.call_count, 2)
+        self.assertEqual(self.worker.collection.due, 111)
+        self.game.refresh_heroes.side_effect = refresh
+        self.game.queue_free = True
+        self.game.schedule = {'server_now_ms': 1011000, 'stages': []}
+        self.clock.return_value = 111
+        self.worker.collection.tick(self.game)
+        self.assertEqual(self.game.departures, [305])
 
     def test_expired_target_queue_status_rechecks_without_reporting_full(self):
         """A3/4 stale preflight goes through bounded refresh instead of waiting as though all slots are used."""
@@ -585,17 +647,19 @@ class ResourceListServiceTests(unittest.TestCase):
         self.assertEqual(self.game.recoveries, [])
         self.assertEqual(self.game.departures, [])
 
-    def test_lower_level_small_live_stock_is_selected_first(self):
-        """A low-level point with one remaining resource is still preferred when it is nearer."""
-        self.game = ListCollectionGame()
-        self.worker.connection = self.game
-        self.game.points[0]['level'] = 3
-        self.game.points[0].update(quantity=0, occupants=1)
-        self.game.live[1] = {'quantity': 1, 'occupants': 0}
-        self.game.states[303]['remaining_ms'] = 0
-        self.start_list()
-        self.assertEqual(self.game.queries, [1])
-        self.assertEqual(self.game.target_departures, [1])
+    def test_lower_level_live_stock_controls_which_nearby_point_is_used(self):
+        """Keep a qualifying near point and continue to the next point when live stock is too low."""
+        for level, quantity, target_id in ((1, 1, 1), (2, 19999, 2), (2, 20000, 1),
+                                           (3, 29999, 2), (3, 30000, 1)):
+            with self.subTest(level=level, quantity=quantity):
+                self.game = ListCollectionGame()
+                self.worker.connection = self.game
+                self.game.points[0].update(level=level, quantity=0, occupants=1)
+                self.game.live[1] = {'quantity': quantity, 'occupants': 0}
+                self.game.states[303]['remaining_ms'] = 0
+                self.start_list()
+                self.assertEqual(self.game.queries, list(range(1, target_id + 1)))
+                self.assertEqual(self.game.target_departures, [target_id])
 
     def test_two_free_queues_dispatch_different_heroes_to_mixed_resources(self):
         """A confirmed first trip must not leave a free second queue idle behind old kind/radius filters."""

@@ -2,7 +2,7 @@
 import tkinter as tk
 from tkinter import ttk
 
-from hero_preferences import load_heroes, save_heroes, checked_heroes
+from hero_preferences import PREFERENCES_PATH, load_heroes, save_heroes, checked_heroes
 from collection import RESOURCE_NAMES
 from collection_display import display_time
 
@@ -22,7 +22,8 @@ def hero_display(state):
 class HeroPanel(ttk.LabelFrame):
     """Keep roster refreshes separate from the user's saved selection and spending switch."""
 
-    def __init__(self, parent, enabled, on_switch, on_refresh, on_attributes=None):
+    def __init__(self, parent, enabled, on_switch, on_refresh, on_attributes=None, *, preferences=PREFERENCES_PATH):
+        """Bind saved hero selections to the current page's preference file."""
         super().__init__(parent, text='英雄属性与恢复', padding=10)
         self.enabled = enabled
         self.ready = False
@@ -37,12 +38,7 @@ class HeroPanel(ttk.LabelFrame):
         self.status = tk.StringVar(value='自动恢复关闭，正在读取名单…')
         self.stock = tk.StringVar(value='五分钟英雄恢复加速：正在读取…')
         self.note = tk.StringVar()
-        try:
-            self.selection = set(load_heroes())
-            self.note.set('点击勾选列选择英雄；修改名单前先关闭自动恢复。')
-        except (ValueError, OSError) as error:
-            self.selection = set()
-            self.note.set('原选择文件读取失败，请重新勾选：' + str(error).splitlines()[0])
+        self.set_preferences(preferences)
         bar = ttk.Frame(self)
         bar.pack(fill='x')
         self.toggle = ttk.Checkbutton(bar, text='自动恢复英雄', variable=enabled, command=on_switch, state='disabled')
@@ -186,13 +182,23 @@ class HeroPanel(ttk.LabelFrame):
         self.stock.set(f"五分钟英雄恢复加速：{state['items']} 个")
         self.render()
 
+    def set_preferences(self, path):
+        """Replace selected heroes with the choices saved for the confirmed role."""
+        self.preferences = path
+        try:
+            self.selection = set(load_heroes(path)) if path is not None else set()
+            self.note.set('点击勾选列选择英雄；修改名单前先关闭自动恢复。')
+        except (ValueError, OSError) as error:
+            self.selection = set()
+            self.note.set('原选择文件读取失败，请重新勾选：' + str(error).splitlines()[0])
+
     def toggle_hero(self, hero_id):
         """Save a user choice atomically; a failed save never silently changes the enabled set."""
-        if self.enabled.get():
+        if self.enabled.get() or self.preferences is None:
             return
         updated = self.selection ^ {hero_id}
         try:
-            save_heroes(updated)
+            save_heroes(updated, self.preferences)
         except (ValueError, OSError) as error:
             self.status.set('保存勾选失败：' + str(error).splitlines()[0])
             return

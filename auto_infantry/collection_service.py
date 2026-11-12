@@ -1,4 +1,5 @@
 """Serial collection planning and property refresh; recovery is delegated to the existing worker."""
+from subprocess import TimeoutExpired
 import threading
 import time
 from dataclasses import replace
@@ -6,7 +7,7 @@ from dataclasses import replace
 from collection import CollectionOptions, CollectionRun, CollectionReplan, collection_queue_reason, candidate_targets, best_collector, quantity_allowed, collection_slot_available, active_resource_targets, RESOURCE_NAMES
 from collection_wakeup import CollectionWakeup
 from collection_display import team_snapshot
-from game_log import ResourceMissing
+from game_log import CollectionRejected, ResourceMissing
 from resource_preferences import remove_coordinate
 from collection_balance import balanced_candidates
 from hunt_reconnect import connection_lost, SessionUnsent, SessionAccepted
@@ -24,6 +25,7 @@ class CollectionService:
         self.due = 0
         self.queue_blocked = False
         self.preflight_replans = 0
+        self.read_retry_pending = False
         self.attributes_requested = threading.Event()
         self.wakeup = CollectionWakeup()
 
@@ -42,6 +44,7 @@ class CollectionService:
             self.due = 0
             self.queue_blocked = False
             self.preflight_replans = 0
+            self.read_retry_pending = False
             self.wakeup = CollectionWakeup()
             if self.owner.connection is not None and (prior_enabled or self.enabled):
                 self.owner.connection.set_collection_enabled(self.enabled)
@@ -73,6 +76,7 @@ class CollectionService:
                 self.wakeup.pending = True
                 self.run.blocked.clear()
                 self.run.continuing_discovery = False
+                self.read_retry_pending = False
 
     def remove_missing_target(self, run, epoch, candidate, error):
         """Persist only a matched6001 deletion within this active run; stop if its approved list becomes empty."""
@@ -84,7 +88,8 @@ class CollectionService:
             point = (candidate['x'], candidate['y'])
             if point not in run.options.coordinates:
                 raise RuntimeError('不存在的资源点不属于当前清单，未删除')
-            saved = remove_coordinate(point)
+            path = self.owner.resource_path
+            saved = remove_coordinate(point, path) if path is not None else remove_coordinate(point)
             remaining = tuple(p for p in run.options.coordinates if p != point)
             self.owner.publish(resource_coordinates=saved, action='resource_removed', coordinate=point,
                                target_id=error.target_id, ret=error.ret,
@@ -106,6 +111,44 @@ class CollectionService:
         seconds = max(0, int(self.due - time.monotonic()))
         return f'按服务器时间约{seconds // 60}分{seconds % 60}秒后检查'
 
+    def handle_rejection(self, connection, run, epoch, target, error, started_at):
+        """Record a confirmed refusal, refresh activity once, and wait for a new wakeup."""
+        with self.owner.guard:
+            if not self.alive(run, epoch):
+                return
+            run.plan = None
+            run.needs_recovery = False
+            # The same point requires an explicit recheck because the reason for refusal can be ambiguous.
+            run.blocked[target['target_id']] = float('inf')
+            self.owner.sync_recovery_gate()
+        self.owner.publish(action='collection_rejected', stage='departure_receipt', ret=error.ret,
+                           target_id=target['target_id'], request_sent=True, receipt_received=True,
+                           wait_seconds=round(time.monotonic() - started_at, 2),
+                           collection_status=f'服务器拒绝采集（{error.ret}），正在核对英雄和部队')
+        try:
+            roster = connection.refresh_heroes()
+            queue = connection.collection_call('collect_status')
+            schedule = connection.collection_call('collect_schedule')
+        except Exception as refresh_error:
+            if connection_lost(refresh_error):
+                raise
+            with self.owner.guard:
+                if self.alive(run, epoch):
+                    self.owner.publish(action='collection_rejection_check_failed', stage='activity_read',
+                                       reason=str(refresh_error).partition('\n')[0] or type(refresh_error).__name__,
+                                       collection_status=f'服务器拒绝采集（{error.ret}），状态复核未完成；{self.schedule_status()}')
+            return
+        with self.owner.guard:
+            if not self.alive(run, epoch):
+                return
+            observed_at = time.monotonic()
+            self.due = self.wakeup.schedule(schedule, observed_at)
+            self.queue_blocked = not queue['queue_free']
+            self.owner.publish(hero_roster=roster, collection_queue=queue,
+                               collection_teams=team_snapshot(schedule, roster, self.wakeup, observed_at),
+                               collection_teams_epoch=epoch,
+                               collection_status=f'服务器拒绝采集（{error.ret}），该点等待手动复查；{self.schedule_status()}')
+
     def refresh_attributes(self, connection):
         """Query three nearby level-two reference points without enabling recovery or dispatch."""
         self.attributes_requested.clear()
@@ -126,21 +169,26 @@ class CollectionService:
         self.owner.publish(collection_status='采集参考属性已刷新（未派出）')
 
     def tick(self, connection):
-        """Balance resources and pass the run's hero recovery setting through to the final send check."""
+        """Plan a departure and distinguish a pre-send read timeout, rejection, and uncertain dispatch."""
         with self.owner.guard:
             if not self.enabled or self.owner.closing.is_set():
                 return
             run, epoch = self.run, self.epoch
             generation = connection.collect_generation
+        started_at = None
         try:
             self.wakeup.poll(connection, time.monotonic())
             with self.owner.guard:
-                if not self.alive(run, epoch) or not self.wakeup.begin(time.monotonic(), self.due):
+                now = time.monotonic()
+                if not self.alive(run, epoch) or not self.wakeup.begin(now, self.due):
                     return
+                started_at = now
+                retrying_read = self.read_retry_pending
+                self.read_retry_pending = False
                 if not run.continuing_discovery:
                     run.scanned_regions.clear()
                 run.continuing_discovery = False
-                self.due = float('inf')
+                self.due = self.wakeup.next_deadline
             roster = connection.refresh_heroes()
             self.owner.publish(hero_roster=roster)
             queue = connection.collection_call('collect_status')
@@ -263,8 +311,13 @@ class CollectionService:
                     target['balance_guard'] = balance is not None
                     target['use_hero_recovery'] = run.options.use_hero_recovery
                 self.uncertain = True
+                dispatch_started_at = time.monotonic()
                 try:
                     receipt, after = connection.dispatch_collection(metrics, hero['hero_id'], generation)
+                except CollectionRejected as error:
+                    self.uncertain = False
+                    self.handle_rejection(connection, run, epoch, target, error, dispatch_started_at)
+                    return
                 except (CollectionReplan, SessionUnsent, SessionAccepted):
                     self.uncertain = False
                     raise
@@ -314,7 +367,7 @@ class CollectionService:
                     if capped:
                         message += '；' + '、'.join(capped) + f"已达同类{balance['same_kind_limit']}队上限"
                 if low_stock:
-                    message += f'，本次跳过{low_stock}个高等级余量不足4万的点'
+                    message += f'，本次跳过{low_stock}个余量未达等级门槛的点'
             else:
                 message = '暂无可出征英雄' if no_eligible_hero else '暂无符合条件的可采点'
             self.owner.publish(collection_status=message + '；' + self.schedule_status())
@@ -344,5 +397,18 @@ class CollectionService:
                     return
                 if connection_lost(error):
                     raise
+                if started_at is not None and not self.uncertain and isinstance(error, (TimeoutError, TimeoutExpired)):
+                    run.plan = None
+                    run.needs_recovery = False
+                    self.owner.sync_recovery_gate()
+                    if not retrying_read:
+                        self.read_retry_pending = True
+                        self.wakeup.pending = True
+                    next_step = self.schedule_status() if retrying_read else '自动复核一次'
+                    self.owner.publish(action='collection_query_timeout', stage='pre_dispatch_read',
+                                       request_sent=False, reason=str(error).partition('\n')[0] or type(error).__name__,
+                                       wait_seconds=round(time.monotonic() - started_at, 2),
+                                       collection_status=f'采集出征前查询超时，尚未派队；{next_step}')
+                    return
                 self.switch(False)
             self.owner.publish(collect_enabled=False, error=str(error), collection_status='采集已停止：' + str(error))

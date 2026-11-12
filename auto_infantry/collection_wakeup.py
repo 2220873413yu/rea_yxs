@@ -12,6 +12,11 @@ class CollectionWakeup:
         self.timers = {}
         self.fired = {}
 
+    @property
+    def next_deadline(self):
+        """Keep the earliest unconsumed stage deadline available when a fresh read fails."""
+        return min((value[0] for value in self.timers.values()), default=float('inf'))
+
     def schedule(self, snapshot, now):
         """Map server epoch deadlines onto monotonic time, independent of rates, levels and PC clock."""
         server_now = snapshot['server_now_ms']
@@ -32,7 +37,7 @@ class CollectionWakeup:
             timers[key] = (now + max(0, (end - server_now) / 1000) + 1, end)
         self.timers = timers
         self.fired = {key: end for key, end in self.fired.items() if key in active}
-        return min((value[0] for value in timers.values()), default=float('inf'))
+        return self.next_deadline
 
     def poll(self, connection, now):
         """Sample local notification state, merging bursts without issuing any server query."""

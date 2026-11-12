@@ -3,7 +3,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from collection_display import display_time
-from beacon_preferences import load_types,save_types
+from beacon_preferences import PREFERENCES_PATH, load_types,save_types
 
 KINDS = {1:'救援', 2:'宝藏', 3:'资源', 4:'怪物'}
 STATES = {0:'未开始', 1:'行军/处理中', 2:'执行中', 3:'可领奖'}
@@ -12,7 +12,7 @@ STATES = {0:'未开始', 1:'行军/处理中', 2:'执行中', 3:'可领奖'}
 class BeaconPanel(ttk.Frame):
     """Show type choices, current events, scout/return stages and authoritative deadline checks."""
 
-    def __init__(self, parent, enabled, on_switch, on_check):
+    def __init__(self, parent, enabled, on_switch, on_check, *, preferences=PREFERENCES_PATH):
         """Build the default-off rescue controls and the read-only event/army display."""
         super().__init__(parent, padding=10)
         self.enabled = enabled
@@ -26,11 +26,8 @@ class BeaconPanel(ttk.Frame):
         bar.pack(fill='x')
         self.toggle = ttk.Checkbutton(bar, text='自动烽火台', variable=enabled, command=on_switch, state='disabled')
         self.toggle.pack(side='left')
-        try:
-            choices=load_types()
-        except (ValueError,OSError) as error:
-            choices=(1,);self.status.set('类型选择未加载，保留救援：'+str(error))
-        self.choices={k:tk.BooleanVar(value=k in choices) for k in KINDS}
+        self.choices={k:tk.BooleanVar() for k in KINDS}
+        self.set_preferences(preferences)
         self.choice_boxes=[]
         for k in (1,4,3,2):
             box=ttk.Checkbutton(bar,text=KINDS[k],variable=self.choices[k],command=self.save_choices)
@@ -68,10 +65,23 @@ class BeaconPanel(ttk.Frame):
         """Return only explicit type choices; the master switch remains separate and default-off."""
         return tuple(k for k,v in self.choices.items() if v.get())
 
+    def set_preferences(self, path):
+        """Reload the beacon choices after confirming the current role."""
+        self.preferences = path
+        try:
+            choices = load_types(path) if path is not None else (1,)
+        except (ValueError, OSError) as error:
+            choices = (1,)
+            self.status.set('类型选择未加载，保留救援：' + str(error))
+        for kind, choice in self.choices.items():
+            choice.set(kind in choices)
+
     def save_choices(self):
         """Persist type choices while stopped; saving never starts any game action."""
         if self.enabled.get():return
-        try:save_types(self.selected_types())
+        if self.preferences is None:
+            return
+        try:save_types(self.selected_types(), self.preferences)
         except (ValueError,OSError) as error:self.status.set('类型选择保存失败：'+str(error))
 
     def apply_scout(self, state):

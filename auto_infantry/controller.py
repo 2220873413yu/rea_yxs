@@ -20,6 +20,7 @@ from report_service import ReportService
 from map_index_service import MapIndexService
 from league_export import LeagueExportService
 from hunt_reconnect import connection_lost, recovery_plan
+from instance_config import INSTANCE_DIRECTORY, role_preferences
 
 
 def owned_soldiers(state):
@@ -121,6 +122,8 @@ class Worker(threading.Thread):
         self.connection = None
         self.allow_scheduled_hunt = True
         self.log_path = Path(__file__).with_name('actions.jsonl')
+        self.resource_path = None
+        self.collection_review_pending = False
         self.collection = CollectionService(self)
         self.hunt = MonsterService(self)
         self.league = LeagueService(self)
@@ -430,9 +433,11 @@ class Worker(threading.Thread):
     def restore_tasks(self, connection, plan):
         """Verify ownership before resuming safe tasks with their previous run options."""
         self.collection.uncertain = plan['collection_blocked']
+        self.collection_review_pending = self.collection.uncertain and INSTANCE_DIRECTORY is not None
         self.hunt.uncertain = plan['hunt_blocked']
         if self.collection.uncertain:
-            self.publish(collection_status='采集继续暂停：上次操作结果不明', action='collection_reconnect_blocked')
+            self.publish(collection_status='采集继续暂停：上次操作结果不明', action='collection_reconnect_blocked',
+                         collection_review_pending=self.collection_review_pending)
         if self.hunt.uncertain:
             self.publish(hunt_status='打野继续暂停：上次出征或跳过战斗结果不明', action='hunt_reconnect_blocked')
         if plan['collection'] is None and plan['hunt'] is None:
@@ -486,10 +491,18 @@ class Worker(threading.Thread):
                 arguments['hunt_resume'] = self.reconnect_plan
             state = connection.open(**arguments)
             self.connection = connection
-            try:
-                self.map_index.load(connection)
-            except Exception as error:
-                self.publish(league_query_status='本地地图记录未加载：'+str(error).splitlines()[0][:180])
+            if INSTANCE_DIRECTORY is not None:
+                zone, map_id = connection.current_map_scope()
+                paths = role_preferences(INSTANCE_DIRECTORY, connection.role_id, zone, map_id)
+                self.resource_path = paths['resources']
+                self.log_path = paths['heroes'].parent / 'actions.jsonl'
+                self.resource_path.parent.mkdir(parents=True, exist_ok=True)
+                self.publish(instance_scope=dict(role=connection.role_id, zone=zone, map_id=map_id))
+            else:
+                try:
+                    self.map_index.load(connection)
+                except Exception as error:
+                    self.publish(league_query_status='本地地图记录未加载：'+str(error).splitlines()[0][:180])
             for unit in UNIT_NAMES:
                 self.publish(state=connection.call('status', unit))
             self.league.tick(connection)
@@ -502,14 +515,15 @@ class Worker(threading.Thread):
             else:
                 self.publish(ready=True, status='已连接，自动造兵关闭')
             while not self.closing.is_set():
-                if self.trial.tick(connection):
-                    run = None
-                    run_epoch = None
-                    self.closing.wait(.1)
-                    continue
-                self.player_tick(connection)
-                self.map_index.tick(connection)
-                self.league_export.tick(connection)
+                if INSTANCE_DIRECTORY is None:
+                    if self.trial.tick(connection):
+                        run = None
+                        run_epoch = None
+                        self.closing.wait(.1)
+                        continue
+                    self.player_tick(connection)
+                    self.map_index.tick(connection)
+                    self.league_export.tick(connection)
                 self.report.tick(connection)
                 self.poll_hero_view(connection)
                 if self.collection.attributes_requested.is_set():
