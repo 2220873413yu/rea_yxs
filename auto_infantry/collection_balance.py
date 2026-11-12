@@ -75,11 +75,20 @@ def resource_balance(snapshot, metrics_by_target):
                 same_kind_limit=same_kind_limit(snapshot['queue_limit']))
 
 
-def balanced_candidates(candidates, balance):
-    """Prefer the least projected stock, retain nearest-point ties, and never exceed the same-kind cap."""
+def collection_resource_order(balance):
+    """Rank dispatchable kinds and hold the richest when its projected stock is twice the next kind."""
     if balance['unknown']:
-        return []
-    return sorted((row for row in candidates
-                   if balance['counts'][row['kind']] < balance['same_kind_limit']),
+        return [], None
+    ranked = sorted(RESOURCE_NAMES, key=lambda kind: (balance['effective'][kind], balance['counts'][kind]))
+    richest, second = ranked[-1], ranked[-2]
+    high, middle = balance['effective'][richest], balance['effective'][second]
+    held = richest if high > middle and high >= 2 * middle else None
+    return [kind for kind in ranked if kind != held and balance['counts'][kind] < balance['same_kind_limit']], held
+
+
+def balanced_candidates(candidates, balance):
+    """Use the resource policy for eligibility and choose nearby points within the same projected stock."""
+    eligible, _ = collection_resource_order(balance)
+    return sorted((row for row in candidates if row['kind'] in eligible),
                   key=lambda row: (balance['effective'][row['kind']], balance['counts'][row['kind']],
                                    row['distance'], row['x'], row['y'], row['target_id']))

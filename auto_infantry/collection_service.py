@@ -9,7 +9,7 @@ from collection_wakeup import CollectionWakeup
 from collection_display import team_snapshot
 from game_log import CollectionRejected, ResourceMissing
 from resource_preferences import remove_coordinate
-from collection_balance import balanced_candidates
+from collection_balance import balanced_candidates, collection_resource_order
 from hunt_reconnect import connection_lost, SessionUnsent, SessionAccepted
 
 
@@ -168,8 +168,32 @@ class CollectionService:
             self.owner.publish(collection_metrics=metrics)
         self.owner.publish(collection_status='采集参考属性已刷新（未派出）')
 
+    def discover_next_region(self, connection, run, epoch, generation, preferred_kind):
+        """Locate one region of saved coordinates and defer selection while discovery is advancing."""
+        self.owner.publish(collection_status=f'优先补{RESOURCE_NAMES[preferred_kind]}，正在加载清单内未确认区域…')
+        located = connection.collection_list_candidates(
+            run.options.coordinates, generation, lambda: not self.alive(run, epoch),
+            known_rows=tuple(run.located.values()), skip_regions=run.scanned_regions, max_regions=1)
+        with self.owner.guard:
+            if not self.alive(run, epoch):
+                return True
+            saved = set(run.options.coordinates)
+            rows = {(row['x'], row['y']): row for row in located['rows'] if (row['x'], row['y']) in saved}
+            discovered = bool(rows.keys() - run.located.keys())
+            run.located.update(rows)
+            run.scanned_regions.update(map(tuple, located['regions_checked']))
+            if not located['regions_loaded'] and not discovered:
+                return False
+            # Continue this scan only after progress so an empty frontier cannot loop.
+            run.continuing_discovery = True
+            self.due = 0
+            self.owner.publish(action='collection_region_loaded', regions_loaded=located['regions_loaded'],
+                               located_points=len(run.located),
+                               collection_status='区域已确认，将按资源缺口重新核对可采点')
+            return True
+
     def tick(self, connection):
-        """Plan a departure and distinguish a pre-send read timeout, rejection, and uncertain dispatch."""
+        """Check scarce resources before falling back, and stop when a departure cannot be confirmed."""
         with self.owner.guard:
             if not self.enabled or self.owner.closing.is_set():
                 return
@@ -223,12 +247,12 @@ class CollectionService:
                 for row in connection.collection_candidates(0,0,0):
                     if (row['x'],row['y']) in saved:run.located[(row['x'],row['y'])]=row
                 rows=list(run.located.values())
-                self.owner.publish(collection_status=f'先核对已定位清单资源（{len(rows)}/{len(saved)}点），有合格点直接补队')
+                self.owner.publish(collection_status=f'已定位清单资源{len(rows)}/{len(saved)}点，按资源缺口核对')
             else:
                 rows = connection.collection_candidates(run.options.kind, run.options.level, run.options.radius)
-            candidates = candidate_targets(rows, run.options, run.blocked, time.monotonic(),
-                                           active_resource_targets(schedule))
             balance = None
+            discover_unlocated = False
+            held_kind = None
             if run.options.mode == 'list':
                 planned = connection.collection_balance(lambda: not self.alive(run, epoch))
                 if not self.alive(run, epoch):
@@ -254,14 +278,22 @@ class CollectionService:
                         reason = collection_queue_reason(queue) if self.queue_blocked else '已有采集队伍收益或类型未确认'
                         self.owner.publish(collection_status=reason + '；' + self.schedule_status())
                         return
-                candidates = candidate_targets(rows, run.options, run.blocked, time.monotonic(),
-                                               active_resource_targets(schedule))
+            candidates = candidate_targets(rows, run.options, run.blocked, time.monotonic(),
+                                           active_resource_targets(schedule))
+            if balance is not None:
+                priority, held_kind = collection_resource_order(balance)
                 candidates = balanced_candidates(candidates, balance)
+                discover_unlocated = bool(priority) and len(run.located) < len(run.options.coordinates)
             low_stock = 0
             no_eligible_hero = False
             for candidate in candidates:
                 with self.owner.guard:
                     if not self.alive(run, epoch):
+                        return
+                # A richer cached point can only win after the saved list's unknown regions have been checked.
+                if discover_unlocated and balance['effective'][candidate['kind']] > balance['effective'][priority[0]]:
+                    discover_unlocated = False
+                    if self.discover_next_region(connection, run, epoch, generation, priority[0]):
                         return
                 try:
                     # Prepare the log cursor first, then refresh activity immediately before target reads.
@@ -322,7 +354,8 @@ class CollectionService:
                     self.uncertain = False
                     raise
                 self.uncertain = False
-                self.owner.publish(action='collection_dispatch', receipt=receipt, hero_roster=after)
+                self.owner.publish(action='collection_dispatch', receipt=receipt, resource_kind=target['kind'],
+                                   hero_roster=after)
                 with self.owner.guard:
                     if not self.alive(run, epoch):
                         return
@@ -340,27 +373,13 @@ class CollectionService:
                     run.needs_recovery = False
                     self.owner.sync_recovery_gate()
             if run.options.mode == 'list':
-                # Only an exhausted eligible cached batch may extend the finite discovery frontier.
-                self.owner.publish(collection_status='已定位点暂无合格可采目标，继续加载一个未确认区域…')
-                located=connection.collection_list_candidates(run.options.coordinates,generation,
-                    lambda:not self.alive(run,epoch),known_rows=tuple(run.located.values()),
-                    skip_regions=run.scanned_regions,max_regions=1)
-                with self.owner.guard:
-                    if not self.alive(run,epoch):return
-                    discovered_rows=[r for r in located['rows'] if (r['x'],r['y']) in run.options.coordinates]
-                    discovered=any((r['x'],r['y']) not in run.located for r in discovered_rows)
-                    for row in discovered_rows:run.located[(row['x'],row['y'])]=row
-                    run.scanned_regions.update(map(tuple,located['regions_checked']))
-                    if located['regions_loaded'] or discovered:
-                        # A completed finite read schedules its next decision; elapsed time alone never scans again.
-                        run.continuing_discovery=True
-                        self.due=0
-                        self.owner.publish(action='collection_region_loaded',regions_loaded=located['regions_loaded'],
-                            located_points=len(run.located),collection_status='区域已确认，自动继续核对并补队，无需点击立即检查')
-                        return
+                if discover_unlocated and self.discover_next_region(connection, run, epoch, generation, priority[0]):
+                    return
                 loaded = {(row['x'], row['y']) for row in rows} & set(run.options.coordinates)
                 message = f'清单{len(run.options.coordinates)}点，本次已定位{len(loaded)}点'
                 message += '；暂无可出征英雄' if no_eligible_hero else '；暂无合格可采点'
+                if held_kind is not None:
+                    message += f'；{RESOURCE_NAMES[held_kind]}预计存量至少为第二多的两倍，暂缓采集'
                 if balance:
                     capped = [RESOURCE_NAMES[k] for k, count in balance['counts'].items()
                               if count >= balance['same_kind_limit']]

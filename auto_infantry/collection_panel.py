@@ -38,7 +38,7 @@ class CollectionPanel(ttk.LabelFrame):
         self.list_button.pack(side='right')
         self.check_button = ttk.Button(row, text='立即检查', command=on_check)
         self.check_button.pack(side='right', padx=6)
-        ttk.Label(self, text='直接采集清单中的点，粮木铁按1:1:1补缺。\n按存量加预计入库优先补少的，同类再选近点。',
+        ttk.Label(self, text='只采清单内资源，按存量加预计入库优先补少的，同类选近点。\n最多的一类达到第二多的两倍时，暂缓采集这一类。',
                   wraplength=520).pack(anchor='w', pady=(8, 4))
         ttk.Label(self, textvariable=self.balance_text, wraplength=520).pack(anchor='w', pady=(0, 4))
         ttk.Label(self, text='1级有余量即可，2级至少2万，3级至少3万，4级及以上至少4万。\n按服务器阶段时间检查，不按采集速度自行估算。\n每队带2个适配兵；无固定轮询，保留被动状态通知。\n清单未缓存坐标会自动加载区域，无需滑动地图。',

@@ -534,6 +534,46 @@ class ResourceListServiceTests(unittest.TestCase):
         self.assertEqual(self.game.target_departures,[2])
         self.assertEqual(self.game.queries,[2])
 
+    def test_missing_scarce_iron_is_located_before_using_cached_wood(self):
+        """An eligible cached fallback must wait while the saved iron coordinate is still unclassified."""
+        self.game = ListCollectionGame()
+        self.worker.connection = self.game
+        self.game.points[0]['kind'] = 2
+        self.game.stock = dict(food=400000, wood=600000, iron=180000)
+        self.game.live = {1: dict(quantity=50000), 2: dict(quantity=50000)}
+        self.game.collection_candidates = lambda *args: self.game.points[:1]
+        self.game.collection_list_candidates = Mock(return_value={
+            'rows': self.game.points, 'regions_loaded': 1, 'regions_checked': [(20, 15)],
+        })
+        self.start_list()
+        self.game.collection_list_candidates.assert_called_once()
+        self.assertEqual(self.game.queries, [])
+        self.assertEqual(self.game.departures, [])
+        self.clock.return_value = 101
+        self.worker.collection.tick(self.game)
+        self.assertEqual(self.game.target_departures, [2])
+
+    def test_excess_wood_waits_when_iron_and_food_fail_live_stock_checks(self):
+        """At twice the next balance, wait after trying iron then food and reconsider on a new check."""
+        self.game = ListCollectionGame()
+        self.worker.connection = self.game
+        self.game.points[0]['kind'] = 2
+        self.game.points.append(point(3, kind=1, level=4, x=99, y=191, quantity=50000))
+        self.game.stock = dict(food=300000, wood=600000, iron=100000)
+        self.game.live = {1: dict(quantity=50000), 2: dict(quantity=39999), 3: dict(quantity=39999)}
+        self.worker.switch_collection(True, CollectionOptions(
+            mode='list', coordinates=((97, 192), (101, 191), (99, 191))))
+        self.worker.collection.tick(self.game)
+        self.clock.return_value = 110
+        self.worker.collection.tick(self.game)
+        self.assertEqual(self.game.queries, [2, 3])
+        self.assertEqual(self.game.departures, [])
+        self.assertTrue(self.worker.collection.enabled)
+        self.game.stock['wood'] -= 1
+        self.worker.collection.request_check()
+        self.worker.collection.tick(self.game)
+        self.assertEqual(self.game.target_departures, [1])
+
     def test_manual_same_type_limit_waits_without_fixed_forecast_or_target_queries(self):
         """Manual inbound/collecting trips count even outside the saved list; elapsed time adds no retries."""
         self.game=ListCollectionGame();self.worker.connection=self.game
