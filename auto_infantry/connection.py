@@ -3,6 +3,7 @@ import json
 from contextlib import contextmanager
 import ctypes
 import contextlib
+import re
 import subprocess
 import threading
 import time
@@ -26,6 +27,11 @@ from bootstrap import ADB, adb, ensure_client_version, root_command, verify_devi
 from instance_config import DEVICE, SECONDARY
 
 ROOT = Path(__file__).resolve().parent
+SUPPORTED_GAME_BUILDS = {'431000017': '4.31.0', '501000073': '5.1.0'}
+
+
+class GameVersionError(RuntimeError):
+    """Report a public package build mismatch before the helper attaches to the game."""
 
 
 class BarrackUnavailable(RuntimeError):
@@ -105,15 +111,19 @@ class Connection:
         self.mutex_handle = handle
 
     def attach(self, expected_process=None):
-        """Own a default-off bridge without requiring a world map, for native login or normal startup."""
+        """Check the installed build before taking ownership of a default-off bridge."""
         ensure_client_version()
         verify_device()
-        self.acquire_owner()
         package = subprocess.check_output([ADB, '-s', DEVICE, 'shell', 'dumpsys', 'package', 'com.qqgame.mic'],
                                           text=True, timeout=8, encoding='utf-8', errors='replace',
                                           creationflags=subprocess.CREATE_NO_WINDOW)
-        if 'versionCode=431000017 ' not in package:
-            raise RuntimeError('Game version changed; this bridge requires 4.31.0 / 431000017')
+        match = re.search(r'^\s*versionCode=(\d+)(?=\s|$)', package, re.MULTILINE)
+        build = match[1] if match else None
+        if build not in SUPPORTED_GAME_BUILDS:
+            supported = '、'.join(f'{version} ({code})' for code, version in SUPPORTED_GAME_BUILDS.items())
+            detected = f'当前构建号 {build}' if build else '未读取到当前构建号'
+            raise GameVersionError(f'英雄杀版本不兼容。{detected}，助手支持 {supported}。')
+        self.acquire_owner()
         identity = self.read_process_identity()
         if expected_process is not None and identity != expected_process:
             raise RuntimeError('游戏已关闭或重启，取消自动重连')
@@ -992,6 +1002,7 @@ class Connection:
         if ret != 0:
             raise TrialRejected(kind, ret)
         return {**receipt, 'ret':ret}
+
 
     def set_report_enabled(self, enabled):
         """Immediately revoke queued timer-owned military report requests without changing other gates."""

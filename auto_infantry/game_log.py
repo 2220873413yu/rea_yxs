@@ -61,6 +61,10 @@ class BeaconCapacityUnavailable(RuntimeError):
     """The final native guard explicitly returned without sending because beacon capacity was full."""
 
 
+class BeaconScoutUnconfirmed(RuntimeError):
+    """A submitted or possibly submitted scout has no attributable successful receipt."""
+
+
 class GameResponseLog:
     """Bind one current log stream and match a single ordinary collection request and its response."""
 
@@ -172,19 +176,19 @@ class GameResponseLog:
                 if sending:
                     destination=tags(data[1])
                     if sent or (destination.get(0),destination.get(1))!=(x,y):
-                        raise RuntimeError('侦察请求目标无法归属，不重发')
+                        raise BeaconScoutUnconfirmed('侦察请求目标无法归属，不重发')
                     sent=True
                     continue
                 if not sent or data[0]!=0:
-                    raise RuntimeError('侦察响应未确认成功或无法归属，不重发')
+                    raise BeaconScoutUnconfirmed('侦察响应未确认成功或无法归属，不重发')
                 info=tags(data[1]);path=info[2]
                 if not path or (tags(path[-1]['value']).get(0),tags(path[-1]['value']).get(1))!=(x,y):
-                    raise RuntimeError('侦察返回路径与目标不符，不重发')
+                    raise BeaconScoutUnconfirmed('侦察返回路径与目标不符，不重发')
                 if not isinstance(info.get(1),(int,float)) or info[1]<=0:
-                    raise RuntimeError('侦察返回结束时间无效，不重发')
+                    raise BeaconScoutUnconfirmed('侦察返回结束时间无效，不重发')
                 return dict(ret=0,logic_x=x,logic_y=y,end_ms=info[1])
             time.sleep(.1)
-        raise TimeoutError('侦察结果不明，已停止且不自动重发')
+        raise BeaconScoutUnconfirmed('侦察回执超时，不重发')
 
     def wait_collection(self, hero_id, target_id, timeout=6):
         """Separate an attributed refusal or acceptance from an unmatched or missing departure receipt."""

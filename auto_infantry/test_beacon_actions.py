@@ -146,8 +146,8 @@ class BeaconActionsTests(unittest.TestCase):
                 self.assertEqual(self.lua.globals().Game.infoQueries,queries)
                 self.assertIsNone(self.lua.globals().Game.regionRequests)
 
-    def test_native_visibility_loss_prevents_hero_and_scout_execution(self):
-        """Recheck native visibility after eligibility; an old positive result cannot authorize spending."""
+    def test_only_treasure_may_use_native_scout_when_vision_is_lost(self):
+        """Losing vision still blocks hero dispatch but the native treasure path can scout in fog."""
         self.prepare(1)
         self.assertTrue(self.result()['heroes'][0]['ready'])
         self.lua.execute('Game.visible=false')
@@ -158,9 +158,13 @@ class BeaconActionsTests(unittest.TestCase):
         self.lua.execute('Game.events[1][2]=2;REA_AUTO_INFANTRY.beacon_scout_query(10)')
         self.assertTrue(json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_scout_result(10)'))['eligible'])
         self.lua.execute('Game.visible=false')
-        self.assertFalse(json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_scout_result(10)'))['eligible'])
+        self.assertTrue(json.loads(self.lua.execute('return REA_AUTO_INFANTRY.beacon_scout_result(10)'))['eligible'])
+        self.lua.execute('REA_AUTO_INFANTRY.beacon_configure(1)')
         self.assertFalse(self.lua.execute('return pcall(REA_AUTO_INFANTRY.beacon_scout,10)')[0])
         self.assertIsNone(self.lua.globals().Game.scoutCalls)
+        self.lua.execute('REA_AUTO_INFANTRY.beacon_configure(2);REA_AUTO_INFANTRY.beacon_scout(10)')
+        self.assertEqual(self.lua.globals().Game.scoutCalls,1)
+        self.assertFalse(self.lua.execute('return pcall(REA_AUTO_INFANTRY.beacon_scout,10)')[0])
 
     def test_scout_insufficient_stale_and_manual_inbound_are_blocked(self):
         """A pre-existing scout journey, stale stock or shortage cannot trigger another scout or purchase."""

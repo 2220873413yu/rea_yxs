@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from beacon_service import BeaconService, beacon_schedule, choose_rescue_hero
-from game_log import BeaconRejected,BeaconCapacityUnavailable
+from game_log import BeaconRejected, BeaconCapacityUnavailable, BeaconScoutUnconfirmed
 
 
 def event(identifier=10, kind=1, state=0, army_id=0):
@@ -173,6 +173,43 @@ class BeaconServiceTests(unittest.TestCase):
         for _ in range(20):self.s.tick(self.c)
         self.c.query_beacon_scout.assert_called_once()
         self.c.beacon_action.assert_not_called()
+
+    def test_only_selected_treasure_can_act_in_fog(self):
+        """A fogged treasure can scout once while fogged rescue, resource and monster events stay inactive."""
+        self.snapshot['events'] = [dict(event(kind,kind=kind), visible=False) for kind in (1,2,3,4)]
+        self.c.query_beacon_scout.return_value = dict(eligible=True,fresh=True,stock=3,cost=1)
+        self.s.switch(True,(1,3,4))
+        with patch('beacon_service.time.monotonic',return_value=100):self.s.tick(self.c)
+        self.c.beacon_action.assert_not_called()
+        self.c.query_beacon_scout.assert_not_called()
+        self.s.switch(True,(1,2,3,4))
+        with patch('beacon_service.time.monotonic',return_value=102):self.s.tick(self.c)
+        self.assertEqual(self.c.beacon_action.call_args.args[:2],('scout',2))
+        with patch('beacon_service.time.monotonic',return_value=104):self.s.tick(self.c)
+        self.c.beacon_action.assert_called_once()
+        self.c.query_beacon_scout.assert_called_once()
+        self.c.query_beacon_candidates.assert_not_called()
+
+    def test_unknown_scout_receipt_blocks_that_event_across_toggle(self):
+        """An unconfirmed scout cannot resend in this connection or stop another selected event."""
+        self.snapshot['events'] = [event(10,kind=2), event(11)]
+        self.c.query_beacon_scout.return_value = dict(eligible=True,fresh=True,stock=3,cost=1)
+
+        def act(operation, identifier, generation, **kwargs):
+            """Leave the treasure unchanged when the server receipt cannot be confirmed."""
+            if operation == 'scout':
+                raise BeaconScoutUnconfirmed('unknown')
+            return self.accept(operation,identifier,generation,**kwargs)
+
+        self.c.beacon_action.side_effect = act
+        self.s.switch(True,(1,2));self.s.last_kind=1
+        self.s.tick(self.c)
+        self.assertTrue(self.s.enabled)
+        self.assertEqual(self.s.scout_review,{10})
+        self.s.switch(False);self.s.switch(True,(1,2));self.s.tick(self.c)
+        self.assertEqual([c.args[:2] for c in self.c.beacon_action.call_args_list],
+                         [('scout',10),('dispatch',11)])
+        self.c.query_beacon_scout.assert_called_once()
 
     def test_resource_prefers_speed_then_load_and_never_recalls_on_arrival(self):
         """The resource strategy cannot accidentally inherit rescue's arrival shortcut."""

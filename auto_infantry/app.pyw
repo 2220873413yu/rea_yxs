@@ -30,6 +30,8 @@ from hall_profile import HallProfileSession
 from guild_invite import GuildInviteSession
 from guild_invite_panel import GuildInvitePanel
 from guild_web_relay import GuildWebRelay
+from gem_swap import GemSwapSession
+from gem_swap_panel import GemSwapPanel
 from hunt_reconnect import log_reconnect
 from secondary_page import SecondaryPage, discover_devices
 
@@ -47,6 +49,7 @@ class App:
         self.hall_profile = HallProfileSession(self.events)
         self.guild_invite = GuildInviteSession(self.events)
         self.guild_web_relay = GuildWebRelay(self.guild_invite, self.events)
+        self.gem_swap = GemSwapSession(self.events)
         self.sessions = LoginSession(self.events)
         self.login_busy = False
         self.accounts_dialog = None
@@ -67,6 +70,7 @@ class App:
         self.beacon_enabled = tk.BooleanVar(value=False)
         self.trial_enabled = tk.BooleanVar(value=False)
         self.report_enabled = tk.BooleanVar(value=False)
+        self.gem_swap_enabled = tk.BooleanVar(value=False)
         self.selections = {unit: tk.BooleanVar(value=unit == 411) for unit in UNIT_NAMES}
         self.counts = {unit: tk.StringVar(value='正在读取…') for unit in UNIT_NAMES}
         self.stock = tk.StringVar(value='五分钟训练加速：正在读取…')
@@ -140,6 +144,9 @@ class App:
         self.feature_tabs.add(self.battle_chat_panel,text='战斗聊天')
         self.guild_invite_panel = GuildInvitePanel(self.feature_tabs, self.guild_invite, self.guild_web_relay)
         self.feature_tabs.add(self.guild_invite_panel, text='公会邀请')
+        self.gem_swap_panel = GemSwapPanel(self.feature_tabs, self.gem_swap_enabled, self.switch_gem_swap,
+                                           self.revert_gem_swap, self.probe_gem_swap, self.resolve_gem_swap)
+        self.feature_tabs.add(self.gem_swap_panel, text='宝具替换')
         self.hero_status = self.hero_panel.status
         ttk.Separator(panel).pack(fill='x', pady=9)
         ttk.Label(panel, textvariable=self.status, wraplength=960).pack(anchor='w')
@@ -287,6 +294,7 @@ class App:
         self.monster_panel.auto_hint.set('本账号尚未手动开启打野，刷新时刻自动开启暂不启用。')
         self.trial_panel.clear()
         self.report_panel.clear()
+        self.gem_swap_panel.clear()
 
     def open_accounts(self):
         """Display public saved-role metadata in a separate window without interrupting active game work."""
@@ -355,6 +363,7 @@ class App:
         self.beacon_panel.update_controls(world_ready)
         self.trial_panel.update_controls(self.ready)
         self.report_panel.update_controls(world_ready)
+        self.gem_swap_panel.update_controls(True)
         self.collection_teams_panel.set_active(self.collect_enabled.get(), world_ready)
         for box in self.choice_widgets.values():
             box.state(['disabled'] if self.enabled.get() or self.trial_exclusive else ['!disabled'])
@@ -602,6 +611,36 @@ class App:
             self.trial_panel.status.set('自动爬塔未开启：'+str(error).splitlines()[0])
         self.update_controls()
 
+    def switch_gem_swap(self, revert=False):
+        """Arm or disarm the 宝具 rules through this feature's own bridge; never sends a game request."""
+        try:
+            if revert:
+                self.gem_swap.revert()
+            elif self.gem_swap_enabled.get():
+                hero_base, first, second = self.gem_swap_panel.selection()
+                self.gem_swap.arm(hero_base, first, second, self.gem_swap_panel.hero.get())
+            else:
+                self.gem_swap.disarm()
+        except Exception as error:
+            self.gem_swap_enabled.set(False)
+            self.gem_swap_panel.status.set('宝具替换未开启：' + str(error).splitlines()[0][:200])
+        self.update_controls()
+
+    def revert_gem_swap(self, revert=True):
+        """Restore the client slots this session changed; the rules stay disarmed afterwards."""
+        self.switch_gem_swap(True)
+
+    def probe_gem_swap(self, probe=True):
+        """Read the hero this battle assigned to my seat, so it can be named without the world roster."""
+        self.gem_swap.probe()
+
+    def resolve_gem_swap(self, resolve=True):
+        """Resolve the typed hero name through the game's own config rows."""
+        try:
+            self.gem_swap.resolve(self.gem_swap_panel.hero.get())
+        except Exception as error:
+            self.gem_swap_panel.status.set('英雄名未解析：' + str(error).splitlines()[0][:200])
+
     def poll(self):
         """Render confirmed switches and accept only the authorized, scoped scheduled-hunting start requests."""
         try:
@@ -701,6 +740,16 @@ class App:
                     self.trial_panel.status.set(event['trial_status'].splitlines()[0][:240])
                 if 'trial_snapshot' in event:
                     self.trial_panel.apply_snapshot(event['trial_snapshot'])
+                if 'gem_swap_enabled' in event:
+                    self.gem_swap_enabled.set(bool(event['gem_swap_enabled']))
+                if 'gem_swap_status' in event:
+                    self.gem_swap_panel.status.set(event['gem_swap_status'].splitlines()[0][:240])
+                if 'gem_swap_slots' in event:
+                    self.gem_swap_panel.apply_slots(event['gem_swap_slots'])
+                if 'gem_swap_current_hero' in event:
+                    self.gem_swap_panel.apply_current_hero(event['gem_swap_current_hero'])
+                if 'gem_swap_resolved' in event:
+                    self.gem_swap_panel.apply_resolved(event['gem_swap_resolved'])
                 if 'beacon_enabled' in event:
                     self.beacon_enabled.set(event['beacon_enabled'])
                 if 'beacon_status' in event:
@@ -753,6 +802,7 @@ class App:
                     self.collection_teams_panel.apply_snapshot(event['collection_teams'])
                 if 'hero_roster' in event:
                     self.hero_panel.apply_roster(event['hero_roster'])
+                    self.gem_swap_panel.set_roster(event['hero_roster'].get('heroes'))
                     if 'queue_used' in event['hero_roster']:
                         self.collection_panel.apply_queue(event['hero_roster'])
                 if 'collection_queue' in event:
@@ -802,6 +852,8 @@ class App:
         self.beacon_enabled.set(False)
         self.trial_enabled.set(False)
         self.report_enabled.set(False)
+        self.gem_swap_enabled.set(False)
+        self.gem_swap.close()
         if self.worker is not None:
             try:
                 self.worker.stop()

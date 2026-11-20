@@ -35,7 +35,7 @@ class BeaconPanel(ttk.Frame):
         self.check = ttk.Button(bar, text='立即检查', command=on_check, state='disabled')
         self.check.pack(side='right')
         ttk.Label(self, text='救援到达撤回；怪物胜券在握才出征、到达后跳过；资源正常采完；完成后自动领奖。\n'
-                  '宝藏正常消耗现有斥候、不购买；不主动用恢复/加速道具。修改类型前先关闭总开关。',
+                  '只有烽火台宝藏可派现有斥候进入迷雾，不购买斥候、不主动用恢复/加速道具。修改类型前先关闭总开关。',
                   foreground='#666666', wraplength=950).pack(anchor='w', pady=(8,4))
         ttk.Label(self, textvariable=self.summary).pack(anchor='w')
         ttk.Label(self, textvariable=self.timing, wraplength=950).pack(anchor='w', pady=(3,4))
@@ -95,7 +95,7 @@ class BeaconPanel(ttk.Frame):
         self.render()
 
     def render(self):
-        """Keep completed event timestamps out of active-stage timers and show returning armies separately."""
+        """Show unconfirmed scout receipts and keep completed timestamps out of active-stage timers."""
         if self.snapshot is None:
             return
         snapshot = self.snapshot
@@ -109,6 +109,7 @@ class BeaconPanel(ttk.Frame):
         self.timing.set(f"刷新参考：{refresh}；下次检查：{check}；数据时间：{display_time(snapshot['server_now_ms'])}")
         self.tree.delete(*self.tree.get_children())
         armies = {a['army_id']:a for a in snapshot['armies']}
+        scout_review = set(snapshot.get('scout_review', ()))
         displayed = set()
         for event in snapshot['events']:
             army = armies.get(event['army_id'])
@@ -116,6 +117,8 @@ class BeaconPanel(ttk.Frame):
                 displayed.add(army['army_id'])
             end = army['end_ms'] if army else event['end_ms'] if event['state']==2 else 0
             state=STATES.get(event['state'],f"状态{event['state']}")
+            if event['kind'] == 2 and event['state'] == 0 and event['event_id'] in scout_review:
+                state = '侦察结果待核对'
             if army and army['state']==9:state+=' / 返城中'
             self.tree.insert('', 'end', values=(KINDS.get(event['kind'],'其他（只读）'),
                 f"{event['event_id']} / ({event['x']},{event['y']})",state,

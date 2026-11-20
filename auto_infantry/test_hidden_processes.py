@@ -3,7 +3,7 @@ import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
-from connection import Connection
+from connection import Connection, GameVersionError
 from game_log import GameResponseLog
 
 
@@ -29,7 +29,7 @@ class HiddenProcessTests(unittest.TestCase):
         device.attach.return_value.create_script.return_value = script
         stat = '123 (com.qqgame.mic) S ' + '0 ' * 18 + '456'
         process = subprocess.CompletedProcess([], 0, stdout='test-boot\n' + stat)
-        with patch('connection.subprocess.check_output', return_value='versionCode=431000017 ') as output, \
+        with patch('connection.subprocess.check_output', return_value='    versionCode=501000073 minSdk=22') as output, \
                 patch('connection.subprocess.run') as run, \
                 patch('connection.frida.get_device_manager') as manager:
             run.side_effect = [process, subprocess.CompletedProcess([], 0)]
@@ -38,3 +38,14 @@ class HiddenProcessTests(unittest.TestCase):
         self.assertEqual(connection.process_identity, (123, 'test-boot', 456))
         for call in output.call_args_list + run.call_args_list:
             self.assertEqual(call.kwargs.get('creationflags'), subprocess.CREATE_NO_WINDOW)
+
+    def test_unknown_build_cannot_acquire_or_attach_a_bridge(self):
+        """Reject a future build even if its build number starts with a supported one."""
+        connection = Connection()
+        with patch('connection.subprocess.check_output', return_value='    versionCode=5010000730'), \
+                patch.object(connection, 'acquire_owner') as acquire, \
+                patch('connection.frida.get_device_manager') as manager:
+            with self.assertRaisesRegex(GameVersionError, '5010000730'):
+                connection.attach()
+        acquire.assert_not_called()
+        manager.assert_not_called()

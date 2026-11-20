@@ -135,7 +135,7 @@ local function scoutStages()
 end
 n.scoutStages=scoutStages
 
--- Read native distance-based cost and confirmed stock; coordinates here are display coordinates for attribution.
+-- Check the native treasure scout flow: cost, stock and duplicate protection apply even in fog.
 function api.beacon_scout_result(id)
  n.world();local e=n.event(id);assert(kind(e)==2,'Not a treasure event')
  if scoutPending or scoutCount==nil then return '{"ready":false}' end
@@ -143,21 +143,19 @@ function api.beacon_scout_result(id)
  assert(divisor>0,'Scout cost configuration invalid')
  local distance=CSLTypes.SLGMapUtils.calMapP2PDistance(e[1][1],map:getMyMainCityCoordinates())
  local cost=math.floor((distance+divisor-1)/divisor)
- local p=e[1][1];local visible=n.visible(p)
+ local p=e[1][1]
  local shown=CSLTypes.SLGMapUtils.logicToDisplay(p);local busy=false
  for _,s in ipairs(scoutStages()) do if s.x==shown[1] and s.y==shown[2] and s.end_ms>n.now() then busy=true end end
  return api.encode_flat_state({ready=true,event_id=id,cost=cost,stock=scoutCount,x=shown[1],y=shown[2],
-  fresh=n.now()-scoutAt<=3000,eligible=visible and not busy and not attempts.scout[id] and e[3]==0 and scoutCount>=cost})
+  fresh=n.now()-scoutAt<=3000,eligible=not busy and not attempts.scout[id] and e[3]==0 and scoutCount>=cost})
 end
 
--- Spend only available scouts through the original confirm-button callback, reserving before the send.
+-- Spend existing scouts once through the native confirm callback, only for a selected beacon treasure.
 function api.beacon_scout(id)
- local e=n.event(id);local state=api.beacon_scout_result(id)
- -- Recompute guards as Lua values; never infer authorization by searching the JSON string.
+ local e=n.event(id)
  assert(kind(e)==2 and e[3]==0 and not attempts.scout[id] and not scoutPending and scoutCount~=nil and
   n.now()-scoutAt<=3000,'Fresh treasure scout stock required')
  local p=e[1][1];local shown=CSLTypes.SLGMapUtils.logicToDisplay(p)
- assert(n.visible(p),'Treasure vision lost')
  local k=math.floor(tonumber(search:searchGlobalVariable(103010)[2]));assert(k>0,'Invalid scout cost')
  local cost=math.floor((CSLTypes.SLGMapUtils.calMapP2PDistance(p,map:getMyMainCityCoordinates())+k-1)/k)
  assert(scoutCount>=cost,'Insufficient scouts; no purchase')

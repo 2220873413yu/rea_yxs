@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import Mock
 
 from connection import Connection
-from game_log import GameResponseLog,BeaconRejected,BeaconCapacityUnavailable
+from game_log import GameResponseLog, BeaconRejected, BeaconCapacityUnavailable, BeaconScoutUnconfirmed
 from test_collection_receipts import request, response
 from test_monster_receipts import skip_request,skip_response
 
@@ -105,7 +105,7 @@ class BeaconReceiptTests(unittest.TestCase):
         self.assertEqual(self.log(11014,sent,live).wait_beacon_scout(86,181)['end_ms'],epoch)
         for a,b in ((sent.replace(bytes.fromhex('0056'),bytes.fromhex('0057')),received),
                     (sent,received.replace(bytes.fromhex('0056'),bytes.fromhex('0057')))):
-            with self.assertRaises(RuntimeError):self.log(11014,a,b).wait_beacon_scout(86,181)
+            with self.assertRaises(BeaconScoutUnconfirmed):self.log(11014,a,b).wait_beacon_scout(86,181)
 
     def test_monster_detail_precedes_availability_and_cancel_prevents_selection(self):
         """Connection prepares the correct quest once before requesting the hero list, with no retries."""

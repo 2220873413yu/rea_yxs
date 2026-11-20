@@ -9,7 +9,7 @@ import time
 import xml.etree.ElementTree as ET
 import frida
 
-from connection import Connection
+from connection import Connection, GameVersionError
 from account_store import AccountError, TicketExpired, AUTH_KEYS, decode_sdk, validate_profile
 from account_transport import AccountTransport, SDK_PREF, cancelled
 from account_lock import account_operation, acquire_role, release_role
@@ -40,7 +40,7 @@ class AccountService:
 
     @contextmanager
     def connection(self, cancel):
-        """Retry only local bridge startup before yielding; never replay an authentication after the caller starts."""
+        """Retry local bridge startup and preserve the build mismatch for account operations."""
         self.transport.wait_modules(cancel)
         connection = Connection()
         try:
@@ -61,7 +61,7 @@ class AccountService:
                     raise AccountError('游戏登录模块尚未就绪，请等待登录页加载完成后重试')
                 cancel.wait(1)
             yield connection
-        except (AccountError, InterruptedError):
+        except (AccountError, GameVersionError, InterruptedError):
             raise
         except Exception:
             # Frida and SDK errors may contain internal values; never forward arbitrary exception text.

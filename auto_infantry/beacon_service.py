@@ -4,7 +4,7 @@ import time
 
 from collection_wakeup import CollectionWakeup
 from beacon_preferences import checked_types
-from game_log import BeaconRejected,BeaconCapacityUnavailable
+from game_log import BeaconRejected, BeaconCapacityUnavailable, BeaconScoutUnconfirmed
 
 
 def choose_rescue_hero(metrics, kind=1):
@@ -53,6 +53,7 @@ class BeaconService:
         self.skipped=set()
         self.capacity_wait=None
         self.last_snapshot=None
+        self.scout_review = set()
 
     def switch(self, enabled, kinds=None):
         """Keep the checkbox default-off and immediately revoke every queued action on an off/on transition."""
@@ -94,17 +95,18 @@ class BeaconService:
             self.hero_signature = signature
 
     def publish_snapshot(self, snapshot, roster):
-        """Display authoritative stages and one-shot check plans, marking disabled timers cancelled."""
+        """Display confirmed server stages, deadlines and treasure receipts requiring review."""
         self.last_snapshot=snapshot
         if self.enabled:
             self.due = self.wakeup.schedule(beacon_schedule(snapshot, roster,self.kinds), time.monotonic())
         check_ms = (snapshot['server_now_ms'] + max(0, self.due-time.monotonic())*1000
                     if self.enabled and self.due != float('inf') else None)
-        self.owner.publish(beacon_snapshot={**snapshot, 'enabled': self.enabled, 'check_ms': check_ms},
+        self.owner.publish(beacon_snapshot={**snapshot, 'enabled': self.enabled, 'check_ms': check_ms,
+                                             'scout_review': sorted(self.scout_review)},
                            hero_roster=roster)
 
     def act(self, connection, operation, event, epoch, generation, army=None, hero=None):
-        """Reserve one action before sending, confirm it, then let the next serialized decision continue."""
+        """Reserve one action and isolate scout results that do not require stopping other events."""
         with self.owner.guard:
             if not self.alive(epoch):
                 return
@@ -122,6 +124,15 @@ class BeaconService:
             if operation!='dispatch':raise
             self.wait_for_capacity(connection,event,epoch,None)
             return
+        except BeaconScoutUnconfirmed as error:
+            if operation != 'scout':
+                raise
+            with self.owner.guard:
+                self.uncertain = False
+                self.scout_review.add(event['event_id'])
+            self.owner.publish(action='beacon_scout_unconfirmed', event_id=event['event_id'],
+                               reason=str(error), beacon_status='该宝藏侦察结果待核对，暂停该事件')
+            return 'review'
         with self.owner.guard:
             self.uncertain = False
             if operation=='skip':self.skipped.add(army['army_id'])
@@ -176,7 +187,7 @@ class BeaconService:
         self.owner.publish(beacon_enabled=False,error=str(error),beacon_status='烽火台已停止：'+str(error))
 
     def tick(self, connection):
-        """Reconcile on startup, explicit request, server deadline or a changed cached signature, never fixed polling."""
+        """Reconcile on manual requests, server deadlines or cached changes and keep independent events moving."""
         with self.owner.guard:
             if self.owner.closing.is_set():
                 return
@@ -236,7 +247,8 @@ class BeaconService:
             rotation=kinds[kinds.index(self.last_kind)+1:]+kinds[:kinds.index(self.last_kind)+1] if self.last_kind in kinds else kinds
             selected.sort(key=lambda e:(rotation.index(e['kind']),e['distance'],e['event_id']))
             for event in selected:
-                if event['state'] != 0 or not event['visible']:
+                # The native treasure dialog can scout in fog; other tasks still require vision.
+                if event['state'] != 0 or (event['kind'] != 2 and not event['visible']):
                     continue
                 if event['event_id'] in self.ignored:
                     continue
@@ -247,15 +259,18 @@ class BeaconService:
                 if not self.alive(epoch):
                     return
                 if event['kind']==2:
+                    if event['event_id'] in self.scout_review:
+                        continue
                     if any(s['x']==event['x'] and s['y']==event['y'] and s['end_ms']>snapshot['server_now_ms'] for s in snapshot.get('scouts',[])):
                         continue
                     metrics=connection.query_beacon_scout(event['event_id'],generation,lambda:not self.alive(epoch))
                     self.owner.publish(beacon_scout=metrics)
                     if not self.alive(epoch):return
                     if metrics['eligible'] and metrics['fresh']:
-                        self.last_kind=2
-                        self.act(connection,'scout',event,epoch,generation)
-                        return
+                        outcome = self.act(connection,'scout',event,epoch,generation)
+                        if outcome is None:
+                            self.last_kind = 2
+                            return
                     continue
                 # All features use this same worker; refresh eligibility before the final native send.
                 roster = connection.refresh_heroes()
@@ -270,7 +285,10 @@ class BeaconService:
                     return
                 if event['kind']==4 and metrics['heroes'] and all(h.get('strength_known',True) for h in metrics['heroes']) and not any(h.get('overwhelming') for h in metrics['heroes']):
                     self.ignored.add(event['event_id'])
-            self.publish_snapshot(snapshot,roster)
+            with self.owner.guard:
+                if not self.alive(epoch):
+                    return
+                self.publish_snapshot(snapshot,roster)
             if blocked or snapshot['queue_full'] or snapshot['queue_used']>=snapshot['queue_limit']:
                 self.owner.publish(beacon_status=f"烽火台额度已满或待服务器确认（{snapshot['queue_used']}/{snapshot['queue_limit']}，含返城），保持开启；等待阶段时间或推送")
             else:
@@ -284,8 +302,7 @@ class BeaconService:
                 except Exception as error:
                     self.stop_on_error(epoch,error)
                     return
-                # Preserve a push arriving after the last published snapshot; self-generated replies
-                # are consumed by the next immediate decision following a successful action.
+                # A confirmed action already schedules its own immediate follow-up.
                 if self.signature is not None and self.signature != signature and self.due != 0:
                     self.wakeup.pending = True
                 self.signature = signature

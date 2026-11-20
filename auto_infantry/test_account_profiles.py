@@ -288,6 +288,17 @@ class AccountLoginTests(unittest.TestCase):
         second.close.assert_called_once()
         self.assertEqual([c.args[1] for c in self.service.call.call_args_list],['ready'])
 
+    def test_account_save_passes_through_unsupported_build(self):
+        """Saving on an unsupported build shows the actionable failure before capturing a profile."""
+        from connection import GameVersionError
+
+        self.connection.attach.side_effect = GameVersionError('unsupported build 501000074')
+        with patch('account_service.Connection', return_value=self.connection):
+            with self.assertRaisesRegex(GameVersionError, '501000074'):
+                self.service.save_current(self.cancel)
+        self.connection.login_call.assert_not_called()
+        self.service.store.save.assert_not_called()
+
     def test_expired_observation_stops_without_another_login_request(self):
         """A missing SDK ticket persists for five seconds and is then reported as scan-required."""
         self.connection.login_call.return_value = dict(logged_in=False)
