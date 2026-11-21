@@ -1,11 +1,12 @@
 """Start only the bundled, version-matched local instrumentation service when needed."""
 import subprocess
 import os
+import re
 import shlex
 import time
 from pathlib import Path
 import frida
-from instance_config import DEVICE, DEVICE_ID, SECONDARY
+from instance_config import DEVICE, DEVICE_ID, EMULATOR_CONFIG, SECONDARY
 
 ROOT = Path(__file__).resolve().parent.parent
 FRIDA_VERSION = '17.26.2'
@@ -29,7 +30,16 @@ def find_adb(configured=None):
     return r'E:\leidian\LDPlayer14\adb.exe'
 
 
-ADB = find_adb()
+ADB = EMULATOR_CONFIG.get('adb') or os.environ.get('REA_ADB') or find_adb()
+
+
+def online_devices(adb_path):
+    """List online emulator serials using the selected ADB executable."""
+    result = subprocess.run([adb_path, 'devices'], capture_output=True, check=True, text=True,
+                            encoding='utf-8', errors='replace', timeout=5,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    return sorted({fields[0] for line in result.stdout.splitlines() if len(fields := line.split()) >= 2
+                   and fields[1] == 'device' and re.fullmatch(r'emulator-[0-9]{4,5}', fields[0])})
 
 
 def ensure_client_version():
@@ -40,6 +50,8 @@ def ensure_client_version():
 
 def adb(*arguments, timeout=10, check=True):
     """Run a bounded ADB command against this process's selected emulator."""
+    if not Path(ADB).is_file():
+        raise RuntimeError('找不到 adb.exe，请在「雷电设置」选择雷电安装目录里的 adb.exe')
     return subprocess.run([ADB, '-s', DEVICE, *arguments], capture_output=True,
                           text=True, encoding='utf-8', errors='replace', timeout=timeout,
                           check=check, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -80,7 +92,9 @@ def ensure_server():
     """Deploy the pinned service and migrate only our verified old helper; never restart the game or change root."""
     ensure_client_version()
     verify_device()
-    adb('get-state')
+    state = adb('get-state', check=False)
+    if state.returncode or state.stdout.strip() != 'device':
+        raise RuntimeError(f'雷电实例 {DEVICE} 未在线。请先启动模拟器，再到「雷电设置」检查主实例和 ADB 路径')
     root = adb('shell', 'su', '-c', 'id')
     if 'uid=0' not in root.stdout:
         raise RuntimeError('模拟器现有 root 不可用，无法连接游戏')

@@ -11,6 +11,7 @@ import frida
 
 from account_lock import ensure_account_available
 from connection import ADB, Connection
+from instance_config import DEVICE
 from game_log import GameResponseLog, tags
 from game_protocol import JceReader
 
@@ -82,7 +83,7 @@ def native_invite_scope():
     process = Connection.read_process_identity()
     if process is None:
         raise RuntimeError('请先在模拟器打开并登录游戏')
-    subprocess.run([ADB, '-s', 'emulator-5554', 'forward', 'tcp:27042', 'tcp:27042'],
+    subprocess.run([ADB, '-s', DEVICE, 'forward', 'tcp:27042', 'tcp:27042'],
                    capture_output=True, check=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
     session = frida.get_device_manager().add_remote_device('127.0.0.1:27042').attach(process[0], realm='emulated')
     script = None

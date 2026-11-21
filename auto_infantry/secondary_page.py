@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import queue
-import re
 import subprocess
 import sys
 import threading
@@ -12,7 +11,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from beacon_panel import BeaconPanel
-from bootstrap import ADB
+from bootstrap import ADB, online_devices
 from collection_display import display_time
 from collection_panel import CollectionPanel
 from collection_teams_panel import CollectionTeamsPanel
@@ -28,15 +27,7 @@ from units import UNIT_NAMES
 
 def discover_devices():
     """List online emulator serials without touching the primary instance or forwarding ports."""
-    result = subprocess.run([ADB, 'devices'], capture_output=True, check=True, text=True, encoding='utf-8',
-                            timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
-    devices = []
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if (len(fields) >= 2 and fields[1] == 'device' and fields[0] != PRIMARY_DEVICE
-                and re.fullmatch(r'emulator-[0-9]{4,5}', fields[0])):
-            devices.append(fields[0])
-    return sorted(set(devices))
+    return [device for device in online_devices(ADB) if device != PRIMARY_DEVICE]
 
 
 class InstanceProcess:

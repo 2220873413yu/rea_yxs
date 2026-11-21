@@ -7,6 +7,9 @@ from pathlib import Path
 
 import frida
 
+from bootstrap import ADB
+from instance_config import DEVICE
+
 ROOT = Path(__file__).resolve().parent
 
 # Only catalogued 主印-style gems; the skill id comes from the game's own gem config row.
@@ -80,7 +83,7 @@ class Bridge:
             pass
 
 
-def attach_bridge(adb='E:\\leidian\\LDPlayer14\\adb.exe', device='emulator-5554'):
+def attach_bridge(adb=ADB, device=DEVICE):
     """Attach without waiting for the world map: the hall and a battle share one Lua VM."""
     flags = subprocess.CREATE_NO_WINDOW
     subprocess.run([adb, '-s', device, 'forward', 'tcp:27042', 'tcp:27042'], capture_output=True,

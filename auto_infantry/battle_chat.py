@@ -8,6 +8,7 @@ from pathlib import Path
 import frida
 from account_lock import ensure_account_available
 from connection import ADB
+from instance_config import DEVICE
 from game_log import GameResponseLog,tags
 from game_protocol import JceReader
 
@@ -72,8 +73,8 @@ def send_battle_chat_once(message,cancelled):
     if cancelled():raise InterruptedError('发送已取消，未调用接口')
     ensure_account_available()
     flags=subprocess.CREATE_NO_WINDOW
-    subprocess.run([ADB,'-s','emulator-5554','forward','tcp:27042','tcp:27042'],capture_output=True,check=True,timeout=5,creationflags=flags)
-    pid=int(subprocess.check_output([ADB,'-s','emulator-5554','shell','pidof','com.qqgame.mic'],text=True,timeout=5,creationflags=flags).split()[0])
+    subprocess.run([ADB,'-s',DEVICE,'forward','tcp:27042','tcp:27042'],capture_output=True,check=True,timeout=5,creationflags=flags)
+    pid=int(subprocess.check_output([ADB,'-s',DEVICE,'shell','pidof','com.qqgame.mic'],text=True,timeout=5,creationflags=flags).split()[0])
     session=frida.get_device_manager().add_remote_device('127.0.0.1:27042').attach(pid,realm='emulated')
     script=None;attempted=False;name='_REA_CHAT_CLICK_'+uuid.uuid4().hex
     try:

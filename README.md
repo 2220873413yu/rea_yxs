@@ -28,7 +28,7 @@
 - 雷电模拟器 `emulator-5554`，优先使用 `E:\leidian\LDPlayer14\adb.exe`，未安装时兼容原 `LDPlayer9` 路径；可用环境变量 `REA_ADB` 指定其他安装位置。
 - 游戏包名 `com.qqgame.mic`。支持 4.31.0（`431000017`）和 5.1.0（`501000073`），按安装包构建号检查。
 - 已有的模拟器 root 环境及电脑端、模拟器端一致的 Frida 17.26.2；支持新版雷电 Android14 的 Houdini ARM 转译连接。服务文件位置见 `auto_infantry/bootstrap.py`。
-- 当前入口使用 `.analysis-tools/pyenv/Scripts/pythonw.exe`。换电脑后需核对 ADB、设备及服务二进制位置，这些设置尚未做成通用配置。
+- 当前入口使用 `.analysis-tools/pyenv/Scripts/pythonw.exe`。换电脑后，先启动雷电，再到助手右上角「雷电设置」选择该电脑雷电安装目录里的 `adb.exe` 和在线的主雷电实例。保存后重新打开助手。路径和实例编号保存在本机 `%LOCALAPPDATA%\REA_YXS\emulator.json`。
 
 在项目根目录准备 Python 环境：
 

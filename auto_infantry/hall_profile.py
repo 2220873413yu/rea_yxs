@@ -7,6 +7,7 @@ from pathlib import Path
 import frida
 from account_lock import ensure_account_available
 from connection import Connection,ADB
+from instance_config import DEVICE
 from game_log import GameResponseLog
 from player_query import query_player,validate_player_id
 
@@ -18,8 +19,8 @@ def query_hall_profile(target,cancelled,clear_cache=False):
     if not clear_cache:target=validate_player_id(target)
     if cancelled():raise InterruptedError('玩家查询已取消')
     ensure_account_available();flags=subprocess.CREATE_NO_WINDOW
-    subprocess.run([ADB,'-s','emulator-5554','forward','tcp:27042','tcp:27042'],capture_output=True,check=True,timeout=5,creationflags=flags)
-    pid=int(subprocess.check_output([ADB,'-s','emulator-5554','shell','pidof','com.qqgame.mic'],text=True,timeout=5,creationflags=flags).split()[0])
+    subprocess.run([ADB,'-s',DEVICE,'forward','tcp:27042','tcp:27042'],capture_output=True,check=True,timeout=5,creationflags=flags)
+    pid=int(subprocess.check_output([ADB,'-s',DEVICE,'shell','pidof','com.qqgame.mic'],text=True,timeout=5,creationflags=flags).split()[0])
     session=frida.get_device_manager().add_remote_device('127.0.0.1:27042').attach(pid,realm='emulated')
     client=Connection();client.player_api='_REA_HALL_PROFILE_'+uuid.uuid4().hex
     script=None;lease=client.player_api+'_LEASE'

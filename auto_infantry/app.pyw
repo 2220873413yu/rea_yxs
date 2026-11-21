@@ -8,8 +8,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 
-from bootstrap import ensure_server
 from controller import Worker, owned_soldiers
+from emulator_settings_dialog import EmulatorSettingsDialog
 from units import UNIT_NAMES
 from hero_panel import HeroPanel
 from collection_panel import CollectionPanel
@@ -94,6 +94,7 @@ class App:
         self.reload_button = ttk.Button(header, text='重新读取当前账号', command=lambda: self.request_session('connect'))
         self.reload_button.pack(side='right', padx=6)
         ttk.Button(header, text='账号管理', command=self.open_accounts).pack(side='right')
+        ttk.Button(header, text='雷电设置', command=self.open_emulator_settings).pack(side='right', padx=6)
         self.account_status = tk.StringVar(value='当前账号：正在读取；自动功能关闭')
         ttk.Label(header, textvariable=self.account_status, wraplength=360).pack(side='left', padx=(14, 0))
         top = ttk.Frame(panel)
@@ -157,6 +158,11 @@ class App:
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.connect()
         self.root.after(100, self.poll)
+
+    def open_emulator_settings(self):
+        """Save the next launch's emulator selection without retargeting active workers."""
+        if EmulatorSettingsDialog(self.root, title='雷电设置').result:
+            messagebox.showinfo('雷电设置', '设置已保存。请关闭并重新打开助手，让新的主实例生效。', parent=self.root)
 
     def workspace_changed(self, _event):
         """Open the instance selector from the add tab without disturbing the primary task view."""
