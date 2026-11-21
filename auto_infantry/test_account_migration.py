@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from account_migration import (encrypt_archive, decrypt_archive, export_accounts, import_accounts,
-                               MAGIC, HEADER_SIZE, MAX_FILE, validate_batch)
+                               MAGIC, HEADER_SIZE, MAX_FILE, validate_batch, archive_requires_password)
 from account_store import AccountStore, AccountError, profile_key, crypt_profile
 from account_dialog import AccountDialog
 from login_session import LoginSession
@@ -75,6 +75,45 @@ class AccountMigrationTests(unittest.TestCase):
         self.assertEqual(self.target.load(ios['profile_id'])['ticket_status'], '已保存，切换时验证')
         self.assertEqual(self.target.load(android['profile_id'])['ticket_status'], '需要重新扫码')
         self.assertFalse(list(self.target.directory.glob('.import-*')))
+
+    def test_plaintext_round_trip_needs_no_password_or_crypto(self):
+        """The default exported JSON imports on a second machine without loading the legacy password cipher."""
+        a = self.source.save(profile(name='plain-one'))
+        b = self.source.save(profile(name='plain-two'), '需要重新扫码')
+        original = self.source._path(a['profile_id']).read_bytes()
+        with patch('account_migration.crypto') as crypto:
+            export_accounts(self.source, [a['profile_id'], b['profile_id']], self.path)
+            value = json.loads(self.path.read_text(encoding='utf-8'))
+            self.assertEqual(value['format'], 2)
+            self.assertEqual(len(value['profiles']), 2)
+            self.assertFalse(archive_requires_password(self.path))
+            self.assertEqual(import_accounts(self.target, self.path), {'imported': 2, 'skipped': 0})
+            before = self.target._path(a['profile_id']).read_bytes()
+            self.assertEqual(import_accounts(self.target, self.path), {'imported': 0, 'skipped': 2})
+            crypto.assert_not_called()
+        self.assertEqual(self.source._path(a['profile_id']).read_bytes(), original)
+        self.assertEqual(self.target._path(a['profile_id']).read_bytes(), before)
+        self.assertEqual(self.target.load(a['profile_id'])['database'], self.source.load(a['profile_id'])['database'])
+        self.assertEqual(self.target.load(b['profile_id'])['ticket_status'], '需要重新扫码')
+
+    def test_plaintext_invalid_batch_never_partially_imports(self):
+        """Reject malformed JSON, wrong format and an invalid second account before publishing any profile."""
+        for blob in (b'{', b'\xff', b'[]', b'{"format":true,"profiles":[]}',
+                     json.dumps({'format':2,'profiles':[profile(),{}]}).encode()):
+            self.path.write_bytes(blob)
+            with self.assertRaises(AccountError):
+                import_accounts(self.target,self.path)
+            self.assertFalse(self.target.directory.exists())
+
+    def test_plaintext_export_failure_preserves_previous_archive(self):
+        """An interrupted write cannot replace an older archive or leave its temporary export file."""
+        key = self.source.save(profile())['profile_id']
+        self.path.write_bytes(b'old archive')
+        with patch('account_migration.os.fsync', side_effect=OSError('write failed')):
+            with self.assertRaises(AccountError):
+                export_accounts(self.source,[key],self.path)
+        self.assertEqual(self.path.read_bytes(),b'old archive')
+        self.assertFalse(list(self.root.glob('.yxs-export-*')))
 
     def test_export_selects_only_requested_accounts_and_is_randomized(self):
         """An archive contains only selected identities and repeated exports never reuse salt/nonce bytes."""
@@ -198,6 +237,8 @@ class MigrationSessionTests(unittest.TestCase):
     def test_import_and_export_never_connect_or_login_and_return_only_public_counts(self):
         """Both flows stop the existing worker and publish no password, identity or ticket contents."""
         for mode, selection, result in (
+            ('account_import', ('fake.yxsaccounts',), {'imported': 2, 'skipped': 1}),
+            ('account_export', (('a'*64,), 'fake.yxsaccounts'), {'exported': 1}),
             ('account_import', ('fake.yxsaccounts', PASSWORD), {'imported': 2, 'skipped': 1}),
             ('account_export', (('a'*64,), 'fake.yxsaccounts', PASSWORD), {'exported': 1}),
         ):
@@ -266,23 +307,38 @@ class MigrationDialogTests(unittest.TestCase):
         with patch('account_dialog.filedialog.asksaveasfilename', return_value='fake.yxsaccounts'), \
              patch('account_dialog.simpledialog.askstring', side_effect=[PASSWORD,PASSWORD]) as prompts:
             self.dialog.export_selected()
-        self.app.request_session.assert_called_once_with('account_export', (('a'*64,'b'*64),'fake.yxsaccounts',PASSWORD))
-        self.assertTrue(all(call.kwargs['show']=='*' for call in prompts.call_args_list))
+        self.app.request_session.assert_called_once_with('account_export', (('a'*64,'b'*64),'fake.yxsaccounts'))
+        prompts.assert_not_called()
         self.dialog.refresh(self.rows)
         self.assertEqual(len(self.dialog.tree.selection()),2)
 
-    def test_import_requires_explicit_file_and_password_and_respects_busy_state(self):
-        """Import is one queued local job; cancellation and mismatched passwords never queue migration."""
+    def test_plaintext_import_has_no_password_prompt_and_respects_busy_state(self):
+        """New JSON imports directly while cancellation and busy controls cannot queue work."""
         with patch('account_dialog.filedialog.askopenfilename',return_value='fake.yxsaccounts'), \
-             patch('account_dialog.simpledialog.askstring',return_value=PASSWORD):
+             patch('account_dialog.archive_requires_password',return_value=False), \
+             patch('account_dialog.simpledialog.askstring') as prompts:
             self.dialog.import_archive()
-        self.app.request_session.assert_called_once_with('account_import', ('fake.yxsaccounts',PASSWORD))
+        self.app.request_session.assert_called_once_with('account_import', ('fake.yxsaccounts',))
+        prompts.assert_not_called()
         self.app.request_session.reset_mock()
         self.dialog.tree.selection_set('a'*64)
-        with patch('account_dialog.filedialog.asksaveasfilename',return_value='fake.yxsaccounts'), \
-             patch('account_dialog.simpledialog.askstring',side_effect=[PASSWORD,'different-password']), \
-             patch('account_dialog.messagebox.showerror'):
+        with patch('account_dialog.filedialog.asksaveasfilename',return_value=''):
             self.dialog.export_selected()
+        self.app.request_session.assert_not_called()
+
+    def test_legacy_import_only_prompts_for_original_masked_password(self):
+        """Existing encrypted files stay importable and password cancellation queues no import."""
+        with patch('account_dialog.filedialog.askopenfilename',return_value='old.yxsaccounts'), \
+             patch('account_dialog.archive_requires_password',return_value=True), \
+             patch('account_dialog.simpledialog.askstring',return_value=PASSWORD) as prompts:
+            self.dialog.import_archive()
+        self.app.request_session.assert_called_once_with('account_import', ('old.yxsaccounts', PASSWORD))
+        self.assertEqual(prompts.call_args.kwargs['show'],'*')
+        self.app.request_session.reset_mock()
+        with patch('account_dialog.filedialog.askopenfilename',return_value='old.yxsaccounts'), \
+             patch('account_dialog.archive_requires_password',return_value=True), \
+             patch('account_dialog.simpledialog.askstring',return_value=None):
+            self.dialog.import_archive()
         self.app.request_session.assert_not_called()
         self.app.login_busy=True;self.dialog.update_controls()
         self.dialog.import_archive()

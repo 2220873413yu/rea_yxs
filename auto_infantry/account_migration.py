@@ -1,4 +1,4 @@
-"""Password-encrypted portable account archives; decrypted tickets stay in memory until local DPAPI storage."""
+"""Plain JSON account migration with legacy password-encrypted archive import support."""
 import json
 import os
 from pathlib import Path
@@ -95,9 +95,36 @@ def decrypt_archive(blob, password):
         raise AccountError('迁移文件内容格式异常，未导入任何账号') from None
 
 
-def export_accounts(store, keys, destination, password, cancel=None):
-    """Read only selected profiles, then atomically write ciphertext; no plaintext temporary files or game calls."""
-    password_bytes(password)
+def archive_requires_password(source):
+    """Inspect only the legacy header so plaintext imports never prompt for a password."""
+    try:
+        with Path(source).open('rb') as file:
+            return file.read(len(MAGIC)) == MAGIC
+    except OSError:
+        raise AccountError('无法读取账号迁移文件') from None
+
+
+def read_archive(blob, password=None):
+    """Validate the entire JSON batch or authenticate an old encrypted archive before importing anything."""
+    if not isinstance(blob, bytes) or not 0 < len(blob) <= MAX_FILE:
+        raise AccountError('账号迁移文件大小异常，未导入任何账号')
+    if blob.startswith(MAGIC):
+        if password is None:
+            raise AccountError('这是旧版加密迁移文件，请输入原迁移密码')
+        return decrypt_archive(blob, password)
+    try:
+        value = json.loads(blob.decode('utf-8-sig'))
+        if not isinstance(value, dict) or type(value.get('format')) is not int or value['format'] != 2:
+            raise ValueError()
+        return validate_batch(value['profiles'])
+    except (ValueError, KeyError, RecursionError):
+        raise AccountError('明文迁移文件格式或账号数据异常，未导入任何账号') from None
+
+
+def export_accounts(store, keys, destination, password=None, cancel=None):
+    """Atomically export selected profiles as JSON; explicit legacy callers may still request encryption."""
+    if password is not None:
+        password_bytes(password)
     if (not isinstance(keys, (tuple, list)) or not 1 <= len(keys) <= MAX_PROFILES or
             any(not isinstance(key, str) for key in keys) or len(set(keys)) != len(keys)):
         raise AccountError('请选择1～50个不同的账号导出')
@@ -109,7 +136,12 @@ def export_accounts(store, keys, destination, password, cancel=None):
     check_cancel(cancel)
     with account_operation():
         values = [store.load(key) for key in keys]
-    blob = encrypt_archive(values, password)
+    if password is None:
+        blob = json.dumps({'format': 2, 'profiles': values}, ensure_ascii=False, indent=2).encode('utf-8')
+        if len(blob) > MAX_PAYLOAD:
+            raise AccountError('所选账号数据超过64MiB，请分批导出')
+    else:
+        blob = encrypt_archive(values, password)
     check_cancel(cancel)
     temporary = None
     try:
@@ -128,16 +160,15 @@ def export_accounts(store, keys, destination, password, cancel=None):
     return {'exported': len(values)}
 
 
-def import_accounts(store, source, password, cancel=None):
-    """Decrypt locally and hand validated profiles to the atomic DPAPI importer without restoring or logging in."""
-    password_bytes(password)
+def import_accounts(store, source, password=None, cancel=None):
+    """Import a validated JSON or legacy encrypted batch into the local DPAPI store without logging in."""
     check_cancel(cancel)
     try:
         with Path(source).open('rb') as file:
             blob = file.read(MAX_FILE + 1)
     except OSError:
         raise AccountError('无法读取账号迁移文件') from None
-    values = decrypt_archive(blob, password)
+    values = read_archive(blob, password)
     check_cancel(cancel)
     try:
         return store.import_profiles(values, cancel)

@@ -88,11 +88,13 @@ class LoginSession:
                 # Migration never needs ADB, a running game, SDK writes or an automatic replacement worker.
                 from account_migration import export_accounts, import_accounts
                 if mode == 'account_export':
-                    keys, path, password = selection
+                    keys, path, *legacy_password = selection
+                    password = legacy_password[0] if legacy_password else None
                     result = export_accounts(self.store, keys, path, password, cancel)
-                    message = f"已加密导出{result['exported']}个账号；密码不会保存"
+                    message = f"已导出{result['exported']}个账号" + ('（明文 JSON）' if password is None else '（旧版加密格式）')
                 else:
-                    path, password = selection
+                    path, *legacy_password = selection
+                    password = legacy_password[0] if legacy_password else None
                     result = import_accounts(self.store, path, password, cancel)
                     message = f"已导入{result['imported']}个账号，跳过{result['skipped']}个本机已有账号；未自动登录"
                 sink.put({'profiles': self.store.list(), 'ready': False,

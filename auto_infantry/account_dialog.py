@@ -2,7 +2,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from account_store import AccountError
-from account_migration import MIN_PASSWORD, MAX_PROFILES, password_bytes
+from account_migration import MIN_PASSWORD, MAX_PROFILES, password_bytes, archive_requires_password
 
 from collection_display import display_time
 
@@ -10,7 +10,7 @@ PLATFORMS = {'安卓 QQ': (0, 1), '安卓微信': (0, 0), 'iOS QQ': (1, 1), 'iOS
 
 
 class AccountDialog(tk.Toplevel):
-    """Manage saved roles, single-account login and explicit multi-account encrypted migration."""
+    """Manage saved roles, single-account login and plaintext migration with legacy archive support."""
 
     def __init__(self, app):
         super().__init__(app.root)
@@ -49,13 +49,13 @@ class AccountDialog(tk.Toplevel):
         self.scan_button.pack(side='left', padx=8)
         migration = ttk.Frame(panel)
         migration.pack(fill='x', pady=(8, 0))
-        self.export_button = ttk.Button(migration, text='加密导出选中账号', command=self.export_selected)
+        self.export_button = ttk.Button(migration, text='明文导出选中账号', command=self.export_selected)
         self.export_button.pack(side='left')
         self.import_button = ttk.Button(migration, text='导入账号迁移文件', command=self.import_archive)
         self.import_button.pack(side='left', padx=8)
         ttk.Label(migration, text='Ctrl / Shift 多选；已有账号不覆盖。').pack(side='left')
         ttk.Label(panel, textvariable=app.status, wraplength=710).pack(anchor='w', pady=(8, 3))
-        ttk.Label(panel, text='本机票据使用Windows用户加密；迁移文件另设密码加密。导入/导出关闭自动功能，不自动登录；失效时重新扫码。',
+        ttk.Label(panel, text='迁移文件为明文JSON，包含登录凭据，请妥善保管。本机账号库使用Windows用户加密。导入/导出后自动功能关闭。',
                   foreground='#666666', wraplength=710).pack(anchor='w')
         self.refresh(app.sessions.store.list())
 
@@ -130,9 +130,9 @@ class AccountDialog(tk.Toplevel):
             messagebox.showerror('删除未完成', str(error), parent=self)
         self.refresh(self.app.sessions.store.list())
 
-    def migration_password(self, exporting=False):
-        """Collect masked input briefly; return no password on cancellation or mismatched export confirmation."""
-        password = simpledialog.askstring('账号迁移密码',
+    def migration_password(self):
+        """Collect a masked password only to open an existing legacy encrypted archive."""
+        password = simpledialog.askstring('旧版加密文件密码',
             f'请输入迁移密码（至少{MIN_PASSWORD}个字符，密码不会保存）：', show='*', parent=self)
         if password is None:
             return None
@@ -141,40 +141,40 @@ class AccountDialog(tk.Toplevel):
         except AccountError as error:
             messagebox.showerror('密码不符合要求', str(error), parent=self)
             return None
-        if exporting:
-            confirm = simpledialog.askstring('确认迁移密码', '请再次输入密码：', show='*', parent=self)
-            if confirm is None:
-                return None
-            if confirm != password:
-                messagebox.showerror('密码不一致', '两次密码不一致，未导出', parent=self)
-                return None
         return password
 
     def export_selected(self):
-        """Queue only explicit readable selections and a masked password; the session stops automation before export."""
+        """Export explicit selections as plaintext JSON without any password prompt."""
         if self.app.login_busy or self.app.closing:
             return
         keys = tuple(self.tree.selection())
         if (not 1 <= len(keys) <= MAX_PROFILES or
                 any(key not in self.records or self.records[key].get('unreadable', False) for key in keys)):
             return
-        path = filedialog.asksaveasfilename(parent=self, title='加密导出选中账号',
+        path = filedialog.asksaveasfilename(parent=self, title='明文导出选中账号',
             defaultextension='.yxsaccounts', initialfile='英雄杀账号迁移.yxsaccounts',
-            filetypes=[('加密账号迁移文件', '*.yxsaccounts')])
+            filetypes=[('账号迁移文件（明文JSON）', '*.yxsaccounts')])
         if not path:
             return
-        password = self.migration_password(exporting=True)
-        if password is not None and not self.app.login_busy and not self.app.closing:
-            self.app.request_session('account_export', (keys, path, password))
+        if not self.app.login_busy and not self.app.closing:
+            self.app.request_session('account_export', (keys, path))
 
     def import_archive(self):
-        """Queue a portable archive for validation and local DPAPI storage; never request login from this control."""
+        """Import plaintext directly, asking for a password only when the legacy encrypted header is present."""
         if self.app.login_busy or self.app.closing:
             return
         path = filedialog.askopenfilename(parent=self, title='导入账号迁移文件',
-            filetypes=[('加密账号迁移文件', '*.yxsaccounts')])
+            filetypes=[('账号迁移文件', '*.yxsaccounts')])
         if not path:
             return
-        password = self.migration_password()
-        if password is not None and not self.app.login_busy and not self.app.closing:
-            self.app.request_session('account_import', (path, password))
+        try:
+            encrypted = archive_requires_password(path)
+        except AccountError as error:
+            messagebox.showerror('导入未完成', str(error), parent=self)
+            return
+        password = self.migration_password() if encrypted else None
+        if encrypted and password is None:
+            return
+        if not self.app.login_busy and not self.app.closing:
+            selection = (path, password) if encrypted else (path,)
+            self.app.request_session('account_import', selection)
