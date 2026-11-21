@@ -273,8 +273,30 @@ class AccountLoginTests(unittest.TestCase):
         self.assertEqual(result,('logged','saved'))
         self.assertEqual(len(connections),1)
         self.service.transport.restart.assert_called_once_with(self.cancel,None)
+        self.service.transport.launch.assert_not_called()
         self.service.call.assert_not_called()
         self.assertEqual(self.service._finish_login.call_args.args[-1],1)
+
+    def test_cold_qr_launches_before_waiting_for_the_old_client(self):
+        """Reproduce a stopped game without a saved pause and verify that loading starts first."""
+        transport = self.service.transport
+        transport.startup_auto_paused.return_value = False
+        transport.pid.return_value = None
+        self.service.call.return_value = '0'
+        self.service._finish_login = Mock(return_value=('logged', 'saved'))
+
+        @contextmanager
+        def bridge(cancel):
+            """Fail if the session waits for the emulator before launching the game."""
+            transport.launch.assert_called_once_with()
+            yield self.connection
+
+        self.service.connection = bridge
+        publish = Mock()
+        self.assertEqual(self.service._login(self.cancel, publish, None, (0, 1)), ('logged', 'saved'))
+        self.service.call.assert_called_once_with(self.connection, 'pause')
+        transport.restart.assert_called_once_with(self.cancel, None)
+        self.service._finish_login.assert_called_once_with(self.connection, self.cancel, publish, None, 0, 1, 0)
 
     def test_startup_bridge_can_be_recreated_before_any_authentication(self):
         """Libraries can appear before the emulated Lua bridge is ready; retry only this local initialization."""

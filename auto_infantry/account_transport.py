@@ -115,7 +115,7 @@ class AccountTransport:
 
     def startup_auto_paused(self):
         """Read the exact persisted startup flag so a paused login screen need not attach its old Lua realm."""
-        setting=self.read(GAME_SETTING)
+        setting=self.read(GAME_SETTING, optional=True)
         marker=b'mNoAutoLogin'
         if setting.count(marker)!=1:return False
         index=setting.find(marker)+len(marker)
@@ -201,6 +201,14 @@ class AccountTransport:
         """Remove only this SDK database's obsolete WAL/shared-memory files while its process is absent."""
         self.root('rm -f ' + SDK_DB + '-wal ' + SDK_DB + '-shm')
 
+    def launch(self):
+        """Open the installed game on the selected emulator using its launcher activity."""
+        verify_device()
+        output = self.run('am start -n com.qqgame.mic/com.tencent.gcloud.msdk.core.policy.MSDKPolicyActivity '
+                          '-a android.intent.action.MAIN -c android.intent.category.LAUNCHER')
+        if any(line.startswith((b'Error:', b'Error type ')) for line in output.splitlines()):
+            raise AccountError('雷电未能启动英雄杀，请确认该实例已安装支持的游戏版本')
+
     def restart(self, cancel, profile=None):
         """Restore both SDK files as one stopped-process transaction; roll back on failure before launching."""
         verify_device()
@@ -242,6 +250,5 @@ class AccountTransport:
                     raise AccountError('账号文件恢复失败且回滚未完成，请勿登录，保留加密备份并联系排查') from None
                 raise AccountError('账号文件恢复失败，已回滚原SDK数据；请重新启动游戏') from None
         # Finish the file transaction before observing cancellation; launch paused, never authenticate here.
-        self.run('am start -n com.qqgame.mic/com.tencent.gcloud.msdk.core.policy.MSDKPolicyActivity '
-                 '-a android.intent.action.MAIN -c android.intent.category.LAUNCHER')
+        self.launch()
         cancelled(cancel)

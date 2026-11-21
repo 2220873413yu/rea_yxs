@@ -213,7 +213,13 @@ class AccountService:
             previous_auto=1
             publish(status='已确认启动自动登录处于关闭状态，直接重启客户端；尚未发起认证…')
         else:
-            publish(status='正在连接旧客户端以暂停启动自动登录，尚未重启或发起认证…')
+            if profile is None and not self.transport.pid():
+                cancelled(cancel)
+                publish(status='游戏未运行，正在启动客户端，尚未请求二维码…')
+                self.transport.launch()
+                publish(status='正在等待客户端加载，再准备扫码登录…')
+            else:
+                publish(status='正在连接旧客户端以暂停启动自动登录，尚未重启或发起认证…')
             with self.connection(cancel) as connection:
                 previous_auto = int(self.call(connection, 'pause'))
         if self.paused_auto is None:

@@ -113,7 +113,8 @@ class LoginSession:
                 sink.put({'status': 'Frida 已下载，正在部署并重新连接…'})
                 mode = 'connect'
             if mode != 'hunt_reconnect':
-                if INSTANCE_DIRECTORY is not None and not adb('shell', 'pidof', 'com.qqgame.mic', check=False).stdout.strip():
+                if (INSTANCE_DIRECTORY is not None and mode != 'account_qr'
+                        and not adb('shell', 'pidof', 'com.qqgame.mic', check=False).stdout.strip()):
                     raise RuntimeError('请在第二台雷电打开游戏并登录，再点「重新读取」')
                 ensure_server()
                 if INSTANCE_DIRECTORY is None:
