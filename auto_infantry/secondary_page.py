@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from beacon_panel import BeaconPanel
-from bootstrap import ADB, online_devices
+from bootstrap import ADB, FRIDA_VERSION, online_devices
 from collection_display import display_time
 from collection_panel import CollectionPanel
 from collection_teams_panel import CollectionTeamsPanel
@@ -176,7 +176,11 @@ class SecondaryPage(ttk.Frame):
         for panel, title in ((self.heroes, '英雄属性与恢复'), (self.hunt, '自动打野'), (self.league, '联盟采集'),
                              (self.beacon, '烽火台'), (self.report, '军报')):
             tabs.add(panel, text=title)
-        ttk.Label(self, textvariable=self.status, wraplength=960).pack(anchor='w', pady=(6, 0))
+        status_row = ttk.Frame(self)
+        status_row.pack(fill='x', pady=(6, 0))
+        self.frida_download_button = ttk.Button(status_row, text=f'下载 Frida {FRIDA_VERSION}',
+                                                command=lambda: self.session('download_frida'))
+        ttk.Label(status_row, textvariable=self.status, wraplength=760).pack(side='left', fill='x', expand=True)
         self.process = InstanceProcess(device, self.events)
         self.update_controls()
         self.poll_job = self.after(100, self.poll)
@@ -267,6 +271,7 @@ class SecondaryPage(ttk.Frame):
             self.status.set(str(error))
             return
         self.reset_role()
+        self.frida_download_button.pack_forget()
         self.busy = True
         self.status.set('正在处理雷电 1 的账号与连接…')
         self.update_controls()
@@ -377,6 +382,7 @@ class SecondaryPage(ttk.Frame):
         if epoch < self.epoch:
             return
         if event.get('session_reset'):
+            self.frida_download_button.pack_forget()
             self.epoch = epoch
             self.reset_role()
         if epoch != self.epoch:
@@ -385,6 +391,10 @@ class SecondaryPage(ttk.Frame):
             self.switches[name].set(event[name])
         if 'login_busy' in event:
             self.busy = event['login_busy']
+        if event.get('frida_needed'):
+            self.frida_download_button.pack(side='right', padx=(8, 0))
+        elif 'frida_needed' in event:
+            self.frida_download_button.pack_forget()
         if 'ready' in event:
             self.ready = event['ready']
             if not self.ready and 'error' in event:

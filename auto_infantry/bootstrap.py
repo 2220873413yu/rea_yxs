@@ -1,10 +1,15 @@
-"""Start only the bundled, version-matched local instrumentation service when needed."""
+"""Deploy the version-matched emulator service and cache it after explicit download."""
+import hashlib
 import subprocess
+import lzma
 import os
 import re
 import shlex
+import shutil
 import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from urllib.request import urlopen
 import frida
 from instance_config import DEVICE, DEVICE_ID, EMULATOR_CONFIG, SECONDARY
 
@@ -15,6 +20,14 @@ SERVER = '/data/local/tmp/' + SERVER_NAME
 OLD_SERVER_NAME = 'rea-frida-server-17.25.2'
 OLD_SERVER = '/data/local/tmp/' + OLD_SERVER_NAME
 LISTEN = '127.0.0.1:27042'
+SERVER_ASSET = f'frida-server-{FRIDA_VERSION}-android-x86_64'
+SERVER_URL = f'https://github.com/frida/frida/releases/download/{FRIDA_VERSION}/{SERVER_ASSET}.xz'
+SERVER_ARCHIVE_SIZE = 44915484
+SERVER_ARCHIVE_SHA256 = '1f03e1bd3800618f6e6b4a978b84a7d093a2bdefd42722eb3f27e4c3bbfd2139'
+
+
+class FridaServerMissing(RuntimeError):
+    """Report that both the selected emulator and the local cache lack the service."""
 
 
 def find_adb(configured=None):
@@ -88,6 +101,38 @@ def verify_running(pid):
         raise RuntimeError('Frida 服务监听地址不是 ' + LISTEN + '，未连接')
 
 
+def download_server(cancel, progress):
+    """Fetch the pinned release, verify it and atomically publish the expanded cache file."""
+    local = ROOT / '.analysis-tools' / SERVER_ASSET
+    if local.is_file():
+        return
+    local.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix='rea-frida-', dir=local.parent) as directory:
+        archive = Path(directory) / (SERVER_ASSET + '.xz')
+        unpacked = Path(directory) / SERVER_ASSET
+        size = 0
+        digest = hashlib.sha256()
+        with urlopen(SERVER_URL, timeout=15) as response, archive.open('wb') as destination:
+            for chunk in iter(lambda: response.read(256 * 1024), b''):
+                if cancel.is_set():
+                    raise InterruptedError('Frida 下载已取消')
+                size += len(chunk)
+                if size > SERVER_ARCHIVE_SIZE:
+                    raise RuntimeError('Frida 下载文件大小异常')
+                destination.write(chunk)
+                digest.update(chunk)
+                progress(size * 100 // SERVER_ARCHIVE_SIZE)
+        if size != SERVER_ARCHIVE_SIZE or digest.hexdigest() != SERVER_ARCHIVE_SHA256:
+            raise RuntimeError('Frida 下载文件 SHA-256 校验失败，请重试')
+        if cancel.is_set():
+            raise InterruptedError('Frida 下载已取消')
+        with lzma.open(archive, 'rb') as source, unpacked.open('wb') as destination:
+            shutil.copyfileobj(source, destination)
+        if cancel.is_set():
+            raise InterruptedError('Frida 下载已取消')
+        unpacked.replace(local)
+
+
 def ensure_server():
     """Deploy the pinned service and migrate only our verified old helper; never restart the game or change root."""
     ensure_client_version()
@@ -104,10 +149,10 @@ def ensure_server():
             raise RuntimeError('存在多个新版 Frida 服务，请先核对；未连接')
         verify_running(running[0])
         return
-    local = ROOT / ('.analysis-tools/frida-server-' + FRIDA_VERSION + '-android-x86_64')
     if root_command('test -f ' + SERVER, check=False).returncode != 0:
+        local = ROOT / '.analysis-tools' / SERVER_ASSET
         if not local.is_file():
-            raise RuntimeError('缺少匹配的 Frida 服务文件：' + str(local))
+            raise FridaServerMissing('缺少 Frida 服务，请点击「下载 Frida」')
         adb('push', str(local), SERVER, timeout=30)
     root_command('chmod 700 ' + SERVER)
     if root_command(SERVER + ' --version').stdout.strip() != FRIDA_VERSION:

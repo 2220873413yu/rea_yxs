@@ -37,7 +37,7 @@ py -3.12 -m venv .analysis-tools/pyenv
 .analysis-tools/pyenv/Scripts/python.exe -m pip install -r requirements.txt
 ```
 
-匹配的 Android x86_64 Frida 服务文件需自行放入 `.analysis-tools/frida-server-17.26.2-android-x86_64`，或已部署到模拟器的对应路径。仓库不包含这些二进制。启动时校验客户端版本、实际服务进程路径、服务版本和监听端口；确认新版文件正确后才停止本助手的旧17.25.2服务，其他未知进程不自动终止。此过程不会重启游戏或切换账号。
+模拟器和本机都缺少匹配的 Android x86_64 服务文件时，助手显示「下载 Frida 17.26.2」。点击后从官方发行页下载、校验并解压到 `.analysis-tools/frida-server-17.26.2-android-x86_64`，然后通过 ADB 部署并重新连接。以后可复用该文件。雷电实例需在线且已启用 Root；连接失败时请先根据提示检查实例。也可以事先把解压后的文件放到上述路径。[Frida 17.26.2 官方发行版](https://github.com/frida/frida/releases/tag/17.26.2)
 
 Android14日志尾部读取显式使用`toybox dd`，兼容新版系统裸`dd`入口返回`no such tool`的情况；仍只读取有界尾部并保留未完成帧，不改为整份日志读取或增加游戏请求。
 

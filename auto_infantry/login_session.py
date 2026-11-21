@@ -2,7 +2,7 @@
 import threading
 import time
 
-from bootstrap import adb, ensure_server
+from bootstrap import FridaServerMissing, adb, download_server, ensure_server
 from connection import Connection
 from controller import Worker
 from pathlib import Path
@@ -53,7 +53,7 @@ class LoginSession:
 
     def request(self, mode='connect', selection=None):
         """Cancel earlier work before serial login, default-off reconnection or local encrypted migration."""
-        if mode not in {'connect', 'hunt_reconnect', 'ios_wechat', 'account_save', 'account_switch', 'account_qr',
+        if mode not in {'connect', 'download_frida', 'hunt_reconnect', 'ios_wechat', 'account_save', 'account_switch', 'account_qr',
                         'account_export', 'account_import'}:
             raise ValueError('Unsupported session mode')
         with self.guard:
@@ -99,6 +99,19 @@ class LoginSession:
                           'account_status': '当前游戏账号未切换；自动功能全部关闭',
                           'status': message + '。需要使用时请选择账号切换，票据失效请重新扫码。'})
                 return
+            if mode == 'download_frida':
+                sink.put({'frida_needed': False, 'status': '正在下载 Frida…'})
+                try:
+                    download_server(cancel, lambda percent: sink.put({'status': f'正在下载 Frida… {percent}%'}))
+                except InterruptedError:
+                    raise
+                except Exception as error:
+                    sink.put({'frida_needed': True, 'status': 'Frida 下载未完成：' + str(error).splitlines()[0]})
+                    return
+                if cancel.is_set():
+                    return
+                sink.put({'status': 'Frida 已下载，正在部署并重新连接…'})
+                mode = 'connect'
             if mode != 'hunt_reconnect':
                 if INSTANCE_DIRECTORY is not None and not adb('shell', 'pidof', 'com.qqgame.mic', check=False).stdout.strip():
                     raise RuntimeError('请在第二台雷电打开游戏并登录，再点「重新读取」')
@@ -129,6 +142,9 @@ class LoginSession:
                     worker.request_hero_refresh()
                     worker.request_collection_attributes()
                 worker.start()
+        except FridaServerMissing as error:
+            sink.put({'frida_needed': True, 'ready': False, 'status': str(error),
+                      'account_status': '当前账号：尚未完成重新读取，自动功能关闭'})
         except InterruptedError:
             pass
         except Exception as error:

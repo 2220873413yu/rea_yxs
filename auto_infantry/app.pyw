@@ -9,6 +9,7 @@ from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 
 from controller import Worker, owned_soldiers
+from bootstrap import FRIDA_VERSION
 from emulator_settings_dialog import EmulatorSettingsDialog
 from units import UNIT_NAMES
 from hero_panel import HeroPanel
@@ -150,7 +151,11 @@ class App:
         self.feature_tabs.add(self.gem_swap_panel, text='宝具替换')
         self.hero_status = self.hero_panel.status
         ttk.Separator(panel).pack(fill='x', pady=9)
-        ttk.Label(panel, textvariable=self.status, wraplength=960).pack(anchor='w')
+        status_row = ttk.Frame(panel)
+        status_row.pack(fill='x')
+        self.frida_download_button = ttk.Button(status_row, text=f'下载 Frida {FRIDA_VERSION}',
+                                                command=lambda: self.request_session('download_frida'))
+        ttk.Label(status_row, textvariable=self.status, wraplength=760).pack(side='left', fill='x', expand=True)
         ttk.Label(panel, text='造兵只处理所选兵种，补满后自动关闭；恢复只用五分钟专用道具，不足五分钟也可用一个。\n采集恢复与自动恢复共用同一队列，不重复用道具；关闭后不发新请求，已接受的行动不会撤销。',
                   foreground='#666666', font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=(10, 0))
         ttk.Label(panel, text='选择会记住，换号后自动功能关闭；本次手动开启打野后，才恢复刷新时刻自动开启规则。',
@@ -314,6 +319,7 @@ class App:
         """Stop old automation before login, local migration or reconstruction; credentials never reach status text."""
         if self.closing:
             return
+        self.frida_download_button.pack_forget()
         self.cancel_reconnect('手动操作或会话替换')
         self.clear_account_views()
         self.login_busy = True
@@ -694,6 +700,10 @@ class App:
                     continue
                 if 'login_busy' in event:
                     self.login_busy = event['login_busy']
+                if event.get('frida_needed'):
+                    self.frida_download_button.pack(side='right', padx=(8, 0))
+                elif 'frida_needed' in event:
+                    self.frida_download_button.pack_forget()
                 if 'account' in event:
                     label = account_label(event['account'])
                     self.account_status.set(label)

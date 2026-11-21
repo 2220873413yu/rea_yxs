@@ -1,6 +1,12 @@
 """Verify version-pinned emulator service migration without touching a real emulator."""
+import hashlib
+from io import BytesIO
+import lzma
 import subprocess
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import Event
 from unittest.mock import Mock, patch
 
 import bootstrap
@@ -23,6 +29,21 @@ class BootstrapVersionTests(unittest.TestCase):
                 bootstrap.ensure_server()
             adb.assert_called_once_with('get-state', check=False)
             root.assert_not_called()
+
+    def test_download_checks_digest_before_publishing_cache(self):
+        payload = b'example server bytes'
+        archive = lzma.compress(payload)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / '.analysis-tools' / bootstrap.SERVER_ASSET
+            with (patch('bootstrap.ROOT', root), patch('bootstrap.SERVER_ARCHIVE_SIZE', len(archive)),
+                  patch('bootstrap.urlopen', side_effect=lambda *args, **kwargs: BytesIO(archive))):
+                with self.assertRaisesRegex(RuntimeError, 'SHA-256'):
+                    bootstrap.download_server(Event(), Mock())
+                self.assertFalse(local.exists())
+                with patch('bootstrap.SERVER_ARCHIVE_SHA256', hashlib.sha256(archive).hexdigest()):
+                    bootstrap.download_server(Event(), Mock())
+                self.assertEqual(local.read_bytes(), payload)
 
     def test_adb_override_and_new_emulator_preference(self):
         with patch('bootstrap.Path.is_file', return_value=True):

@@ -105,7 +105,7 @@ def main():
                     operation = command['operation']
                     if operation == 'session':
                         mode, selection = command['mode'], command.get('selection')
-                        if mode not in {'connect', 'account_save', 'account_switch', 'account_qr'}:
+                        if mode not in {'connect', 'download_frida', 'account_save', 'account_switch', 'account_qr'}:
                             raise ValueError('第二台雷电不支持此账号操作')
                         if mode == 'account_qr':
                             selection = tuple(selection)

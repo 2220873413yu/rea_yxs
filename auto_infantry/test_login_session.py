@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from lupa import LuaRuntime
 from login_session import LoginSession, SessionEvents, account_label
 from account_store import AccountError
+from bootstrap import FridaServerMissing
 
 SOURCE = Path(__file__).with_name('login_runtime.lua').read_text(encoding='utf-8')
 ROLE = dict(logged_in=True, stage='MainHallSceneStage', agreement=True, ret=0,
@@ -46,6 +47,20 @@ class LoginLifecycleTests(unittest.TestCase):
         self.bridge.login_call.assert_not_called()
         factory.assert_not_called()
         self.session.accounts.login.assert_called_once()
+
+    def test_missing_server_waits_for_explicit_download_then_reconnects(self):
+        with (patch('login_session.ensure_server', side_effect=[FridaServerMissing('missing'), None]) as ensure,
+              patch('login_session.download_server') as download,
+              patch('login_session.Worker', return_value=self.worker)):
+            self.session._replace('connect', 0, self.cancel, None, None)
+            download.assert_not_called()
+            self.worker.start.assert_not_called()
+            self.assertTrue(any(event.get('frida_needed') for event in self.events.queue))
+            self.session._replace('download_frida', 0, self.cancel, None, None)
+            download.assert_called_once()
+            self.assertEqual(ensure.call_count, 2)
+            self.worker.start.assert_called_once()
+            self.session.accounts.login.assert_not_called()
 
     def test_success_closes_old_owner_and_uses_one_qr_before_new_default_off_worker(self):
         """A successful scan cannot resume old automation, heroes, map caches or scheduled hunting."""
