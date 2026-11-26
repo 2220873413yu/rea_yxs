@@ -1,4 +1,5 @@
 // Offline SDK cipher only: never call login, save, update, or SDK account selection.
+// Bundled with frida.Compiler so the Java bridge is inlined; see account_rekey_agent.bundle.js.
 import Java from 'frida-java-bridge';
 
 rpc.exports = {

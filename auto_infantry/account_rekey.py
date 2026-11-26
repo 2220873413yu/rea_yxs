@@ -14,7 +14,8 @@ FIELDS = ('access_token', 'refresh_token', 'pf', 'pf_key')
 QQ_FIELDS = ('access_token', 'pay_token', 'pf', 'pf_key')
 CIPHER_FIELDS = ('access_token', 'refresh_token', 'pay_token', 'pf', 'pf_key')
 TABLES = {0: 'wx_login_info', 1: 'qq_login_info'}
-ROOT = Path(__file__).resolve().parent.parent
+AGENT = Path(__file__).with_name('account_rekey_agent.js')
+BUNDLE = Path(__file__).with_name('account_rekey_agent.bundle.js')
 
 
 def cipher_fields(profile):
@@ -22,22 +23,34 @@ def cipher_fields(profile):
     return FIELDS if profile['role']['open_platform'] == 0 else QQ_FIELDS
 
 
+def agent_source():
+    """Prefer the committed bundle so a fresh clone needs no npm package; compile only when it is absent."""
+    if BUNDLE.is_file():
+        return BUNDLE.read_text(encoding='utf-8')
+    directory = Path(__file__).resolve().parent.parent / '.analysis-tools/xinyue-tools'
+    if not (directory / 'node_modules/frida-java-bridge/package.json').is_file():
+        raise AccountError('SDK票据脚本缺失，请重新拉取仓库或按README重新生成agent')
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=directory, suffix='.js', delete=False) as file:
+            temporary = Path(file.name)
+            file.write(AGENT.read_bytes())
+        return frida.Compiler().build(str(temporary))
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def transform_sdk(pid, mode, values, endpoint='127.0.0.1:27042'):
     """Run only the SDK cipher against one already-running process; never issue auth or persist SDK rows."""
     if (type(pid) is not int or pid <= 1 or mode not in {'decode', 'encode'} or
             not isinstance(values, dict) or not values or not set(values) <= set(CIPHER_FIELDS)):
         raise AccountError('迁移参数无效，未操作SDK')
-    directory = ROOT / '.analysis-tools/xinyue-tools'
-    if not (directory / 'node_modules/frida-java-bridge/index.js').is_file():
-        raise AccountError('缺少本地Java桥，未操作SDK')
-    temporary, session, script = None, None, None
+    session, script = None, None
     try:
-        with tempfile.NamedTemporaryFile(dir=directory, suffix='.js', delete=False) as file:
-            temporary = Path(file.name)
-            file.write(Path(__file__).with_name('account_rekey_agent.js').read_bytes())
-        compiled = frida.Compiler().build(str(temporary))
+        source = agent_source()
         session = frida.get_device_manager().add_remote_device(endpoint).attach(pid)
-        script = session.create_script(compiled)
+        script = session.create_script(source, name='rea-sdk-cipher')
         script.load()
         result = script.exports_sync.transform(mode, values)
         if not result.get('ok') or set(result.get('values', {})) != set(values):
@@ -52,8 +65,6 @@ def transform_sdk(pid, mode, values, endpoint='127.0.0.1:27042'):
             script.unload()
         if session is not None:
             session.detach()
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
 
 
 def credential_columns(profile):

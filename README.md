@@ -96,6 +96,19 @@ Python测试使用隔离模型和协议样本，UI测试会构造并隐藏Tk窗�
 3. 目标电脑导入后选择该账号切换。切换前助手先用本机SDK的 `f3` 重新加密这些列、回读校验、换掉快照里对应的密文并重算 `db_sha256`，之后才走原有的重启与票据恢复流程；重加密成功后本机只保留本机密文，明文块不再保存。
 4. 目标电脑当时没开游戏时，助手会先启动客户端、等模块加载完再重加密，不会跳过。任何一步失败都保持原账号记录，不发起登录。
 
+目标电脑不需要 Node/npm：仓库自带 `auto_infantry/account_rekey_agent.bundle.js`（由 `account_rekey_agent.js` 用 `frida.Compiler` 编译，Java 桥已内联）。只有改过 agent 源码才需要重新生成，在装有 `frida-java-bridge` 的机器上从仓库根目录执行：
+
+```bash
+python - <<'PY'
+import pathlib, frida
+work = pathlib.Path('.analysis-tools/xinyue-tools/build.js')
+work.write_text(pathlib.Path('auto_infantry/account_rekey_agent.js').read_text(encoding='utf-8'), encoding='utf-8')
+pathlib.Path('auto_infantry/account_rekey_agent.bundle.js').write_text(
+    frida.Compiler().build(str(work)), encoding='utf-8')
+work.unlink()
+PY
+```
+
 约束：可移植的是 `access_token`（约2小时）与 `refresh_token`（约30天）。超期、服务器按设备/渠道拒绝（`iRet=2`）仍要重新扫码；两台电脑需同版本游戏与可用的 Frida 服务。文件含明文Token，请自行保管，不要提交到Git或网盘公开链接。
 
 助手顶部的「iOS 微信扫码登录」会先停止自动操作、关闭旧连接并重启客户端。请本人勾选登录页协议，等待二维码出现后用苹果角色对应的微信扫码授权；成功后自动加密保存。二维码只请求一次，等待超时不自动重发。授权后进入西游幻境，助手主动拉取兵营数据，成功后初始化当前账号其他数据。
