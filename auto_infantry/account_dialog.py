@@ -16,7 +16,7 @@ class AccountDialog(tk.Toplevel):
         super().__init__(app.root)
         self.app = app
         self.title('账号保存、切换与迁移')
-        self.geometry('800x465')
+        self.geometry('800x485')
         self.minsize(720, 430)
         self.records = {}
         panel = ttk.Frame(self, padding=12)
@@ -53,7 +53,10 @@ class AccountDialog(tk.Toplevel):
         self.export_button.pack(side='left')
         self.import_button = ttk.Button(migration, text='导入账号迁移文件', command=self.import_archive)
         self.import_button.pack(side='left', padx=8)
-        ttk.Label(migration, text='Ctrl / Shift 多选；已有账号不覆盖。').pack(side='left')
+        self.portable_button = ttk.Button(migration, text='导出可移植凭据（含明文Token）', command=self.export_portable)
+        self.portable_button.pack(side='left')
+        ttk.Label(panel, text='Ctrl / Shift 多选；已有账号不覆盖。可移植凭据需游戏停在本机登录页，可在另一台电脑直接切换。',
+                  foreground='#666666', wraplength=710).pack(anchor='w', pady=(4, 0))
         ttk.Label(panel, textvariable=app.status, wraplength=710).pack(anchor='w', pady=(8, 3))
         ttk.Label(panel, text='迁移文件为明文JSON，包含登录凭据，请妥善保管。本机账号库使用Windows用户加密。导入/导出后自动功能关闭。',
                   foreground='#666666', wraplength=710).pack(anchor='w')
@@ -85,7 +88,8 @@ class AccountDialog(tk.Toplevel):
         self.delete_button.state(['!disabled'] if enabled and len(selected) == 1 else ['disabled'])
         exportable = (1 <= len(selected) <= MAX_PROFILES and
                       all(key in self.records and not self.records[key].get('unreadable', False) for key in selected))
-        self.export_button.state(['!disabled'] if enabled and exportable else ['disabled'])
+        for control in (self.export_button, self.portable_button):
+            control.state(['!disabled'] if enabled and exportable else ['disabled'])
 
     def select(self, event=None):
         """Choose the matching native QR platform for a profile that needs a renewed authorization."""
@@ -158,6 +162,22 @@ class AccountDialog(tk.Toplevel):
             return
         if not self.app.login_busy and not self.app.closing:
             self.app.request_session('account_export', (keys, path))
+
+    def export_portable(self):
+        """Export decoded tickets for another PC; the running client supplies its SDK cipher only."""
+        if self.app.login_busy or self.app.closing:
+            return
+        keys = tuple(self.tree.selection())
+        if (not 1 <= len(keys) <= MAX_PROFILES or
+                any(key not in self.records or self.records[key].get('unreadable', False) for key in keys)):
+            return
+        path = filedialog.asksaveasfilename(parent=self, title='导出可移植登录凭据',
+            defaultextension='.yxsaccounts', initialfile='英雄杀可移植凭据.yxsaccounts',
+            filetypes=[('账号迁移文件（含明文Token）', '*.yxsaccounts')])
+        if not path:
+            return
+        if not self.app.login_busy and not self.app.closing:
+            self.app.request_session('account_export_portable', (keys, path))
 
     def import_archive(self):
         """Import plaintext directly, asking for a password only when the legacy encrypted header is present."""

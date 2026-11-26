@@ -54,7 +54,7 @@ class LoginSession:
     def request(self, mode='connect', selection=None):
         """Cancel earlier work before serial login, default-off reconnection or local encrypted migration."""
         if mode not in {'connect', 'download_frida', 'hunt_reconnect', 'ios_wechat', 'account_save', 'account_switch', 'account_qr',
-                        'account_export', 'account_import'}:
+                        'account_export', 'account_import', 'account_export_portable'}:
             raise ValueError('Unsupported session mode')
         with self.guard:
             if self.closed:
@@ -117,12 +117,23 @@ class LoginSession:
             if mode != 'hunt_reconnect':
                 if (INSTANCE_DIRECTORY is not None and mode != 'account_qr'
                         and not adb('shell', 'pidof', 'com.qqgame.mic', check=False).stdout.strip()):
-                    raise RuntimeError('请在第二台雷电打开游戏并登录，再点「重新读取」')
+                    raise RuntimeError('请先打开游戏并停在登录页，再导出可移植凭据' if mode == 'account_export_portable'
+                                       else '请在第二台雷电打开游戏并登录，再点「重新读取」')
                 ensure_server()
                 if INSTANCE_DIRECTORY is None:
                     legacy = Path(__file__).resolve().parents[1] / 'analysis/evidence'
                     self.store.import_legacy([legacy / 'ios-wechat-ticket-test.dpapi', legacy / 'android-qq-ticket-test.dpapi'])
                 sink.put({'profiles': self.store.list()})
+            if mode == 'account_export_portable':
+                # Decoding needs only the running client's SDK cipher: no login, restart or account change.
+                from account_portable import export_portable
+                keys, path = selection
+                result = export_portable(self.store, keys, path, cancel)
+                sink.put({'profiles': self.store.list(), 'ready': False,
+                          'account_status': '当前游戏账号未切换；自动功能全部关闭',
+                          'status': f"已导出{result['exported']}个可移植凭据（含明文Token）。另一台电脑导入后"
+                                    '选择切换即可，无需重扫；文件请妥善保管，票据过期仍需扫码。'})
+                return
             if mode == 'account_save':
                 record = self.accounts.save_current(cancel)
                 sink.put({'status': '已加密保存当前账号：' + record['name'], 'profiles': self.store.list()})
