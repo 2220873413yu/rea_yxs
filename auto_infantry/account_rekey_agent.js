@@ -7,8 +7,10 @@ rpc.exports = {
     return new Promise(resolve => Java.perform(() => {
       try {
         if (!['decode', 'encode'].includes(mode)) throw new Error();
-        const fields = ['access_token', 'refresh_token', 'pf', 'pf_key'];
-        if (Object.keys(values).sort().join() !== fields.sort().join()) throw new Error();
+        // QQ stores a pay token in place of the WeChat refresh token; take only these named columns.
+        const allowed = ['access_token', 'refresh_token', 'pay_token', 'pf', 'pf_key'];
+        const fields = Object.keys(values || {});
+        if (!fields.length || fields.some(field => !allowed.includes(field))) throw new Error();
         const cipher = Java.use('com.tencent.msdk.a.e').$new(
           Java.use('com.tencent.msdk.db.WxLoginModel').$new().gk());
         const Base64 = Java.use('android.util.Base64');

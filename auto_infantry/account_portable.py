@@ -8,29 +8,29 @@ import sqlite3
 import tempfile
 
 from account_migration import MAX_PAYLOAD, MAX_PROFILES, check_cancel
-from account_rekey import FIELDS, credential_columns, transform_sdk
+from account_rekey import TABLES, cipher_fields, credential_columns, transform_sdk
 from account_store import AccountError, validate_profile
 
 PLAIN_KEY = 'sdk_plain'
 PLAIN_HASH = 'sdk_plain_sha256'
-TABLES = {0: 'wx_login_info', 1: 'qq_login_info'}
 
 
 def values_digest(values):
-    """Bind the four decoded columns so a hand-edited migration file cannot reach the SDK."""
+    """Bind the decoded columns so a hand-edited migration file cannot reach the SDK."""
     payload = json.dumps(values, sort_keys=True, separators=(',', ':')).encode('utf-8')
     return hashlib.sha256(payload).hexdigest()
 
 
 def decode_columns(profile, transform):
-    """Decode one saved profile's four SDK columns; the token must still match its recorded hash."""
+    """Decode one saved profile's SDK columns; the token must still match its recorded hash."""
     validate_profile(profile)
+    fields = cipher_fields(profile)
     values = transform('decode', credential_columns(profile))
-    if not isinstance(values, dict) or set(values) != set(FIELDS):
+    if not isinstance(values, dict) or set(values) != set(fields):
         raise AccountError('SDK票据解码结果异常，未导出可移植凭据')
     try:
         token = base64.b64decode(values['access_token'], validate=True)
-        empty = [field for field in FIELDS if not base64.b64decode(values[field], validate=True)]
+        empty = [field for field in fields if not base64.b64decode(values[field], validate=True)]
     except (KeyError, ValueError):
         raise AccountError('SDK票据解码结果异常，未导出可移植凭据') from None
     if not token or empty:
@@ -53,8 +53,9 @@ def needs_rekey(profile):
 
 def rekey_profile(profile, transform):
     """Re-encrypt an exported ticket with this PC's SDK key and drop the plaintext from the result."""
+    fields = cipher_fields(profile)
     values = profile.get(PLAIN_KEY)
-    if not isinstance(values, dict) or set(values) != set(FIELDS):
+    if not isinstance(values, dict) or set(values) != set(fields):
         raise AccountError('可移植票据不完整，未写入本机SDK')
     if profile.get(PLAIN_HASH) != values_digest(values):
         raise AccountError('可移植票据校验失败，未写入本机SDK')
@@ -71,9 +72,9 @@ def rekey_profile(profile, transform):
     db = sqlite3.connect(':memory:')
     try:
         db.deserialize(validate_profile(profile))
-        db.execute('update ' + TABLES[profile['role']['open_platform']] +
-                   ' set access_token=?,refresh_token=?,pf=?,pf_key=?',
-                   tuple(encrypted[field] for field in FIELDS))
+        db.execute('update ' + TABLES[profile['role']['open_platform']] + ' set ' +
+                   ','.join(field + '=?' for field in fields),
+                   tuple(encrypted[field] for field in fields))
         db.commit()
         snapshot = bytearray(db.serialize())
     except sqlite3.Error:

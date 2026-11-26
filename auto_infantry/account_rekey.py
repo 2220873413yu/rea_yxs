@@ -11,12 +11,21 @@ import frida
 from account_store import AccountError, crypt_profile, validate_profile
 
 FIELDS = ('access_token', 'refresh_token', 'pf', 'pf_key')
+QQ_FIELDS = ('access_token', 'pay_token', 'pf', 'pf_key')
+CIPHER_FIELDS = ('access_token', 'refresh_token', 'pay_token', 'pf', 'pf_key')
+TABLES = {0: 'wx_login_info', 1: 'qq_login_info'}
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def cipher_fields(profile):
+    """Name the encrypted columns of one platform; QQ stores a pay token instead of a refresh token."""
+    return FIELDS if profile['role']['open_platform'] == 0 else QQ_FIELDS
 
 
 def transform_sdk(pid, mode, values, endpoint='127.0.0.1:27042'):
     """Run only the SDK cipher against one already-running process; never issue auth or persist SDK rows."""
-    if type(pid) is not int or pid <= 1 or mode not in {'decode', 'encode'} or set(values) != set(FIELDS):
+    if (type(pid) is not int or pid <= 1 or mode not in {'decode', 'encode'} or
+            not isinstance(values, dict) or not values or not set(values) <= set(CIPHER_FIELDS)):
         raise AccountError('迁移参数无效，未操作SDK')
     directory = ROOT / '.analysis-tools/xinyue-tools'
     if not (directory / 'node_modules/frida-java-bridge/index.js').is_file():
@@ -31,7 +40,7 @@ def transform_sdk(pid, mode, values, endpoint='127.0.0.1:27042'):
         script = session.create_script(compiled)
         script.load()
         result = script.exports_sync.transform(mode, values)
-        if not result.get('ok') or set(result.get('values', {})) != set(FIELDS):
+        if not result.get('ok') or set(result.get('values', {})) != set(values):
             raise AccountError('SDK迁移解密或回读校验失败，未发起登录')
         return result['values']
     except AccountError:
@@ -48,24 +57,25 @@ def transform_sdk(pid, mode, values, endpoint='127.0.0.1:27042'):
 
 
 def credential_columns(profile):
-    """Validate one saved WeChat profile before reading its four SDK-encrypted columns in memory."""
+    """Validate one saved profile, then read only its platform's SDK-encrypted columns in memory."""
     data = validate_profile(profile)
-    if profile['role']['open_platform'] != 0:
-        raise AccountError('本次迁移仅支持已验证的微信票据')
+    fields = cipher_fields(profile)
     with sqlite3.connect(':memory:') as db:
         db.deserialize(data)
-        row = db.execute('select access_token,refresh_token,pf,pf_key from wx_login_info').fetchone()
-    return dict(zip(FIELDS, row))
+        row = db.execute('select ' + ','.join(fields) + ' from ' +
+                         TABLES[profile['role']['open_platform']]).fetchone()
+    return dict(zip(fields, row))
 
 
 def seal_source(profile, transform):
     """Seal SDK-decoded bytes with current-user DPAPI only after matching the original token hash."""
+    fields = cipher_fields(profile)
     values = transform('decode', credential_columns(profile))
     try:
         token = base64.b64decode(values['access_token'], validate=True)
         if not token or hashlib.sha256(token).hexdigest() != profile['sdk_access_token_sha256']:
             raise ValueError()
-        if any(not base64.b64decode(values[field], validate=True) for field in FIELDS):
+        if any(not base64.b64decode(values[field], validate=True) for field in fields):
             raise ValueError()
     except (KeyError, ValueError):
         raise AccountError('源票据校验不一致，未生成迁移数据') from None
@@ -78,8 +88,11 @@ def rekey_destination(blob, transform):
     if value.get('format') != 1:
         raise AccountError('迁移数据版本不匹配')
     profile = copy.deepcopy(value['profile'])
+    fields = cipher_fields(profile)
     credential_columns(profile)
     values = value['values']
+    if set(values) != set(fields):
+        raise AccountError('迁移数据版本不匹配')
     token = base64.b64decode(values['access_token'], validate=True)
     if hashlib.sha256(token).hexdigest() != profile['sdk_access_token_sha256']:
         raise AccountError('迁移Token校验失败')
@@ -89,8 +102,9 @@ def rekey_destination(blob, transform):
         raise AccountError('新版SDK票据回读不一致，未写入账号库')
     with sqlite3.connect(':memory:') as db:
         db.deserialize(validate_profile(profile))
-        db.execute('update wx_login_info set access_token=?,refresh_token=?,pf=?,pf_key=?',
-                   tuple(encrypted[field] for field in FIELDS))
+        db.execute('update ' + TABLES[profile['role']['open_platform']] + ' set ' +
+                   ','.join(field + '=?' for field in fields),
+                   tuple(encrypted[field] for field in fields))
         db.commit()
         snapshot = db.serialize()
     profile['database'] = base64.b64encode(snapshot).decode('ascii')

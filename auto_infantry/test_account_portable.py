@@ -12,33 +12,49 @@ from unittest.mock import Mock, patch
 from account_migration import read_archive
 from account_portable import (PLAIN_HASH, PLAIN_KEY, export_portable, needs_rekey,
                               portable_profile, rekey_profile, values_digest)
-from account_rekey import FIELDS, credential_columns
+from account_rekey import FIELDS, QQ_FIELDS, cipher_fields, credential_columns
 from account_service import AccountService
 from account_store import AccountError, AccountStore, profile_key, validate_profile
 from test_account_profiles import profile, test_cipher
 
 
 def with_ticket_columns(value):
-    """Give a synthetic snapshot the real four-column SDK shape without any genuine credential."""
+    """Give a synthetic snapshot the real encrypted-column shape of its own platform."""
     db = sqlite3.connect(':memory:')
     db.deserialize(validate_profile(value))
-    db.execute('alter table wx_login_info add column pf text')
-    db.execute('alter table wx_login_info add column pf_key text')
-    db.execute("update wx_login_info set pf='fake-pf',pf_key='fake-key'")
+    table = 'qq_login_info' if value['role']['open_platform'] else 'wx_login_info'
+    if value['role']['open_platform']:
+        db.execute('alter table ' + table + ' add column pay_token text')
+        db.execute("update " + table + " set pay_token='fake-pay-token'")
+    db.execute('alter table ' + table + ' add column pf text')
+    db.execute('alter table ' + table + ' add column pf_key text')
+    db.execute('update ' + table + " set pf='fake-pf',pf_key='fake-key'")
     db.commit()
     data = db.serialize()
     db.close()
     return dict(value, database=base64.b64encode(data).decode(), db_sha256=hashlib.sha256(data).hexdigest())
 
 
-PLAIN = {field: base64.b64encode(b'fake-access' if field == 'access_token'
-                                else ('fake-' + field).encode()).decode() for field in FIELDS}
+def plain_block(fields):
+    """Build the decoded base64 block one platform would carry, keyed by its own column names."""
+    return {field: base64.b64encode(b'fake-access' if field == 'access_token'
+                                    else ('fake-' + field).encode()).decode() for field in fields}
+
+
+PLAIN = plain_block(FIELDS)
+QQ_PLAIN = plain_block(QQ_FIELDS)
 DESTINATION = {field: 'destination-sdk-' + field for field in FIELDS}
+QQ_DESTINATION = {field: 'destination-sdk-' + field for field in QQ_FIELDS}
 
 
 def source_transform(mode, values):
     """Emulate this PC's SDK cipher; both directions are exact so a wrong call cannot pass unnoticed."""
     return PLAIN if mode == 'decode' else DESTINATION
+
+
+def qq_transform(mode, values):
+    """Emulate the QQ variant, which carries a pay token instead of a refresh token."""
+    return QQ_PLAIN if mode == 'decode' else QQ_DESTINATION
 
 
 class PortableExportTests(unittest.TestCase):
@@ -105,6 +121,29 @@ class PortableImportTests(unittest.TestCase):
             return DESTINATION if mode == 'encode' else dict(PLAIN, pf='other-pf')
         with self.assertRaisesRegex(AccountError, '回读不一致'):
             rekey_profile(self.portable, broken)
+
+
+class PortableQQTests(unittest.TestCase):
+    """A QQ profile stores a pay token instead of a refresh token, so the column set follows the platform."""
+
+    def setUp(self):
+        """Use one synthetic QQ identity with that platform's encrypted columns."""
+        self.source = with_ticket_columns(profile(platform=1))
+
+    def test_qq_columns_are_pay_token_pf_and_pf_key(self):
+        """Export and rekey both use the QQ column set and leave a decryptable qq_login_info row."""
+        self.assertEqual(cipher_fields(self.source), QQ_FIELDS)
+        result = portable_profile(self.source, qq_transform)
+        self.assertEqual(set(result[PLAIN_KEY]), set(QQ_FIELDS))
+        rekeyed = rekey_profile(result, qq_transform)
+        self.assertNotIn(PLAIN_KEY, rekeyed)
+        self.assertEqual(credential_columns(rekeyed), QQ_DESTINATION)
+
+    def test_qq_profile_rejects_a_wechat_shaped_plaintext_block(self):
+        """A refresh_token block cannot be applied to a QQ snapshot."""
+        value = dict(portable_profile(self.source, qq_transform), sdk_plain=PLAIN)
+        with self.assertRaisesRegex(AccountError, '不完整'):
+            rekey_profile(value, source_transform)
 
 
 class PortableFileTests(unittest.TestCase):
